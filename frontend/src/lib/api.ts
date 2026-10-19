@@ -1369,6 +1369,21 @@ export const api = {
     }> {
       return request("/api/studio/sbx/auth");
     },
+    sbxAuthStart(token?: string): Promise<{
+      ok: boolean;
+      authenticated: boolean;
+      verificationUrl: string | null;
+      userCode?: string | null;
+      instructions: string;
+      detail: string;
+      sandboxes?: Array<{ name: string; id: string; status: string; cpus?: number; memoryMib?: number }>;
+    }> {
+      return request("/api/studio/sbx/auth", {
+        method: "POST",
+        body: { mode: "start", ...(token ? { token } : {}) },
+        timeoutMs: 30000,
+      });
+    },
     testNode(id: string): Promise<NodeProbe> {
       return request(`/api/studio/nodes/${enc(id)}/test`, { method: "POST", body: {}, timeoutMs: 45000 });
     },

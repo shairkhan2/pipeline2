@@ -1667,6 +1667,7 @@ export async function handleStudioRoute(
         ok: started.ok,
         authenticated: started.authenticated,
         verificationUrl: started.verificationUrl,
+        userCode: started.userCode,
         instructions: started.instructions,
         detail: started.detail,
         sandboxes: sandboxAuthStatus().sandboxes,

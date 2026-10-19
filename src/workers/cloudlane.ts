@@ -1392,8 +1392,18 @@ export function createCloudNode(
         };
       }
       try {
-        nodeRun(run, ["start", box], 240);
-        state.ts = 0;
+        try {
+          nodeRun(run, ["start", box], 240);
+        } catch (err) {
+          if (!/unknown command/i.test(String((err as Error)?.message ?? err))) {
+            throw err;
+          }
+          nodeRun(run, ["exec", box, "sh", "-c", "true"], 240);
+        }
+        state.ts = time.now();
+        state.ok = true;
+        state.why = "ok";
+        state.fails = 0;
         return { ok: true, detail: `started ${box}` };
       } catch (err) {
         return { ok: false, detail: String((err as Error)?.message ?? err) };
@@ -1520,8 +1530,8 @@ export function createCloudNode(
             `mkdir -p ${shQuote(`${remoteDir}/public`)} ${shQuote(`${RDIR}/jobs`)}` +
             (remoteDir === SANDBOX_STUDIO_DIR
               ? ""
-              : ` && mkdir -p $(dirname ${shQuote(SANDBOX_STUDIO_DIR)})` +
-                ` && { [ -L ${shQuote(SANDBOX_STUDIO_DIR)} ] || { rm -rf ${shQuote(SANDBOX_STUDIO_DIR)}; ln -sfn ${shQuote(remoteDir)} ${shQuote(SANDBOX_STUDIO_DIR)}; }; }`)],
+              : ` && (mkdir -p $(dirname ${shQuote(SANDBOX_STUDIO_DIR)}) 2>/dev/null || sudo -n mkdir -p $(dirname ${shQuote(SANDBOX_STUDIO_DIR)}) 2>/dev/null || true)` +
+                ` && ({ [ -L ${shQuote(SANDBOX_STUDIO_DIR)} ] || { rm -rf ${shQuote(SANDBOX_STUDIO_DIR)} 2>/dev/null || sudo -n rm -rf ${shQuote(SANDBOX_STUDIO_DIR)} 2>/dev/null || true; ln -sfn ${shQuote(remoteDir)} ${shQuote(SANDBOX_STUDIO_DIR)} 2>/dev/null || sudo -n ln -sfn ${shQuote(remoteDir)} ${shQuote(SANDBOX_STUDIO_DIR)} 2>/dev/null || true; }; } || true)`)],
           120,
         );
         steps.push(`prepared ${remoteDir}`);
@@ -1559,10 +1569,9 @@ export function createCloudNode(
         nodeRun(
           run,
           ["exec", targetBox, "sh", "-c",
-            "command -v ffmpeg >/dev/null 2>&1 || " +
-            "(sudo -n apt-get update -y >/dev/null 2>&1 || apt-get update -y >/dev/null 2>&1 || true); " +
-            "command -v ffmpeg >/dev/null 2>&1 || " +
-            "(sudo -n apt-get install -y ffmpeg >/dev/null 2>&1 || apt-get install -y ffmpeg >/dev/null 2>&1 || true)"],
+            `has_ffmpeg() { command -v ffmpeg >/dev/null 2>&1 || [ -n "$(find ${shQuote(remoteDir)}/node_modules/@remotion -name ffmpeg -perm -u+x 2>/dev/null | head -1)" ]; }; ` +
+            "has_ffmpeg || (sudo -n apt-get update -y >/dev/null 2>&1 || apt-get update -y >/dev/null 2>&1 || true); " +
+            "has_ffmpeg || (sudo -n apt-get install -y ffmpeg >/dev/null 2>&1 || apt-get install -y ffmpeg >/dev/null 2>&1 || true)"],
           1800,
         );
         steps.push("ffmpeg checked");
@@ -1570,7 +1579,9 @@ export function createCloudNode(
         nodeRun(
           run,
           ["exec", targetBox, "sh", "-c",
-            `cd ${shQuote(remoteDir)} && npm install --no-audit --no-fund && npx remotion browser ensure && touch .kit-ready`],
+            `if [ -f ${shQuote(`${remoteDir}/.kit-ready`)} ] && [ -x ${shQuote(`${remoteDir}/node_modules/.bin/remotion`)} ] && [ -n "$(find ${shQuote(`${remoteDir}/node_modules/.remotion`)} -type f \\( -name chrome-headless-shell -o -name headless_shell \\) -perm -u+x 2>/dev/null | head -1)" ]; then ` +
+            `echo "prebake ready"; ` +
+            `else cd ${shQuote(remoteDir)} && npm install --no-audit --no-fund && npx remotion browser ensure && touch .kit-ready; fi`],
           3600,
         );
         steps.push("npm install completed");
@@ -1584,7 +1595,7 @@ export function createCloudNode(
             `printf '{"cpus":%s,"mem_gb":%s,"disk_gb":%s,"ffmpeg":%s,"studio":%s,"miss":"%s"}\\n' ` +
             `"$(nproc)" "$(awk '/MemAvailable/{printf "%.1f",$2/1048576}' /proc/meminfo)" ` +
             `"$(df -Pk . | awk 'NR==2{printf "%.1f",$4/1048576}')" ` +
-            `"$(command -v ffmpeg >/dev/null && echo true || echo false)" ` +
+            `"$( (command -v ffmpeg >/dev/null 2>&1 || [ -n "$(find node_modules/@remotion -name ffmpeg -perm -u+x 2>/dev/null | head -1)" ]) && echo true || echo false)" ` +
             `"$([ -d node_modules ] && echo true || echo false)" "$miss"`],
           120,
         );
@@ -1606,7 +1617,14 @@ export function createCloudNode(
         if (parsed.ffmpeg !== true) missing.push("ffmpeg");
         if (parsed.studio !== true) missing.push("studio");
         const ok = missing.length === 0;
-        state.ts = 0;
+        if (ok) {
+          state.ok = true;
+          state.why = "ok";
+          state.ts = time.now();
+          state.fails = 0;
+        } else {
+          state.ts = 0;
+        }
         return {
           ok,
           detail: ok

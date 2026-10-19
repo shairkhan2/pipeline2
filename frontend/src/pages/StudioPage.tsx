@@ -4005,12 +4005,37 @@ function NodesTab({
   const [trash, setTrash] = useState<TrashItem[]>([]);
   const [nodeOutputs, setNodeOutputs] = useState<Record<string, { ok: boolean; text: string }>>({});
   const [busyNodeKey, setBusyNodeKey] = useState<string>("");
+  const [sbxDeviceLink, setSbxDeviceLink] = useState<{
+    nodeId?: string;
+    verificationUrl: string | null;
+    userCode: string | null;
+    instructions: string;
+    detail: string;
+  } | null>(null);
   const active = nodes.find((node) => node.id === drawerId) || null;
 
   useEffect(() => {
     const q = settings?.renderQuality || settings?.settings?.renderQuality;
     if (q === "720p" || q === "1080p") setRenderQuality(q);
   }, [settings]);
+
+  useEffect(() => {
+    if (!sbxDeviceLink?.verificationUrl) return;
+    const targetNodeId = sbxDeviceLink.nodeId;
+    const timer = window.setInterval(() => {
+      void api.studio.sbxAuthStatus().then((res) => {
+        if (res.authenticated) {
+          if (targetNodeId) {
+            setNodeOutputs((current) => ({ ...current, [targetNodeId]: { ok: true, text: res.detail } }));
+          }
+          setSbxDeviceLink(null);
+          log(`ok  ${res.detail}`);
+          onNotice("Docker account linked · sbx CLI ready");
+        }
+      }).catch(() => {});
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [sbxDeviceLink?.verificationUrl, sbxDeviceLink?.nodeId, onNotice]);
 
   const handleStorageStateLoaded = useCallback((rep: StudioStorageReport | null, list: TrashItem[]) => {
     if (rep) setStorage(rep);
@@ -4055,21 +4080,55 @@ function NodesTab({
         onNotice(probe.ok ? "Probe ok" : probe.reason);
         return;
       }
-      if (action === "auth-status") {
-        const statusRes = await api.studio.nodeAction(id, "auth-status");
-        log(statusRes.ok ? `ok  ${statusRes.detail}` : `info  ${statusRes.detail}`);
-        if (!statusRes.ok && statusRes.status !== "missing-cli") {
-          const started = await api.studio.nodeAction(id, "auth-start");
-          const url = typeof started.probe?.verificationUrl === "string" ? started.probe.verificationUrl : "";
-          const instructions = typeof started.probe?.instructions === "string" ? started.probe.instructions : "";
-          const combined = [started.detail, instructions, url ? `Login URL: ${url}` : ""].filter(Boolean).join(" · ");
-          log(started.ok ? `ok  ${combined}` : `info  ${combined}`);
-          setNodeOutputs((current) => ({ ...current, [id]: { ok: started.ok, text: combined } }));
-          onNotice(combined);
+      if (action === "auth-status" || action === "auth-start") {
+        if (action === "auth-status") {
+          const statusRes = await api.studio.nodeAction(id, "auth-status");
+          if (statusRes.ok) {
+            setSbxDeviceLink(null);
+            log(`ok  ${statusRes.detail}`);
+            setNodeOutputs((current) => ({ ...current, [id]: { ok: true, text: statusRes.detail } }));
+            onNotice(statusRes.detail);
+            return;
+          }
+          log(`info  ${statusRes.detail}`);
+          if (statusRes.status === "missing-cli") {
+            setNodeOutputs((current) => ({ ...current, [id]: { ok: false, text: statusRes.detail } }));
+            onNotice(statusRes.detail);
+            return;
+          }
+        }
+        const started = await api.studio.sbxAuthStart();
+        if (started.authenticated) {
+          setSbxDeviceLink(null);
+          log(`ok  ${started.detail}`);
+          setNodeOutputs((current) => ({ ...current, [id]: { ok: true, text: started.detail } }));
+          onNotice(started.detail);
           return;
         }
-        setNodeOutputs((current) => ({ ...current, [id]: { ok: statusRes.ok, text: statusRes.detail } }));
-        onNotice(statusRes.detail);
+        const url = typeof started.verificationUrl === "string" ? started.verificationUrl : null;
+        const code = typeof started.userCode === "string" ? started.userCode : null;
+        const instructions = typeof started.instructions === "string" ? started.instructions : "";
+        if (url || code) {
+          setSbxDeviceLink({
+            nodeId: id,
+            verificationUrl: url,
+            userCode: code,
+            instructions,
+            detail: started.detail,
+          });
+          log(`info  One-time code: ${code ?? "—"} · Sign in: ${url ?? "—"}`);
+        }
+        const combined = [
+          started.detail,
+          code ? `Code: ${code}` : "",
+          url ? `Login URL: ${url}` : "",
+          instructions,
+        ].filter(Boolean).join(" · ");
+        if (!url && !code) {
+          log(`info  ${combined}`);
+        }
+        setNodeOutputs((current) => ({ ...current, [id]: { ok: false, text: combined } }));
+        onNotice(combined);
         return;
       }
       const result = await api.studio.nodeAction(id, action);
@@ -4208,6 +4267,19 @@ function NodesTab({
                     <Button
                       type="button"
                       size="sm"
+                      variant="outline"
+                      className="min-h-11 md:min-h-8"
+                      disabled={!privileged || Boolean(busyNodeKey)}
+                      onClick={() => {
+                        setDrawerId(node.id);
+                        void run(node.id, "auth-start");
+                      }}
+                    >
+                      {busyNodeKey === `${node.id}:auth-start` || busyNodeKey === `${node.id}:auth-status` ? "Linking…" : "Link Docker"}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
                       className="min-h-11 md:min-h-8"
                       disabled={!privileged || Boolean(busyNodeKey)}
                       onClick={() => {
@@ -4266,6 +4338,35 @@ function NodesTab({
                   }}
                 /> : null}
               </div>
+              {node.kind === "docker-sbx" && sbxDeviceLink && (!sbxDeviceLink.nodeId || sbxDeviceLink.nodeId === node.id) && (sbxDeviceLink.userCode || sbxDeviceLink.verificationUrl) ? (
+                <div className="mt-3 flex flex-col gap-2 rounded-xl border border-[#2b2c30] bg-[#101113] p-3 text-xs">
+                  {sbxDeviceLink.userCode ? (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[#a2a19f]">One-Time Code:</span>
+                      <code className="rounded border border-[#2b2c30] bg-[#17181a] px-2 py-0.5 font-mono text-sm font-semibold text-[#f2efe9]">
+                        {sbxDeviceLink.userCode}
+                      </code>
+                      <CopyButton value={sbxDeviceLink.userCode} label="Copy code" />
+                    </div>
+                  ) : null}
+                  {sbxDeviceLink.verificationUrl ? (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <a
+                        href={sbxDeviceLink.verificationUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex w-fit items-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-2.5 py-1 font-mono text-xs text-[#5eead4] hover:border-[#f18b6e]"
+                      >
+                        Open Docker Sign-In
+                      </a>
+                      <CopyButton value={sbxDeviceLink.verificationUrl} label="Copy URL" />
+                    </div>
+                  ) : null}
+                  <p className="font-mono text-[11px] text-[#d6b57b]">
+                    Waiting for Docker browser sign-in… (auto-checking every 3s)
+                  </p>
+                </div>
+              ) : null}
               {nodeOutputs[node.id] ? (
                 <div
                   className={cn(
@@ -4314,6 +4415,7 @@ function NodesTab({
               {active?.kind === "docker-sbx" ? (
                 <>
                   <Button type="button" size="sm" variant="outline" disabled={!privileged} onClick={() => void run(active.id, "auth-status")}>Auth</Button>
+                  <Button type="button" size="sm" variant="outline" disabled={!privileged} onClick={() => void run(active.id, "auth-start")}>Link Docker</Button>
                   <Button type="button" size="sm" disabled={!privileged} onClick={() => void run(active.id, "provision")}>Provision</Button>
                   <Button type="button" size="sm" variant="outline" disabled={!privileged} onClick={() => void run(active.id, "start")}>Start</Button>
                   <InlineConfirm label="Stop" subject={active.label} description="Stop sandbox?" disabled={!privileged || Boolean(busyNodeKey)} onConfirm={() => run(active.id, "stop")} />
@@ -4323,6 +4425,36 @@ function NodesTab({
                 <Button type="button" size="sm" disabled={!privileged} onClick={() => void run(active.id, "provision")}>Provision</Button>
               ) : null}
             </div>
+            {active?.kind === "docker-sbx" && sbxDeviceLink && (sbxDeviceLink.userCode || sbxDeviceLink.verificationUrl) ? (
+              <div className="flex flex-col gap-2 rounded-xl border border-[#2b2c30] bg-[#101113] p-3 text-xs">
+                <p className="font-mono text-[#d6b57b]">{sbxDeviceLink.detail}</p>
+                {sbxDeviceLink.userCode ? (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[#a2a19f]">One-Time Code:</span>
+                    <code className="rounded border border-[#2b2c30] bg-[#17181a] px-2 py-0.5 font-mono text-sm font-semibold text-[#f2efe9]">
+                      {sbxDeviceLink.userCode}
+                    </code>
+                    <CopyButton value={sbxDeviceLink.userCode} label="Copy code" />
+                  </div>
+                ) : null}
+                {sbxDeviceLink.verificationUrl ? (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <a
+                      href={sbxDeviceLink.verificationUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex w-fit items-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-2.5 py-1 font-mono text-xs text-[#5eead4] hover:border-[#f18b6e]"
+                    >
+                      Open Docker Sign-In
+                    </a>
+                    <CopyButton value={sbxDeviceLink.verificationUrl} label="Copy URL" />
+                  </div>
+                ) : null}
+                <p className="font-mono text-[11px] text-[#a2a19f]">
+                  Waiting for Docker browser sign-in… (auto-checking every 3s)
+                </p>
+              </div>
+            ) : null}
             <Terminal>
               <TerminalHeader>sbx / ssh</TerminalHeader>
               <TerminalBody>
@@ -4658,6 +4790,7 @@ function NodeDialog({
     ok: boolean;
     detail: string;
     verificationUrl?: string | null;
+    userCode?: string | null;
     instructions?: string;
   } | null>(null);
   const [checkingSbxAuth, setCheckingSbxAuth] = useState(false);
@@ -4739,6 +4872,26 @@ function NodeDialog({
     return () => { cancelled = true; };
   }, [open, kind, editing]);
 
+  useEffect(() => {
+    if (!open || kind !== "docker-sbx" || sbxAuthInfo?.ok || !sbxAuthInfo?.verificationUrl) return;
+    const timer = window.setInterval(() => {
+      void api.studio.sbxAuthStatus().then((res) => {
+        if (res.authenticated) {
+          setSbxAuthInfo({ checked: true, ok: true, detail: res.detail });
+          setDetectedSandboxes(res.sandboxes || []);
+          if (!editing) {
+            const firstName = res.sandboxes?.[0]?.name || "";
+            if (firstName && BOX_RE.test(firstName)) {
+              setBox((cur) => (!cur.trim() || cur === "manhwa-box-1" ? firstName : cur));
+            }
+          }
+          onNotice("Docker account linked · sbx CLI ready");
+        }
+      }).catch(() => {});
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [open, kind, editing, sbxAuthInfo?.ok, sbxAuthInfo?.verificationUrl, onNotice]);
+
   function selectKind(nextKind: RenderNodeKind) {
     setKind(nextKind);
     setSlots((current) => clampSlotsForKind(nextKind, current));
@@ -4758,6 +4911,44 @@ function NodeDialog({
     } else {
       if (!idTouched) setId("local");
       if (!labelTouched) setLabel("Local");
+    }
+  }
+
+  async function startSbxDeviceLink() {
+    if (!privileged || checkingSbxAuth) return;
+    setCheckingSbxAuth(true);
+    setFormError(null);
+    try {
+      const started = await api.studio.sbxAuthStart();
+      if (Array.isArray(started.sandboxes)) {
+        setDetectedSandboxes(started.sandboxes);
+        if (!editing && (!box.trim() || box === "manhwa-box-1") && started.sandboxes.length > 0) {
+          setBox(started.sandboxes[0].name);
+        }
+      }
+      const verificationUrl =
+        typeof started.verificationUrl === "string" ? started.verificationUrl : null;
+      const userCode =
+        typeof started.userCode === "string" ? started.userCode : null;
+      const instructions =
+        typeof started.instructions === "string"
+          ? started.instructions
+          : "Open the Docker verification link and enter the one-time code.";
+      setSbxAuthInfo({
+        checked: true,
+        ok: Boolean(started.authenticated),
+        detail: started.detail,
+        verificationUrl,
+        userCode,
+        instructions,
+      });
+      if (verificationUrl) {
+        window.open(verificationUrl, "_blank", "noopener,noreferrer");
+      }
+    } catch (error) {
+      setFormError(errText(error));
+    } finally {
+      setCheckingSbxAuth(false);
     }
   }
 
@@ -4792,18 +4983,21 @@ function NodeDialog({
         });
         return;
       }
-      const started = await api.studio.nodeAction(targetNodeId, "auth-start");
+      const started = await api.studio.sbxAuthStart();
       const verificationUrl =
-        typeof started.probe?.verificationUrl === "string" ? started.probe.verificationUrl : null;
+        typeof started.verificationUrl === "string" ? started.verificationUrl : null;
+      const userCode =
+        typeof started.userCode === "string" ? started.userCode : null;
       const instructions =
-        typeof started.probe?.instructions === "string"
-          ? started.probe.instructions
+        typeof started.instructions === "string"
+          ? started.instructions
           : "Run `sbx login` in a terminal and finish the browser sign-in flow.";
       setSbxAuthInfo({
         checked: true,
-        ok: started.ok,
+        ok: Boolean(started.authenticated),
         detail: started.detail,
         verificationUrl,
+        userCode,
         instructions,
       });
       if (verificationUrl) {
@@ -5058,36 +5252,65 @@ function NodeDialog({
                     {sbxAuthInfo ? (sbxAuthInfo.ok ? "Signed in" : "Auth needed") : "Unchecked"}
                   </span>
                 </div>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={!privileged || checkingSbxAuth}
-                  onClick={() => void checkOrStartSbxAuth()}
-                >
-                  {checkingSbxAuth ? "Checking…" : "Check / Sign In"}
-                </Button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={!privileged || checkingSbxAuth}
+                    onClick={() => void checkOrStartSbxAuth()}
+                  >
+                    {checkingSbxAuth ? "Checking…" : "Check Auth"}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={!privileged || checkingSbxAuth}
+                    onClick={() => void startSbxDeviceLink()}
+                  >
+                    {checkingSbxAuth ? "Linking…" : "Link Docker Account (URL + Code)"}
+                  </Button>
+                </div>
               </div>
               {sbxAuthInfo ? (
-                <div className="flex flex-col gap-1.5 text-xs">
+                <div className="flex flex-col gap-2 text-xs">
                   <p className={cn("font-mono", sbxAuthInfo.ok ? "text-[#aed1a8]" : "text-[#d6b57b]")}>
                     {sbxAuthInfo.detail}
                   </p>
+                  {!sbxAuthInfo.ok && (sbxAuthInfo.userCode || sbxAuthInfo.verificationUrl) ? (
+                    <div className="flex flex-col gap-2 rounded-xl border border-[#2b2c30] bg-[#17181a] p-3">
+                      {sbxAuthInfo.userCode ? (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-[#a2a19f]">One-time code:</span>
+                          <code className="rounded border border-[#2b2c30] bg-[#101113] px-2.5 py-1 font-mono text-sm font-semibold text-[#f2efe9]">
+                            {sbxAuthInfo.userCode}
+                          </code>
+                          <CopyButton value={sbxAuthInfo.userCode} label="Copy code" />
+                        </div>
+                      ) : null}
+                      {sbxAuthInfo.verificationUrl ? (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <a
+                            href={sbxAuthInfo.verificationUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex w-fit items-center rounded-lg border border-[#2b2c30] bg-[#101113] px-2.5 py-1 font-mono text-xs text-[#5eead4] hover:border-[#f18b6e]"
+                          >
+                            Open Docker Sign-In
+                          </a>
+                          <CopyButton value={sbxAuthInfo.verificationUrl} label="Copy URL" />
+                        </div>
+                      ) : null}
+                      <p className="font-mono text-[11px] text-[#a2a19f]">
+                        Waiting for Docker browser sign-in… (auto-checking every 3s)
+                      </p>
+                    </div>
+                  ) : null}
                   {sbxAuthInfo.instructions ? (
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-[#a2a19f]">{sbxAuthInfo.instructions}</span>
                       <CopyButton value="sbx login" label="Copy sbx login" />
                     </div>
-                  ) : null}
-                  {sbxAuthInfo.verificationUrl ? (
-                    <a
-                      href={sbxAuthInfo.verificationUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex w-fit items-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-2.5 py-1 font-mono text-xs text-[#5eead4] hover:border-[#f18b6e]"
-                    >
-                      Open {sbxAuthInfo.verificationUrl}
-                    </a>
                   ) : null}
                 </div>
               ) : null}
@@ -5105,6 +5328,9 @@ function NodeDialog({
                   {provisioningNow ? "Provisioning…" : "Provision now"}
                 </Button>
               </div>
+              <p className="text-xs text-[#a2a19f]">
+                Provision auto-checks if the prebaked Remotion environment (<code>.kit-ready</code>, headless browser, <code>ffmpeg</code>) is in the sandbox, and creates/bakes it if missing.
+              </p>
               {detectedSandboxes.length ? <div className="flex flex-wrap items-center gap-2 text-xs">
                 <span className="text-[#a2a19f]">Existing sandboxes:</span>
                 {detectedSandboxes.map((sandbox) => <button key={sandbox.id || sandbox.name} type="button" className={cn("chip", box === sandbox.name && "is-on")} aria-pressed={box === sandbox.name} onClick={() => setBox(sandbox.name)}>{sandbox.name} · {sandbox.status}{sandbox.cpus != null ? ` · ${sandbox.cpus} vCPU` : ""}</button>)}

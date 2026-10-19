@@ -795,7 +795,53 @@ describe('nodeRegistry provision: fresh docker-sbx and ssh accounts', () => {
     });
     const started = nodeRegistry.sandboxAuthStart();
     expect(started.verificationUrl).toBe('https://sbx.dev/device?code=ABCD');
+    expect(started.userCode).toBe('ABCD');
     expect(started.instructions).toContain('sbx login');
+  });
+
+  it('extracts Docker device confirmation code and skips legal agreement URL', () => {
+    nodeRegistry._setLocalRunnerForTests((args) => {
+      if (String(args[0]).includes('sh')) return { status: 0, stdout: '/usr/bin/sbx', stderr: '' };
+      return {
+        status: 1,
+        stdout: [
+          'By logging in, you agree to our Subscription Service Agreement. For more details, see https://www.docker.com/legal/docker-subscription-service-agreement/',
+          '',
+          'Your one-time device confirmation code is: MCRN-XWZP',
+          'Complete sign-in in your browser, then return to this terminal.',
+          'Open this URL to sign in: https://login.docker.com/activate?user_code=MCRN-XWZP',
+          '',
+          'Waiting for authentication...',
+        ].join('\n'),
+        stderr: '',
+      };
+    });
+    const started = nodeRegistry.sandboxAuthStart();
+    expect(started.verificationUrl).toBe('https://login.docker.com/activate?user_code=MCRN-XWZP');
+    expect(started.userCode).toBe('MCRN-XWZP');
+    expect(started.instructions).toContain('MCRN-XWZP');
+    expect(started.instructions).toContain('sbx login');
+  });
+
+  it('falls back to `sbx exec` when `sbx start` is unsupported and probes on `status` action', () => {
+    const calls: string[][] = [];
+    cloudlane._setRunnerForTests((args) => {
+      calls.push([...args]);
+      if (args[2] === 'start') {
+        return { status: 1, stdout: '', stderr: 'error: sbx: unknown command: sbx start' };
+      }
+      if (args[2] === 'ls') {
+        return ok(JSON.stringify({ sandboxes: [{ name: 'sbx-arm-1', status: 'running' }] }));
+      }
+      return ok();
+    });
+    writeNodes(outDir, [{ id: 'sbx-arm-1', kind: 'docker-sbx', box: 'sbx-arm-1' }]);
+    const started = nodeRegistry.runNodeAction('sbx-arm-1', 'start', { outDir, allowControl: true });
+    expect(started).toEqual({ ok: true, detail: 'started sbx-arm-1' });
+    expect(calls.some((args) => args[2] === 'exec' && args[3] === 'sbx-arm-1')).toBe(true);
+
+    const status = nodeRegistry.runNodeAction('sbx-arm-1', 'status', { outDir });
+    expect(status).toEqual({ ok: true, detail: 'ok', status: 'available' });
   });
 
   it('creates a base sandbox when the template is missing and deploys the studio', () => {

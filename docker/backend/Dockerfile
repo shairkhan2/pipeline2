@@ -7,9 +7,14 @@ RUN npm ci --prefix remotion-studio
 
 FROM docker.io/library/node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates chromium ffmpeg fonts-dejavu-core fonts-noto-color-emoji \
+    ca-certificates chromium curl ffmpeg fonts-dejavu-core fonts-noto-color-emoji \
     python3 python3-venv openssh-client rsync util-linux \
     && rm -rf /var/lib/apt/lists/* \
+    && ARCH="$(dpkg --print-architecture)" \
+    && SBX_ARCH="$( [ "$ARCH" = "arm64" ] && echo "arm64" || echo "amd64" )" \
+    && curl -fsSL "https://github.com/docker/sbx-releases/releases/latest/download/DockerSandboxes-linux-${SBX_ARCH}.tar.gz" \
+       | tar -xz -C /usr/local/bin --strip-components=1 docker-sbx/sbx \
+    && chmod 0755 /usr/local/bin/sbx \
     && python3 -m venv /opt/tts \
     && /opt/tts/bin/pip install --no-cache-dir edge-tts==7.2.3
 WORKDIR /app
@@ -19,6 +24,7 @@ COPY package.json package-lock.json tsconfig.json ./
 COPY src/ ./src/
 COPY remotion-studio/ ./remotion-studio/
 COPY tools/ ./tools/
+COPY cloud-kit/ ./cloud-kit/
 RUN rm -rf src/player/public \
     && mkdir -p /data/series /data/out/jobs /data/out/config /data/thumbnails /data/auth /app/remotion-studio/public \
     && chown -R node:node /data /app/remotion-studio

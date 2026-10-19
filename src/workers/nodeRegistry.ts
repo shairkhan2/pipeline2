@@ -12,6 +12,7 @@
  * node owns its own state, breaker, and slots. It holds no credentials.
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -435,7 +436,11 @@ export function runNodeAction(
     return { ok: false, detail: `unknown render node ${JSON.stringify(id)}` };
   }
   if (action === "status") {
-    const s = instance.status();
+    let s = instance.status();
+    if (s.status === "unknown" || s.reason === "not probed") {
+      instance.healthy(true);
+      s = instance.status();
+    }
     return { ok: s.ok, detail: s.reason, status: s.status };
   }
   if (action === "provision" || action === "bootstrap") {
@@ -498,11 +503,36 @@ export function runNodeAction(
 /** Test-only: forget every live instance. */
 export function _resetNodeRegistryForTests(): void {
   instances.clear();
+  activeLoginSession = null;
 }
 
 /* ------------------------------------------------------------------ *
  * Fresh-account provisioning & sandbox CLI auth
  * ------------------------------------------------------------------ */
+
+export function parseSbxLoginOutput(text: string): {
+  verificationUrl: string | null;
+  userCode: string | null;
+} {
+  const codeMatch =
+    /confirmation code is:\s*([A-Z0-9]{4,}-[A-Z0-9]{4,})/i.exec(text) ??
+    /[?&](?:user_)?code=([A-Za-z0-9-]+)/i.exec(text);
+  const userCode = codeMatch ? codeMatch[1]! : null;
+
+  const signInMatch = /Open this URL to sign in:\s*(https?:\/\/\S+)/i.exec(text);
+  if (signInMatch) {
+    return { verificationUrl: signInMatch[1]!, userCode };
+  }
+
+  const urls = Array.from(text.matchAll(/https?:\/\/\S+/g), (m) => m[0]).filter(
+    (u) => !/docker\.com\/legal\//i.test(u),
+  );
+  const preferred = urls.find((u) => /activate|device|login|code=/i.test(u));
+  const verificationUrl = preferred ?? urls[0] ?? null;
+  return { verificationUrl, userCode };
+}
+
+let activeLoginSession: { pid: number; logFile: string; startedAt: number } | null = null;
 
 export interface SandboxBoxInfo {
   name: string;
@@ -540,6 +570,75 @@ export function parseSandboxListing(stdout: string): SandboxBoxInfo[] {
   }
 }
 
+/** Ensure `sbx` CLI is installed on the host, auto-downloading on real runtime if missing. */
+export function ensureSbxCliInstalled(): {
+  installed: boolean;
+  binPath: string;
+  detail: string;
+} {
+  if (localRunnerIsCustom) {
+    const probe = runLocal(["sh", "-c", "command -v sbx"], 15);
+    const binPath = probe.status === 0 ? probe.stdout.trim() : "";
+    return {
+      installed: binPath.length > 0,
+      binPath,
+      detail: binPath || "sbx CLI not installed; install it and retry (https://docs.sbx.dev)",
+    };
+  }
+  const localBinDir = path.join(os.homedir(), ".local", "bin");
+  const pathParts = String(process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+  for (const extra of ["/usr/local/bin", localBinDir]) {
+    if (!pathParts.includes(extra)) {
+      pathParts.unshift(extra);
+    }
+  }
+  process.env.PATH = pathParts.join(path.delimiter);
+
+  const probe = runLocal(
+    ["sh", "-c", 'PATH="$HOME/.local/bin:/usr/local/bin:$PATH" command -v sbx'],
+    15,
+  );
+  if (probe.status === 0 && probe.stdout.trim().length > 0) {
+    const binPath = probe.stdout.trim();
+    return { installed: true, binPath, detail: `sbx CLI installed (${binPath})` };
+  }
+
+  const archive =
+    process.platform === "darwin"
+      ? "DockerSandboxes-darwin.tar.gz"
+      : `DockerSandboxes-linux-${process.arch === "arm64" ? "arm64" : "amd64"}.tar.gz`;
+  const url = `https://github.com/docker/sbx-releases/releases/latest/download/${archive}`;
+  const installScript = [
+    "set -e",
+    'TMP_DIR="$(mktemp -d)"',
+    'trap \'rm -rf "$TMP_DIR"\' EXIT',
+    `curl -fsSL "${url}" | tar -xz -C "$TMP_DIR" --strip-components=1 docker-sbx/sbx`,
+    'chmod 0755 "$TMP_DIR/sbx"',
+    'if [ -w /usr/local/bin ]; then mv "$TMP_DIR/sbx" /usr/local/bin/sbx && echo /usr/local/bin/sbx;',
+    'elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then sudo -n mv "$TMP_DIR/sbx" /usr/local/bin/sbx && sudo -n chmod 0755 /usr/local/bin/sbx && echo /usr/local/bin/sbx;',
+    `else mkdir -p "${localBinDir}" && mv "$TMP_DIR/sbx" "${localBinDir}/sbx" && echo "${localBinDir}/sbx"; fi`,
+  ].join("\n");
+  const installRes = runLocal(["sh", "-c", installScript], 120);
+  if (installRes.status === 0) {
+    const verify = runLocal(
+      ["sh", "-c", 'PATH="$HOME/.local/bin:/usr/local/bin:$PATH" command -v sbx'],
+      15,
+    );
+    const binPath = (verify.stdout || installRes.stdout).trim().split("\n").pop()?.trim() ?? "";
+    if (binPath) {
+      return { installed: true, binPath, detail: `sbx CLI auto-installed (${binPath})` };
+    }
+  }
+  const errDetail = (installRes.stderr || installRes.stdout).trim().slice(-300);
+  return {
+    installed: false,
+    binPath: "",
+    detail: errDetail
+      ? `sbx CLI auto-install failed: ${errDetail}`
+      : "sbx CLI not installed; install it and retry (https://docs.sbx.dev)",
+  };
+}
+
 /** `which sbx` + `sbx ls`: is the CLI present and logged in on this host? */
 export function sandboxAuthStatus(): {
   ok: boolean;
@@ -548,6 +647,14 @@ export function sandboxAuthStatus(): {
   detail: string;
   sandboxes: SandboxBoxInfo[];
 } {
+  if (!localRunnerIsCustom) {
+    const localBinDir = path.join(os.homedir(), ".local", "bin");
+    const pathParts = String(process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+    for (const extra of ["/usr/local/bin", localBinDir]) {
+      if (!pathParts.includes(extra)) pathParts.unshift(extra);
+    }
+    process.env.PATH = pathParts.join(path.delimiter);
+  }
   const probe = runLocal(["sh", "-c", "command -v sbx"], 15);
   const installed = probe.status === 0 && probe.stdout.trim().length > 0;
   if (!installed) {
@@ -588,9 +695,23 @@ export function sandboxAuthStart(token?: string): {
   ok: boolean;
   authenticated: boolean;
   verificationUrl: string | null;
+  userCode: string | null;
   instructions: string;
   detail: string;
 } {
+  if (!localRunnerIsCustom) {
+    const cli = ensureSbxCliInstalled();
+    if (!cli.installed) {
+      return {
+        ok: false,
+        authenticated: false,
+        verificationUrl: null,
+        userCode: null,
+        instructions: "Install the `sbx` CLI (https://docs.sbx.dev) and retry.",
+        detail: scrubSecrets(cli.detail),
+      };
+    }
+  }
   const explicit = String(token ?? process.env.SBX_TOKEN ?? "").trim();
   if (explicit) {
     const res = runLocal(["sh", "-c", "sbx auth login --token \"$SBX_TOKEN\" 2>&1 || sbx auth --token \"$SBX_TOKEN\" 2>&1 || true"],
@@ -600,6 +721,7 @@ export function sandboxAuthStart(token?: string): {
       ok: status.authenticated,
       authenticated: status.authenticated,
       verificationUrl: null,
+      userCode: null,
       instructions: "Run `sbx login` in a terminal, or paste an sbx token.",
       detail: scrubSecrets(
         status.authenticated
@@ -610,16 +732,20 @@ export function sandboxAuthStart(token?: string): {
   }
   // Real runtime: a synchronous `sbx login` blocks until the browser flow
   // finishes, so the caller never sees the verification URL. Start it detached
-  // instead, read the first chunk (or wait up to 1500 ms) and leave the process
+  // instead, read the first chunk (or wait up to 4000 ms) and leave the process
   // alive in the background to finish the browser auth.
   if (!localRunnerIsCustom) {
-    const login = startLoginDetached(1500);
-    const urlMatch = /(https?:\/\/\S+)/.exec(login.text);
+    const login = startLoginDetached(4000);
+    const parsed = parseSbxLoginOutput(login.text);
+    const instructions = parsed.userCode
+      ? `Open ${parsed.verificationUrl ?? "the verification URL"} and enter code ${parsed.userCode} to finish \`sbx login\` in your browser.`
+      : "Open the verification URL and finish the browser flow; `sbx login` keeps running in the background.";
     return {
       ok: login.started,
       authenticated: false,
-      verificationUrl: urlMatch ? urlMatch[1]! : null,
-      instructions: "Open the verification URL and finish the browser flow; `sbx login` keeps running in the background.",
+      verificationUrl: parsed.verificationUrl,
+      userCode: parsed.userCode,
+      instructions,
       detail: scrubSecrets(
         login.text.slice(-400)
           || (login.started
@@ -630,12 +756,16 @@ export function sandboxAuthStart(token?: string): {
   }
   const start = runLocal(["sbx", "login"], 20);
   const text = `${start.stdout}\n${start.stderr}`.trim();
-  const urlMatch = /(https?:\/\/\S+)/.exec(text);
+  const parsed = parseSbxLoginOutput(text);
+  const instructions = parsed.userCode
+    ? `Open ${parsed.verificationUrl ?? "the verification URL"} and enter code ${parsed.userCode} to finish \`sbx login\` in your browser.`
+    : "Run `sbx login` in a terminal and finish the browser flow, then retry.";
   return {
     ok: start.status === 0,
     authenticated: start.status === 0,
-    verificationUrl: urlMatch ? urlMatch[1]! : null,
-    instructions: "Run `sbx login` in a terminal and finish the browser flow, then retry.",
+    verificationUrl: parsed.verificationUrl,
+    userCode: parsed.userCode,
+    instructions,
     detail: scrubSecrets(text.slice(-400) || "sbx login started; finish the browser flow"),
   };
 }
@@ -645,19 +775,33 @@ export function sandboxAuthStart(token?: string): {
  * the first chunk (or whatever arrived within `timeoutMs`). The child is
  * unref'd so it outlives this call and can complete the browser flow.
  */
-function startLoginDetached(timeoutMs: number): { text: string; started: boolean } {
+function startLoginDetached(timeoutMs = 4000): { text: string; started: boolean } {
+  if (activeLoginSession && Date.now() - activeLoginSession.startedAt < 5 * 60 * 1000) {
+    try {
+      process.kill(activeLoginSession.pid, 0);
+      const existingText = fs.readFileSync(activeLoginSession.logFile, "utf8");
+      if (parseSbxLoginOutput(existingText).verificationUrl !== null) {
+        return { text: existingText.trim(), started: true };
+      }
+    } catch {
+      activeLoginSession = null;
+    }
+  }
   const dir = fs.mkdtempSync(path.join(process.env.TMPDIR || "/tmp", "sbx-login-"));
   const logFile = path.join(dir, "login.log");
   let started = false;
   let fd: number | null = null;
+  let pid: number | undefined;
   try {
     fd = fs.openSync(logFile, "a", 0o600);
     const child = spawn("sbx", ["login"], {
       detached: true,
       stdio: ["ignore", fd, fd],
     });
+    child.on("error", () => {});
     child.unref();
-    started = child.pid !== undefined;
+    pid = child.pid;
+    started = pid !== undefined;
   } catch {
     started = false;
   } finally {
@@ -669,6 +813,9 @@ function startLoginDetached(timeoutMs: number): { text: string; started: boolean
       }
     }
   }
+  if (started && pid !== undefined) {
+    activeLoginSession = { pid, logFile, startedAt: Date.now() };
+  }
   const readLog = (): string => {
     try {
       return fs.readFileSync(logFile, "utf8");
@@ -679,7 +826,7 @@ function startLoginDetached(timeoutMs: number): { text: string; started: boolean
   const deadline = Date.now() + Math.max(0, timeoutMs);
   let text = readLog();
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
-  while (Date.now() < deadline && !/https?:\/\/\S+/.test(text)) {
+  while (Date.now() < deadline && parseSbxLoginOutput(text).verificationUrl === null) {
     Atomics.wait(sleeper, 0, 0, 50);
     text = readLog();
   }
@@ -745,6 +892,7 @@ function sandboxAuthAction(
     status: started.authenticated ? "authorized" : "pending",
     probe: {
       verificationUrl: started.verificationUrl,
+      userCode: started.userCode,
       instructions: started.instructions,
     },
   };
@@ -759,7 +907,15 @@ function provisionNode(
   const studio = process.env.MANHWA_STUDIO || path.join(REPO_ROOT, "remotion-studio");
   try {
     if (instance.kind === "docker-sbx") {
-      const auth = sandboxAuthStatus();
+      let auth = sandboxAuthStatus();
+      if (!auth.installed && !localRunnerIsCustom) {
+        const cli = ensureSbxCliInstalled();
+        if (cli.installed) {
+          auth = sandboxAuthStatus();
+        } else {
+          return { ok: false, detail: cli.detail, status: "missing-cli" };
+        }
+      }
       if (!auth.installed) return { ok: false, detail: auth.detail, status: "missing-cli" };
       if (!auth.authenticated) {
         return {
