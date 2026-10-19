@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "note": "Curated SHARED prior-source signatures (names / domains / provenance). These are research-discovered signatures valid for OLD archives; they do NOT assert any live/official current status of the groups or their sites. Names are FULL group labels only - never a bare ambiguous token like 'Asura' / 'Reaper' / 'Flame'. Domains are canonical hosts; matching is boundary-safe (case/URL/path/subdomain tolerated).",
+  "sources": [
+    {
+      "id": "asura-scans",
+      "names": ["Asura Scans"],
+      "domains": ["asurascans.com"],
+      "provenance": "https://asurascans.com/",
+      "status": "historic"
+    },
+    {
+      "id": "reaper-scans",
+      "names": ["Reaper Scans"],
+      "domains": ["reaperscans.com"],
+      "provenance": "https://forums.mangadex.org/threads/reaper-scans-shuts-down.2266221/",
+      "status": "historic-shutdown"
+    },
+    {
+      "id": "flame-scans",
+      "names": ["Flame Scans", "Flame Comics"],
+      "domains": ["flamescans.org", "flamecomics.com", "flamecomics.xyz"],
+      "provenance": "https://flamecomics.xyz/novel/1/51511f83b8766907 ; https://everythingmoe.com/changelog.html",
+      "status": "historic"
+    },
+    {
+      "id": "rage-scans",
+      "names": ["Rage Scans", "Rage Team"],
+      "domains": ["ragescans.com"],
+      "provenance": "pipeline/promo_block.py (docstring: seed 'Rage scans', edge banner 'Rage Team'); pipeline/docs/issues.md (historic build: seeds ['Rage scans'], domains ['ragescanscom'])",
+      "status": "project-metadata"
+    }
+  ]
+}

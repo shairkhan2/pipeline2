@@ -1,0 +1,55 @@
+schemaVersion: "2"
+kind: mixin
+name: manhwa-render
+displayName: Manhwa recap render kit
+description: >-
+  Bake the Remotion studio (node_modules + pinned headless-shell browser) into a
+  cloud sandbox so a per-chapter render only ships panels + shots.json, never the
+  585 MB node_modules tree. Pair with docker/sandbox-templates:shell.
+
+# IMPORTANT (verified empirically, 2026-10-10): in a CLOUD sandbox, static
+# files under files/home/ land AFTER setup.install runs — the opposite of the
+# documented order. setup.install therefore cannot see /home/agent/studio.
+# The heavy bake must run in setup.startup, which DOES see the static files.
+# It is marker-guarded so a warm stop/resume replays it as a no-op.
+
+# Static files land at /home/agent/studio/ (from files/home/studio/).
+# shell template already ships Node 22 + npm.
+permissions:
+  network:
+    allow:
+      # install-time only (npm ci / npx). Rendering itself is fully offline.
+      - registry.npmjs.org
+      - remotion.media
+      - playwright.azureedge.net
+      - storage.googleapis.com
+      # apt/npx refresh every configured source, so keep these reachable.
+      - archive.ubuntu.com
+      - security.ubuntu.com
+      - ports.ubuntu.com
+      - download.docker.com
+
+environment:
+  variables:
+    MANHWA_STUDIO: /home/agent/studio
+
+setup:
+  startup:
+    # Runs on create AND on every resume; the .kit-ready guard makes it a no-op
+    # once baked. Idempotent by design (required by the startup contract).
+    - command:
+        - sh
+        - -c
+        - >
+          set -e;
+          cd /home/agent/studio;
+          if [ ! -f .kit-ready ]; then
+            npm ci --no-audit --no-fund &&
+            npx remotion browser ensure &&
+            test -x node_modules/.bin/remotion &&
+            test -x "$(find node_modules/.remotion -type f \( -name chrome-headless-shell -o -name headless_shell \) -perm -u+x | head -1)" &&
+            touch .kit-ready;
+          fi
+      user: "1000"
+      background: false
+      description: Bake studio deps + pinned browser (once)

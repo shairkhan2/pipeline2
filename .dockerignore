@@ -1,0 +1,16 @@
+**/node_modules
+.git
+.env
+.env.*
+env.sh
+secrets
+series
+out
+thumbnails
+**/.auth_secret
+**/.htpasswd
+**/.temp_users.json
+**/*.log
+remotion-studio/public
+src/player/public/previews
+tests

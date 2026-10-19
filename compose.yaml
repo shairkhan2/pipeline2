@@ -1,0 +1,44 @@
+services:
+  backend:
+    image: pipeline-v2-backend:local
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    shm_size: 1gb
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PLAYER_API_ONLY: "1"
+      HOST: 0.0.0.0
+      PORT: "8080"
+    volumes:
+      - pipeline-data:/data
+    secrets:
+      - player_htpasswd
+    expose:
+      - "8080"
+
+  frontend:
+    image: pipeline-v2-frontend:local
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:8080
+    ports:
+      - "${PLAYER_BIND:-127.0.0.1}:${PLAYER_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pipeline-data:
+
+secrets:
+  player_htpasswd:
+    file: ./secrets/player.htpasswd
