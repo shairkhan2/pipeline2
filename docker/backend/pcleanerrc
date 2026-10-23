@@ -1,0 +1,60 @@
+[General]
+
+# Interface language. Leave blank to use the system default.
+locale = 
+
+# The default profile to use. Leave blank to use the built-in default profile.
+default_profile = 
+
+# This is the command used to open the profile files.
+# If blank, the system default editor is used.
+profile_editor = 
+
+# This is the directory where the program will store temporary files.
+# If blank, the default directory is used.
+cache_dir = /opt/panelcleaner/cache
+
+# This is the path to the default torch model.
+# It is downloaded automatically if blank.
+default_torch_model_path = 
+
+# This is the path to the default cv2 model.
+# It is downloaded automatically if blank.
+default_cv2_model_path = /opt/panelcleaner/cache/model/comictextdetector.pt.onnx
+
+# This is the theme to use for the GUI.
+# If blank, the system default theme is used.
+# Built-in themes are Breeze and Breeze Dark
+gui_theme = 
+
+# Show out-of-memory warnings.
+show_oom_warnings = True
+
+
+
+[Post-Action]
+# Post-Action settings from the GUI
+
+# Remember the last action taken.
+pa_remember_action = False
+
+# Last action taken.
+pa_last_action = 
+
+# Wait time before executing the action.
+pa_wait_time = 5
+
+# Shutdown command to use.
+pa_shutdown_command = 
+
+# Cancel the custom action if an error occurs.
+pa_cancel_on_error = True
+
+# Commands are stored in Base32, to prevent issues with special characters.
+# This is a GUI-only feature, so readability isn't a concern.
+[Custom Commands]
+
+
+
+[Saved Profiles]
+

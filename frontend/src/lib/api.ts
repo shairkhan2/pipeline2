@@ -48,11 +48,12 @@ export type ProviderAuthMode =
   | "none";
 export type StageId = "reader" | "matcher" | "writer" | "scout" | "fact_check";
 export type PromptStageId = "reader" | "writer" | "story_writer" | "matcher" | "outro";
-export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type RenderQuality = "1080p" | "720p";
-export type RenderNodeKind = "local" | "docker-sbx" | "ssh";
+import { parseIntakeJob, type JobRecord, type RenderNodeKind } from "./renderLanes";
+export { parseIntakeJob, type JobRecord, type RenderNodeKind };
+export type { AutoRetry, AutoRetrySettings, StageRetryFields } from "./retry";
 export type NodeAction = "start" | "pause" | "stop" | "status" | "provision" | "auth-status" | "auth-start";
-export type LaneControlAction = "pause" | "resume" | "stop";
 export type OutroHookType = "part2" | "next_chapter" | "new_series" | "custom";
 export type TrashKind = "chapter-video" | "full-video" | "series-cache" | "series" | "artifact";
 
@@ -160,36 +161,6 @@ export interface LanesState {
   [key: string]: unknown;
 }
 
-export interface JobRecord {
-  id: string;
-  status?: string;
-  paused?: boolean;
-  stage?: string;
-  title?: string;
-  slug?: string;
-  error?: string | null;
-  actions?: string[];
-  controlActions?: string[];
-  [key: string]: unknown;
-}
-
-export function parseIntakeJob(raw: unknown): JobRecord {
-  if (!raw || typeof raw !== "object") {
-    return { id: "", paused: false, actions: [], controlActions: [] };
-  }
-  const r = raw as Record<string, unknown>;
-  const rawActions = Array.isArray(r.actions) ? r.actions.map((a) => String(a)) : [];
-  const rawControl = Array.isArray(r.controlActions) ? r.controlActions.map((a) => String(a)) : [];
-  const actions = Array.from(new Set([...rawActions, ...rawControl]));
-  return {
-    ...r,
-    id: typeof r.id === "string" ? r.id : String(r.id ?? ""),
-    paused: Boolean(r.paused),
-    actions,
-    controlActions: Array.isArray(r.controlActions) ? rawControl : rawActions.filter((a) => a === "pause" || a === "resume" || a === "stop" || a === "cancel"),
-  };
-}
-
 export interface JobsList {
   schemaVersion: number;
   at: number;
@@ -200,9 +171,28 @@ export interface JobsList {
   [key: string]: unknown;
 }
 
+export type SeriesStyle = Partial<Record<'writerMode' | 'matchMode' | 'emotionTags' | 'pacing', string>>;
+export type StyleOptions = Record<keyof SeriesStyle, Array<{ value: string; label: string; description: string }>>;
+export interface TtsStyle { voice_id?: string; speed?: number; style?: string; language?: string }
+export interface SeriesSettings {
+  style: SeriesStyle;
+  tts: TtsStyle & { engine?: string };
+  visuals: { background?: string; motion?: string };
+  styleOptions: StyleOptions;
+}
+export interface SeriesSettingsPatch {
+  style?: Partial<Record<keyof SeriesStyle, string | null>>;
+  tts?: { voice_id?: string | null; speed?: number | null; style?: string | null; language?: string | null };
+  visuals?: { background?: string; motion?: string };
+}
+
 export interface IntakeCatalog {
+  styleOptions?: StyleOptions;
+  ttsOptions?: { speed: { min: number; max: number; step: number; description: string }; style: { description: string }; language: { description: string } };
   schemaVersion: number;
   defaultProvider: string;
+  defaultRenderLane?: string;
+  defaultRenderQuality?: RenderQuality;
   providers: Array<Record<string, unknown>>;
   renderLanes: unknown;
   backgrounds: string[];
@@ -262,6 +252,11 @@ export interface SeriesOutroState {
   slug: string;
   exists?: boolean;
   hasOutro?: boolean;
+  hasVideo?: boolean;
+  rendered?: boolean;
+  renderError?: string | null;
+  audioError?: string | null;
+  warning?: string | null;
   script?: string;
   narration?: string;
   text?: string;
@@ -269,13 +264,46 @@ export interface SeriesOutroState {
   hookType?: OutroHookType;
   totalChapters?: number;
   coveredChapters?: number;
+  availableChapters?: string[];
   panels?: OutroCharacterPanel[];
   selectedPanels?: OutroCharacterPanel[];
   characters?: Array<{ name: string; role?: string; description?: string; visual?: string }>;
   audioUrl?: string | null;
   videoUrl?: string | null;
+  videoUpdatedAt?: number | null;
+  generatedAt?: string | null;
   shotsPath?: string | null;
   updatedAt?: number | null;
+  [key: string]: unknown;
+}
+
+export interface SeriesOutroAttachment {
+  /** An explicit saved preference exists. False means the legacy include-by-default behaviour. */
+  explicit: boolean;
+  enabled: boolean;
+  /** Chapter the attached outro follows (always the newest rendered chapter). */
+  targetChapter: string | null;
+  tailChapter: string | null;
+  addedSinceAttach?: boolean;
+  videoChanged?: boolean;
+  missing?: boolean;
+  /** Enabled attachment whose render is gone: merge is refused instead of dropping it. */
+  blocked?: boolean;
+  videoAvailable?: boolean;
+  stale?: boolean;
+  attachedAt?: string | null;
+  /** Whether the next Merge All Chapters click includes the outro. */
+  nextMergeIncludesOutro: boolean;
+  message?: string;
+  [key: string]: unknown;
+}
+
+export interface SeriesOutroAttachmentResult {
+  ok?: boolean;
+  slug?: string;
+  attachment?: SeriesOutroAttachment;
+  merge?: SeriesMergeState;
+  error?: string;
   [key: string]: unknown;
 }
 
@@ -296,6 +324,14 @@ export interface SeriesMergeState {
   chaptersMerged?: string[];
   chapterCount?: number;
   includesOutro?: boolean;
+  /** Saved outro attachment state; absent on older servers. */
+  attachment?: SeriesOutroAttachment;
+  outro?: {
+    included?: boolean;
+    targetChapter?: string | null;
+    position?: number | null;
+    videoUrl?: string | null;
+  };
   updatedAt?: number | null;
   mtime?: number | null;
   message?: string;
@@ -326,8 +362,59 @@ export interface SeriesExtendResult {
   newChapters?: string[];
   targetChapters?: string;
   message?: string;
+  warnings?: string[];
   [key: string]: unknown;
 }
+
+import {
+  type LanguageExportState,
+  type LanguageGenerateInput,
+  type LanguageMergeInput,
+  type LanguageOutroInput,
+  type LanguagePreviewResult,
+  type SeriesLanguagesState,
+} from "./languages";
+
+export {
+  LANGUAGE_SPEED_MAX,
+  LANGUAGE_SPEED_MIN,
+  defaultLanguageChapters,
+  firstAvailableLanguageVoice,
+  hasLanguageVideo,
+  isLanguageChapterRetryable,
+  isLanguageExportBusy,
+  isLanguageVersionActive,
+  languageChapterNumber,
+  languageChapterSettings,
+  languageChapterSpec,
+  languageChapterWarnings,
+  languageMediaUrl,
+  languageProviderLabel,
+  languageRetryGroups,
+  languageVoiceGroups,
+  languageVoiceModelId,
+  languageVoiceUnavailableReason,
+  mergeNewerSnapshot,
+  type LanguageCatalogEntry,
+  type LanguageChapterSpec,
+  type LanguageChapterVersion,
+  type LanguageExportChapterNote,
+  type LanguageExportError,
+  type LanguageExportOutcome,
+  type LanguageExportState,
+  type LanguageGenerateInput,
+  type LanguageMergeInput,
+  type LanguageOutroInput,
+  type LanguagePreviewResult,
+  type LanguageRetryGroup,
+  type LanguageRetrySettings,
+  type LanguageSourceChapter,
+  type LanguageVersion,
+  type LanguageVersionStatus,
+  type LanguageVoice,
+  type LanguageVoiceModelGroup,
+  type SeriesLanguagesState,
+} from "./languages";
 
 export type StagePromptValue =
   | string
@@ -381,14 +468,20 @@ function normalizePromptsState(state: StudioPromptsState): StudioPromptsState {
 }
 
 export interface StudioSettingsState {
+  autoRetry?: import("./retry").AutoRetrySettings;
+  defaultOutro?: { enabled: boolean; hookType: OutroHookType; customNote: string };
   schemaVersion?: number;
   revision?: number;
   renderQuality: RenderQuality;
+  defaultRenderLane?: string;
   preserveCacheHashes?: boolean;
   updatedAt?: number | null;
   updatedBy?: string | null;
   settings?: {
+    autoRetry?: import("./retry").AutoRetrySettings;
+    defaultOutro?: { enabled: boolean; hookType: OutroHookType; customNote: string };
     renderQuality?: RenderQuality;
+    defaultRenderLane?: string;
     preserveCacheHashes?: boolean;
     [key: string]: unknown;
   };
@@ -450,6 +543,8 @@ export interface StudioStorageReport {
 }
 
 export interface GdriveJobInput {
+  style?: SeriesStyle;
+  tts?: TtsStyle;
   gdriveUrl: string;
   title: string;
   slug?: string;
@@ -464,6 +559,8 @@ export interface GdriveJobInput {
 }
 
 export interface UploadJobInput {
+  style?: SeriesStyle;
+  tts?: TtsStyle;
   file: Blob;
   filename?: string;
   title: string;
@@ -600,6 +697,7 @@ export interface ProviderUpsert {
   expectedRevision?: number;
   revokeSecret?: boolean;
   verifyBeforeSave?: boolean;
+  createOnly?: boolean;
 }
 
 export interface DiscoveredModel {
@@ -1095,6 +1193,8 @@ export const api = {
       if (input.renderLane) query.renderLane = input.renderLane;
       if (input.renderQuality) query.renderQuality = input.renderQuality;
       if (input.outroConfig) query.outroConfig = JSON.stringify(input.outroConfig);
+      if (input.style) query.style = JSON.stringify(input.style);
+      if (input.tts) query.tts = JSON.stringify(input.tts);
       const progressCb = onProgress ?? input.onProgress;
       if (progressCb && typeof XMLHttpRequest !== "undefined") {
         return (async () => {
@@ -1177,6 +1277,66 @@ export const api = {
   },
 
   series: {
+    getSettings(slug: string): Promise<SeriesSettings> {
+      return request(`/api/series/${enc(slug)}/settings`);
+    },
+    patchSettings(slug: string, patch: SeriesSettingsPatch): Promise<SeriesSettings> {
+      return request(`/api/series/${enc(slug)}/settings`, { method: 'PATCH', body: patch });
+    },
+    /** Language versions: catalog, English source eligibility, and per-chapter Hindi progress. */
+    languages(slug: string, signal?: AbortSignal): Promise<SeriesLanguagesState> {
+      return request<SeriesLanguagesState>(`/api/series/${enc(slug)}/languages`, { signal, timeoutMs: 20000 });
+    },
+    generateLanguage(slug: string, input: LanguageGenerateInput, signal?: AbortSignal): Promise<SeriesLanguagesState> {
+      return request<SeriesLanguagesState>(`/api/series/${enc(slug)}/languages`, {
+        method: "POST",
+        body: input,
+        signal,
+        timeoutMs: 60000,
+      });
+    },
+    previewLanguage(
+      slug: string,
+      input: { locale: string; voice: string; speed?: number },
+      signal?: AbortSignal,
+    ): Promise<LanguagePreviewResult> {
+      return request<LanguagePreviewResult>(`/api/series/${enc(slug)}/languages/preview`, {
+        method: "POST",
+        body: input,
+        signal,
+        timeoutMs: 60000,
+      });
+    },
+    /** Merge/outro/download state of one language version (e.g. `hi-IN`). */
+    languageExport(slug: string, locale: string, signal?: AbortSignal, includeOutro?: boolean): Promise<LanguageExportState> {
+      const query = includeOutro === undefined ? "" : `?includeOutro=${includeOutro}`;
+      return request<LanguageExportState>(`/api/series/${enc(slug)}/languages/${enc(locale)}/export${query}`, {
+        signal,
+        timeoutMs: 20000,
+      });
+    },
+    /**
+     * Start joining finished language chapters (plus the language outro when present).
+     * Answers 202 at once with `busy.merge: true`; poll `languageExport` until it clears,
+     * then read `lastMerge`.
+     */
+    mergeLanguage(slug: string, locale: string, input: LanguageMergeInput = {}, signal?: AbortSignal): Promise<LanguageExportState> {
+      return request<LanguageExportState>(`/api/series/${enc(slug)}/languages/${enc(locale)}/merge`, {
+        method: "POST",
+        body: input,
+        signal,
+        timeoutMs: 30000,
+      });
+    },
+    /** Start making or replacing the language outro (202, then poll; outcome in `lastOutro`). */
+    generateLanguageOutro(slug: string, locale: string, input: LanguageOutroInput = {}, signal?: AbortSignal): Promise<LanguageExportState> {
+      return request<LanguageExportState>(`/api/series/${enc(slug)}/languages/${enc(locale)}/outro`, {
+        method: "POST",
+        body: input,
+        signal,
+        timeoutMs: 30000,
+      });
+    },
     getOutro(slug: string): Promise<SeriesOutroState> {
       return request<SeriesOutroState>(`/api/series/${enc(slug)}/outro`);
     },
@@ -1189,6 +1349,13 @@ export const api = {
     },
     getMerge(slug: string): Promise<SeriesMergeState> {
       return request<SeriesMergeState>(`/api/series/${enc(slug)}/merge`);
+    },
+    setOutroAttachment(slug: string, enabled: boolean): Promise<SeriesOutroAttachmentResult> {
+      return request<SeriesOutroAttachmentResult>(`/api/series/${enc(slug)}/outro/attachment`, {
+        method: "POST",
+        body: { enabled },
+        timeoutMs: 30000,
+      });
     },
     mergeAll(slug: string, payload?: { includeOutro?: boolean; force?: boolean }): Promise<SeriesMergeState> {
       return request<SeriesMergeState>(`/api/series/${enc(slug)}/merge`, {
@@ -1394,16 +1561,6 @@ export const api = {
         timeoutMs: action === "provision" ? 300000 : 60000,
       });
     },
-    controlLane(
-      laneId: string,
-      action: LaneControlAction,
-    ): Promise<{ ok: boolean; laneId?: string; id?: string; action: LaneControlAction; status?: string; detail?: string; message?: string }> {
-      return request("/api/studio/lanes/control", {
-        method: "POST",
-        body: { laneId, id: laneId, action },
-        timeoutMs: 45000,
-      });
-    },
     getPrompts(): Promise<StudioPromptsState> {
       return request<StudioPromptsState>("/api/studio/prompts").then(normalizePromptsState);
     },
@@ -1451,9 +1608,12 @@ export const api = {
       return request<StudioSettingsState>("/api/studio/settings");
     },
     putSettings(payload: {
+      autoRetry?: Partial<import("./retry").AutoRetrySettings>;
       renderQuality?: RenderQuality;
+      defaultRenderLane?: string;
       preserveCacheHashes?: boolean;
       revision?: number;
+      expectedRevision?: number;
       [key: string]: unknown;
     }): Promise<StudioSettingsState> {
       return request<StudioSettingsState>("/api/studio/settings", {

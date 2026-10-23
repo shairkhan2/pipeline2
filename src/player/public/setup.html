@@ -4,19 +4,32 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Setup — Screening Room</title>
-    <meta name="theme-color" content="#101113" />
+    <meta name="theme-color" content="#ffffff" />
+    <script>
+      (function () {
+        try {
+          var m = localStorage.getItem("sr-theme-mode");
+          var a = localStorage.getItem("sr-theme-accent") || "ink";
+          var d = m === "dark" || ((m === null || m === "system") && matchMedia("(prefers-color-scheme: dark)").matches);
+          var r = document.documentElement;
+          r.classList.toggle("dark", d);
+          r.dataset.theme = d ? "dark" : "light";
+          r.dataset.accent = a;
+          r.style.colorScheme = d ? "dark" : "light";
+          document.querySelector('meta[name="theme-color"]').content = d ? "#1b1b1d" : "#ffffff";
+        } catch (e) {}
+      })();
+    </script>
     <meta name="description" content="First-run setup for the Screening Room." />
+    <link rel="icon" type="image/png" href="/icons/icon-192.png" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Screening Room" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=Fraunces:opsz,wght@9..144,560;9..144,650&family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700&display=swap" rel="stylesheet" />
-    <script type="module" crossorigin src="/assets/main-9qZ9fjVr.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/main-BNP7Bocx.css">
+    <script type="module" crossorigin src="/assets/main-VHF2vuen.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/main-xAGBlJWI.css">
   </head>
   <body>
     <div id="root"></div>

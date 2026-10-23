@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
-import { Download, Film, HardDrive, Play, Plus, RefreshCw, Search, Sparkles, Trash2, X } from "lucide-react";
+import { Download, Film, HardDrive, Info, Play, Plus, RefreshCw, Search, Sparkles, Trash2 } from "lucide-react";
 
 import { AppShell } from "@/components/layout/AppShell";
+import { LanguageVersions } from "@/components/library/LanguageVersions";
+import { SeriesSettingsEditor } from '@/components/library/SeriesSettingsEditor';
 import { StorageTrashDrawer } from "@/components/shared/StorageTrashDrawer";
+import { ErrorNotice, Notice, RawDetails } from "@/components/ui/notice";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -15,15 +19,16 @@ import {
 import { Input } from "@/components/ui/input";
 import {
   api,
-  isApiError,
   type LibraryChapter,
   type LibrarySeries,
   type LibrarySnapshot,
   type OutroCharacterPanel,
   type OutroHookType,
   type SeriesMergeState,
+  type SeriesOutroAttachment,
   type SeriesOutroState,
 } from "@/lib/api";
+import { describeError, type ErrorInfo } from "@/lib/errors";
 import { cn } from "@/lib/utils";
 
 const RATES = [0.75, 1, 1.25, 1.5, 2] as const;
@@ -238,10 +243,8 @@ function libraryShape(data: LibrarySnapshot | null): string {
   ]);
 }
 
-function errText(error: unknown, fallback: string): string {
-  if (isApiError(error)) return error.message;
-  if (error instanceof Error && error.message) return error.message;
-  return fallback;
+function requestInfo(error: string | ErrorInfo): ErrorInfo {
+  return typeof error === "string" ? describeError(error) : error;
 }
 
 async function toggleFullscreen(video: HTMLVideoElement): Promise<void> {
@@ -274,7 +277,7 @@ function Poster({
   const [broken, setBroken] = useState(false);
   if (broken) {
     return (
-      <span className={cn("grid place-items-center bg-[#202125] font-serif text-3xl text-[#a2a19f]", className)} aria-hidden>
+      <span className={cn("grid place-items-center bg-muted text-3xl font-semibold tracking-[-0.02em] text-muted-foreground", className)} aria-hidden>
         {(alt || slug).slice(0, 1).toUpperCase()}
       </span>
     );
@@ -294,14 +297,14 @@ function Poster({
 function ProgressTrack({ pct, label }: { pct: number; label: string }) {
   return (
     <span
-      className="block h-1 overflow-hidden rounded-full bg-[#2b2c30]"
+      className="block h-1 overflow-hidden rounded-full bg-raised"
       role="progressbar"
       aria-label={label}
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={Math.round(pct)}
     >
-      <span className="block h-full bg-[#f18b6e]" style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
+      <span className="block h-full bg-primary" style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
     </span>
   );
 }
@@ -309,7 +312,7 @@ function ProgressTrack({ pct, label }: { pct: number; label: string }) {
 export function LibraryPage() {
   const [route, setRoute] = useState<LibraryRoute>(() => parseHash(window.location.hash || "#/"));
   const [library, setLibrary] = useState<LibrarySnapshot | null>(null);
-  const [loadError, setLoadError] = useState("");
+  const [loadError, setLoadError] = useState<string | ErrorInfo>("");
   const [warning, setWarning] = useState("");
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState(() => storage.get("library-sort") || "latest");
@@ -344,7 +347,7 @@ export function LibraryPage() {
         setWarning("Couldn’t refresh the library. Showing the last copy.");
         return;
       }
-      setLoadError(errText(error, "Couldn’t load the library."));
+      setLoadError(describeError(error, "Couldn’t load the library."));
       showToast("Couldn’t refresh. Please try again.");
     } finally {
       if (manual) setRefreshing(false);
@@ -368,7 +371,7 @@ export function LibraryPage() {
         setLoadError("");
       })
       .catch((error: unknown) => {
-        if (!stop) setLoadError(errText(error, "Couldn’t load the library."));
+        if (!stop) setLoadError(describeError(error, "Couldn’t load the library."));
       });
     return () => {
       stop = true;
@@ -485,17 +488,12 @@ export function LibraryPage() {
   let body: ReactNode;
   if (!library && loadError) {
     body = (
-      <EmptyState title="We lost the connection." text={loadError}>
-        <Button type="button" className="min-h-11" onClick={() => void refresh(true)}>
-          <RefreshCw className="size-4" aria-hidden /> Try again
-        </Button>
-      </EmptyState>
+      <ErrorNotice className="[&_button]:min-h-11" info={requestInfo(loadError)} onRetry={() => void refresh(true)} />
     );
   } else if (!library) {
     body = (
       <div className="py-16" aria-busy="true">
-        <p className="font-serif text-3xl">Setting the scene…</p>
-        <p className="mt-2 text-sm text-[#a2a19f]">Loading your collection.</p>
+        <p className="text-sm text-muted-foreground">Loading…</p>
       </div>
     );
   } else if (route.view === "artwork") {
@@ -522,6 +520,7 @@ export function LibraryPage() {
   } else if (route.view === "series") {
     body = activeSeries ? (
       <SeriesView
+        key={activeSeries.slug}
         series={activeSeries}
         privileged={privileged}
         query={query}
@@ -535,14 +534,14 @@ export function LibraryPage() {
   } else if (series.length === 0) {
     body = (
       <EmptyState
-        title="The screen is ready. Your stories are on their way."
-        text="Finished chapters appear here automatically. Start a series, or open the studio to connect a provider."
+        title="No videos yet"
+        text="Rendered chapters show up here on their own. Start a series from a Drive link or ZIP, or connect a model provider in settings first."
       >
-        <a className="inline-flex min-h-11 items-center rounded-lg bg-[#f18b6e] px-3 text-sm font-medium text-[#201713]" href="/new-series.html">
-          New series
+        <a className="inline-flex min-h-11 items-center rounded-full bg-primary px-4 text-[14.5px] font-medium text-primary-foreground hover:bg-primary-hover" href="/new-series.html">
+          Start a series
         </a>
-        <a className="inline-flex min-h-11 items-center rounded-lg border border-[#3c3e44] px-3 text-sm" href="/studio.html">
-          Studio
+        <a className="inline-flex min-h-11 items-center rounded-full bg-background px-4 text-[14.5px] font-medium hover:bg-muted" href="?settings=providers">
+          Open settings
         </a>
       </EmptyState>
     );
@@ -572,10 +571,10 @@ export function LibraryPage() {
       title={shellTitle}
       actions={
         showSearch ? (
-          <div className="flex items-center gap-2">
-            <label className="relative block">
+          <div className="flex min-w-0 items-center gap-2">
+            <label className="relative block min-w-0">
               <span className="sr-only">{route.view === "artwork" ? "Search artwork" : "Search series or chapter"}</span>
-              <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-[#a2a19f]" aria-hidden />
+              <Search className="pointer-events-none absolute top-1/2 left-3.5 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
               <Input
                 id="library-search"
                 type="search"
@@ -584,43 +583,42 @@ export function LibraryPage() {
                 aria-label={route.view === "artwork" ? "Search artwork" : "Search series or chapter"}
                 autoComplete="off"
                 spellCheck={false}
-                className="h-11 w-[min(280px,46vw)] pl-8"
+                className="h-10 w-[min(300px,40vw)] rounded-full border-transparent bg-card pl-9 max-sm:w-[min(200px,44vw)]"
                 onChange={(event) => setQuery(event.target.value)}
               />
             </label>
-            <Button
+            <Tooltip label="Storage" side="bottom"><Button
               type="button"
               variant="outline"
-              className="min-h-11"
+              className="max-sm:hidden"
               aria-label="Storage & Trash"
               onClick={() => setStorageOpen(true)}
             >
               <HardDrive className="size-4" aria-hidden />
-              <span className="hidden sm:inline">Storage &amp; Trash</span>
-            </Button>
-            <Button
+              <span className="hidden lg:inline">Storage</span>
+            </Button></Tooltip>
+            <Tooltip label="Refresh" side="bottom"><Button
               type="button"
               variant="outline"
-              className="min-h-11"
+              size="icon"
+              className="max-sm:hidden"
               aria-label="Refresh library"
               disabled={refreshing}
               onClick={() => void refresh(true)}
             >
               <RefreshCw className={cn("size-4", refreshing && "animate-spin")} aria-hidden />
-            </Button>
+            </Button></Tooltip>
           </div>
         ) : null
       }
     >
       {warning ? (
-        <p className="mb-4 rounded-xl border border-[#3c3e44] bg-[#191a1d] px-4 py-3 text-sm text-[#d6b57b]" role="status">
-          {warning}
-        </p>
+        <Notice tone="warning" title="Library update failed" className="mb-4" details={<RawDetails text={warning} />} />
       ) : null}
       {body}
       <p className="sr-only" role="status" aria-live="polite">{toast}</p>
       {toast ? (
-        <div className="fixed bottom-20 left-1/2 z-50 -translate-x-1/2 rounded-full bg-[#f2efe9] px-4 py-2 text-sm text-[#201713] shadow-lg md:bottom-6" role="status">
+        <div className="fixed bottom-20 left-1/2 z-50 -translate-x-1/2 rounded-full bg-foreground px-4 py-2 text-sm text-background shadow-float md:bottom-6" role="status">
           {toast}
         </div>
       ) : null}
@@ -632,16 +630,16 @@ export function LibraryPage() {
         onDeleted={(subject, message) => void onDeleted(subject, message)}
       />
       <Dialog open={Boolean(light)} onOpenChange={(open) => { if (!open) setLight(null); }}>
-        <DialogContent className="sm:max-w-3xl" aria-describedby={undefined}>
+        <DialogContent className="[&_[data-slot=dialog-close]]:size-11 sm:max-w-3xl" aria-describedby={undefined}>
           {light ? (
             <>
               <DialogHeader>
-                <DialogTitle className="font-serif text-2xl">{artworkLabel(light.name)}</DialogTitle>
+                <DialogTitle className="break-words text-2xl font-semibold tracking-[-0.015em]">{artworkLabel(light.name)}</DialogTitle>
                 <DialogDescription>{light.name} · {fmtSize(light.size)}</DialogDescription>
               </DialogHeader>
-              <img src={light.url} alt={artworkLabel(light.name)} className="max-h-[70vh] w-full rounded-lg object-contain bg-black" />
+              <img src={light.url} alt={artworkLabel(light.name)} className="max-h-[65vh] w-full rounded-2xl bg-muted object-contain" />
               <DialogFooter>
-                <a className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-[#f18b6e] px-3 text-sm font-medium text-[#201713]" href={`${light.url}?download=1`} download={light.name}>
+                <a className="inline-flex min-h-11 items-center gap-2 rounded-full bg-primary px-4 text-[14.5px] font-medium text-primary-foreground hover:bg-primary-hover" href={`${light.url}?download=1`} download={light.name}>
                   <Download className="size-4" aria-hidden /> Download
                 </a>
               </DialogFooter>
@@ -678,14 +676,14 @@ function HomeView({
   onClear: () => void;
 }) {
   return (
-    <div className="space-y-8">
+    <div className="space-y-10 pt-2">
       {resume.length ? (
         <section aria-label="Continue watching">
           <div className="mb-3 flex items-baseline justify-between gap-3">
-            <h2 className="font-serif text-2xl">Continue watching</h2>
-            <p className="text-xs tracking-[0.14em] text-[#a2a19f] uppercase">{resume.length} in progress</p>
+            <h2 className="text-xl font-semibold tracking-[-0.01em]">Continue watching</h2>
+            <p className="text-[14px] text-muted-foreground">{resume.length} in progress</p>
           </div>
-          <div className="flex gap-3 overflow-x-auto pb-2 snap-x snap-mandatory">
+          <div className="-mx-4 flex snap-x snap-mandatory gap-3 overflow-x-auto px-4 pb-2 md:mx-0 md:px-0">
             {resume.map((item) => {
               const pct = item.chapter.duration ? Math.min(100, (item.pos / item.chapter.duration) * 100) : 0;
               const left = item.chapter.duration ? fmtTime(item.chapter.duration - item.pos) : fmtTime(item.pos);
@@ -696,14 +694,14 @@ function HomeView({
                   className="w-44 shrink-0 snap-start"
                   aria-label={`Continue ${item.series.title}, chapter ${item.chapter.num}, ${left} remaining`}
                 >
-                  <span className="relative block aspect-[2/3] overflow-hidden rounded-xl bg-[#191a1d]">
+                  <span className="relative block aspect-[2/3] overflow-hidden rounded-[20px] bg-muted">
                     <Poster slug={item.series.slug} ch={item.chapter.ch} alt="" className="size-full" />
                     <span className="absolute inset-x-2 bottom-2">
                       <ProgressTrack pct={pct} label="Saved progress" />
                     </span>
                   </span>
-                  <span className="mt-2 block truncate text-sm">{item.series.title}</span>
-                  <span className="block text-xs text-[#a2a19f]">Chapter {item.chapter.num} · {left} left</span>
+                  <span className="mt-2.5 block truncate text-[15px] font-medium">{item.series.title}</span>
+                  <span className="block text-[13px] text-muted-foreground">Chapter {item.chapter.num}, {left} left</span>
                 </a>
               );
             })}
@@ -712,16 +710,16 @@ function HomeView({
       ) : null}
 
       <section aria-label="Series">
-        <div className="mb-3 flex flex-wrap items-end justify-between gap-3">
+        <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="font-serif text-2xl">Series</h2>
-            <p className="text-sm text-[#a2a19f]">{total} in the library</p>
+            <h1 className="text-[28px] font-semibold tracking-[-0.02em] md:text-[32px]">Library</h1>
+            <p className="mt-0.5 text-[15px] text-muted-foreground">{total} series</p>
           </div>
-          <label className="flex items-center gap-2 text-sm text-[#a2a19f]">
-            Sort
+          <label className="flex items-center gap-2 text-[14px] text-muted-foreground">
+            <span className="max-sm:sr-only">Sort</span>
             <select
               aria-label="Sort library"
-              className="h-11 rounded-lg border border-[#3c3e44] bg-[#191a1d] px-2 text-[#f2efe9]"
+              className="field min-h-10 w-auto rounded-full"
               value={sort}
               onChange={(event) => onSort(event.target.value)}
             >
@@ -731,7 +729,7 @@ function HomeView({
           </label>
         </div>
         {query ? (
-          <p className="mb-3 text-sm text-[#a2a19f]" role="status">
+          <p className="mb-3 text-sm text-muted-foreground" role="status">
             {series.length} series matching “{query.trim()}”
           </p>
         ) : null}
@@ -740,7 +738,7 @@ function HomeView({
             <Button type="button" variant="outline" className="min-h-11" onClick={onClear}>Clear search</Button>
           </EmptyState>
         ) : (
-          <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+          <div className="grid grid-cols-2 gap-x-4 gap-y-6 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
             {series.map((item) => {
               const cover = coverChapter(item);
               return (
@@ -750,14 +748,14 @@ function HomeView({
                   className="group block min-w-0"
                   aria-label={`${item.title}, ${item.chapters.length} chapters`}
                 >
-                  <span className="relative block aspect-[2/3] overflow-hidden rounded-xl bg-[#191a1d] ring-1 ring-[#2b2c30]">
-                    {cover ? <Poster slug={item.slug} ch={cover.ch} alt="" className="size-full transition duration-300 group-hover:scale-[1.03]" /> : null}
-                    <span className="absolute top-2 right-2 rounded-full bg-black/70 px-2 py-0.5 font-mono text-[10px] tracking-wide text-[#f2efe9]">
+                  <span className="relative block aspect-[2/3] overflow-hidden rounded-[22px] bg-muted transition-shadow duration-200 group-hover:shadow-float group-focus-visible:ring-2 group-focus-visible:ring-ring">
+                    {cover ? <Poster slug={item.slug} ch={cover.ch} alt="" className="size-full transition-transform duration-300 group-hover:scale-[1.025]" /> : null}
+                    <span className="absolute top-2 right-2 rounded-full bg-black/65 px-2 py-0.5 text-[12px] font-medium text-white tabular-nums backdrop-blur-sm">
                       {item.chapters.length} ch
                     </span>
                   </span>
-                  <span className="mt-2 block truncate text-sm font-medium">{item.title}</span>
-                  <span className="block text-xs text-[#a2a19f]">{fmtLength(totalDuration(item))}</span>
+                  <span className="mt-2.5 block truncate text-[15px] font-medium">{item.title}</span>
+                  <span className="block text-[13px] text-muted-foreground">{item.chapters.length} {item.chapters.length === 1 ? "chapter" : "chapters"}, {fmtLength(totalDuration(item))}</span>
                 </a>
               );
             })}
@@ -766,6 +764,34 @@ function HomeView({
       </section>
     </div>
   );
+}
+
+function describeOutroAttachment(
+  attachment: SeriesOutroAttachment | undefined,
+  attached: boolean,
+  target: string | null,
+): string {
+  if (!attachment) return attached ? "Outro included in next merge" : "Chapters only";
+  if (!attachment.explicit) {
+    return attachment.videoAvailable === false ? "No outro generated" : "Outro included automatically";
+  }
+  if (!attachment.enabled) return "Outro detached";
+  if (attachment.missing) return "Outro attached but missing";
+  return `Outro attached after ${target ?? "last chapter"}`;
+}
+
+/**
+ * Attach/re-attach is only pointless when an explicit attachment is enabled and its
+ * snapshot still matches the current render. A legacy default (nothing saved), a
+ * regenerated render, or a missing render must all be fixable from the UI.
+ */
+function canAttachOutro(attachment: SeriesOutroAttachment | undefined): boolean {
+  if (!attachment) return true;
+  // Nothing to attach without a render; detach stays available instead.
+  if (attachment.videoAvailable === false) return false;
+  if (!attachment.explicit) return true;
+  if (!attachment.enabled) return true;
+  return Boolean(attachment.stale || attachment.videoChanged || attachment.missing);
 }
 
 function SeriesView({
@@ -794,6 +820,7 @@ function SeriesView({
 
   const [mergeState, setMergeState] = useState<SeriesMergeState | null>(null);
   const [merging, setMerging] = useState(false);
+  const [mergeError, setMergeError] = useState<{ error: unknown; force: boolean } | null>(null);
 
   const [extendOpen, setExtendOpen] = useState(false);
   const [extendChapters, setExtendChapters] = useState(() => {
@@ -804,16 +831,41 @@ function SeriesView({
   const [extendFile, setExtendFile] = useState<File | null>(null);
   const extendFileInput = useRef<HTMLInputElement>(null);
   const [extending, setExtending] = useState(false);
-  const [extendError, setExtendError] = useState("");
+  const [extendError, setExtendError] = useState<string | ErrorInfo>("");
 
   const [outroOpen, setOutroOpen] = useState(false);
   const [outroState, setOutroState] = useState<SeriesOutroState | null>(null);
-  const [totalChapters, setTotalChapters] = useState(50);
+  const [totalChapters, setTotalChapters] = useState(() => Math.max(50, series.chapters.length || 20));
   const [coveredChapters, setCoveredChapters] = useState(() => Math.max(1, series.chapters.length || 20));
   const [hookType, setHookType] = useState<OutroHookType>("part2");
   const [customPrompt, setCustomPrompt] = useState("");
   const [generatingOutro, setGeneratingOutro] = useState(false);
-  const [outroError, setOutroError] = useState("");
+  const [outroError, setOutroError] = useState<string | ErrorInfo>("");
+  const [outroCacheBust, setOutroCacheBust] = useState(0);
+  const [attachingOutro, setAttachingOutro] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string | ErrorInfo>("");
+  const activeSlugRef = useRef(series.slug);
+
+  useEffect(() => {
+    activeSlugRef.current = series.slug;
+    setOutroOpen(false);
+    setOutroState(null);
+    setOutroError("");
+    setOutroCacheBust(0);
+    setGeneratingOutro(false);
+    setAttachingOutro(false);
+    setAttachmentError("");
+    setCoveredChapters(Math.max(1, series.chapters.length || 20));
+    setTotalChapters(Math.max(50, series.chapters.length || 20));
+    setHookType("part2");
+    setCustomPrompt("");
+    setExtendOpen(false);
+    setExtendError("");
+    setExtendFile(null);
+    return () => {
+      activeSlugRef.current = "";
+    };
+  }, [series.slug]);
 
   useEffect(() => {
     let stop = false;
@@ -836,19 +888,69 @@ function SeriesView({
     ? mergedChapters.length
     : typeof mergedChapters === "number" ? mergedChapters : mergeState?.chapterCount;
   const fullDownloadHref = `/media/${encodeURIComponent(series.slug)}/full.mp4?download=1`;
+  const attachment: SeriesOutroAttachment | undefined = mergeState?.attachment;
+  const attachmentAttached = attachment ? attachment.nextMergeIncludesOutro : Boolean(mergeState?.includesOutro);
+  const attachmentTarget =
+    attachment?.targetChapter || mergeState?.outro?.targetChapter || null;
+  /** The GET /merge payload reports the rendered outro even before the builder modal opens. */
+  const outroRendered = Boolean(mergeState?.outro?.videoUrl);
+  const attachmentLabel = describeOutroAttachment(attachment, attachmentAttached, attachmentTarget);
 
   async function runMergeAll(force = false) {
     if (!privileged || merging) return;
+    const requestedSlug = series.slug;
     setMerging(true);
+    setMergeError(null);
     try {
-      const res = await api.series.mergeAll(series.slug, { includeOutro: true, force });
+      // No includeOutro override: the server applies the saved attachment preference
+      // (legacy default: include a rendered outro) so a detached outro stays out.
+      const res = await api.series.mergeAll(series.slug, { force });
+      if (activeSlugRef.current !== requestedSlug) return;
       setMergeState({ ...res, exists: true, merged: true });
       onToast(res.message || "Merged all chapters into full.mp4.");
       onRefresh();
     } catch (error) {
-      onToast(errText(error, "Could not merge chapters."));
+      if (activeSlugRef.current === requestedSlug) setMergeError({ error, force });
     } finally {
-      setMerging(false);
+      if (activeSlugRef.current === requestedSlug) setMerging(false);
+    }
+  }
+
+  async function toggleOutroAttachment(enabled: boolean) {
+    if (!privileged || attachingOutro) return;
+    const requestedSlug = series.slug;
+    setAttachingOutro(true);
+    setAttachmentError("");
+    try {
+      const res = await api.series.setOutroAttachment(requestedSlug, enabled);
+      if (activeSlugRef.current !== requestedSlug) return;
+      if (res.merge) {
+        setMergeState(res.merge);
+      } else {
+        try {
+          const refreshed = await api.series.getMerge(requestedSlug);
+          if (activeSlugRef.current === requestedSlug) setMergeState(refreshed);
+        } catch {
+          if (activeSlugRef.current === requestedSlug) {
+            setAttachmentError("Outro preference saved, but the merge state could not be refreshed.");
+          }
+        }
+      }
+      if (res.attachment && activeSlugRef.current === requestedSlug) {
+        setOutroState((prev) => (prev ? { ...prev, attachment: res.attachment } : prev));
+      }
+      if (activeSlugRef.current !== requestedSlug) return;
+      onToast(
+        enabled
+          ? `Outro attached after ${res.attachment?.targetChapter ?? "the last chapter"}. Chapter files unchanged.`
+          : "Outro detached. Merge All Chapters will include chapters only.",
+      );
+      onRefresh();
+    } catch (error) {
+      if (activeSlugRef.current !== requestedSlug) return;
+      setAttachmentError(describeError(error, enabled ? "Could not attach the outro." : "Could not detach the outro."));
+    } finally {
+      if (activeSlugRef.current === requestedSlug) setAttachingOutro(false);
     }
   }
 
@@ -879,40 +981,67 @@ function SeriesView({
         gdriveUrl: gdriveUrl || undefined,
         preserveCompleted: true,
       });
-      await api.series.getMerge(series.slug).then(setMergeState).catch(() => {});
+      await api.series.getMerge(series.slug).then((m) => {
+        if (activeSlugRef.current === series.slug) setMergeState(m);
+      }).catch(() => {});
+      if (activeSlugRef.current !== series.slug) return;
       setExtendFile(null);
       if (extendFileInput.current) extendFileInput.current.value = "";
       setExtendOpen(false);
-      onToast(res.message || `Extended ${series.title} (${spec}) without rerunning completed chapters.`);
+      const baseMsg = res.message || `Extended ${series.title} (${spec}) without rerunning completed chapters.`;
+      const extendWarnings = Array.isArray(res.warnings)
+        ? res.warnings.map((w) => String(w || "").trim()).filter(Boolean)
+        : [];
+      onToast(extendWarnings.length ? `${baseMsg} Warning: ${extendWarnings.join(" ")}` : baseMsg);
       onRefresh();
     } catch (error) {
-      setExtendError(errText(error, "Could not extend series."));
+      if (activeSlugRef.current === series.slug) {
+        setExtendError(describeError(error, "Could not extend series."));
+      }
     } finally {
-      setExtending(false);
+      if (activeSlugRef.current === series.slug) {
+        setExtending(false);
+      }
     }
   }
 
   function openOutroModal() {
+    const requestedSlug = series.slug;
     setOutroOpen(true);
     setOutroError("");
     void api.series
-      .getOutro(series.slug)
+      .getOutro(requestedSlug)
       .then((res) => {
+        if (activeSlugRef.current !== requestedSlug) return;
         setOutroState(res);
-        if (typeof res.totalChapters === "number" && res.totalChapters > 0) setTotalChapters(res.totalChapters);
-        if (typeof res.coveredChapters === "number" && res.coveredChapters > 0) setCoveredChapters(res.coveredChapters);
+        if (res.videoUpdatedAt || res.updatedAt) {
+          setOutroCacheBust(Number(res.videoUpdatedAt || res.updatedAt) || Date.now());
+        }
+        const cov = typeof res.coveredChapters === "number" && res.coveredChapters > 0
+          ? res.coveredChapters
+          : Math.max(1, series.chapters.length || 1);
+        const availCount = Array.isArray(res.availableChapters) ? res.availableChapters.length : 0;
+        const tot = typeof res.totalChapters === "number" && res.totalChapters >= cov
+          ? res.totalChapters
+          : Math.max(cov, availCount, totalChapters);
+        setCoveredChapters(cov);
+        setTotalChapters(tot);
         if (res.hookType) setHookType(res.hookType);
       })
-      .catch(() => {});
+      .catch((error) => {
+        if (activeSlugRef.current !== requestedSlug) return;
+        setOutroError(describeError(error, "Could not inspect series outro state."));
+      });
   }
 
   async function submitGenerateOutro(event: FormEvent) {
     event.preventDefault();
     if (!privileged || generatingOutro) return;
+    const requestedSlug = series.slug;
     setGeneratingOutro(true);
     setOutroError("");
     try {
-      const res = await api.series.generateOutro(series.slug, {
+      const res = await api.series.generateOutro(requestedSlug, {
         enabled: true,
         totalChapters,
         coveredChapters,
@@ -920,66 +1049,133 @@ function SeriesView({
         customPrompt: customPrompt.trim() || undefined,
         renderVideo: true,
       });
-      setOutroState(res);
+      if (activeSlugRef.current !== requestedSlug) return;
+      const panels = res.panels || res.selectedPanels || [];
+      const hasRenderedVideo = Boolean(res.videoUrl && res.rendered !== false && res.hasVideo !== false && !res.renderError);
+      if (res.ok === false || !panels.length || !hasRenderedVideo) {
+        const reason = String(
+          res.renderError ||
+            res.error ||
+            (!panels.length
+              ? "No usable character or narrative panels available to generate an outro announcement."
+              : "Outro video could not be rendered."),
+        );
+        setOutroState((prev) => {
+          const prevHasVideo = Boolean(prev?.videoUrl && prev?.hasVideo !== false);
+          return {
+            ...prev,
+            ...res,
+            rendered: prevHasVideo ? true : false,
+            hasVideo: prevHasVideo,
+            videoUrl: prevHasVideo ? prev!.videoUrl : null,
+            videoUpdatedAt: prevHasVideo ? prev!.videoUpdatedAt : null,
+          };
+        });
+        setOutroError(reason);
+        return;
+      }
+      const stamp = Number(res.videoUpdatedAt || res.updatedAt || Date.now()) || Date.now();
+      setOutroCacheBust(stamp);
+      setOutroState({ ...res, hasVideo: true });
       const warnings = [
-        res.renderError ? `Video render warning: ${String(res.renderError)}` : "",
         res.audioError ? `Audio warning: ${String(res.audioError)}` : "",
+        typeof res.warning === "string" && res.warning !== res.audioError ? String(res.warning) : "",
       ].filter(Boolean);
       if (warnings.length) {
-        setOutroError(`Outro generated with warnings. ${warnings.join(" ")}`);
-        onToast("Outro generated with warnings. See the dialog for details.");
+        setOutroError(`Outro video generated without narration. ${warnings.join(" ")}`);
+        onToast("Outro video generated with warnings. See the dialog for details.");
       } else {
         onToast("Generated character-panel outro announcement.");
       }
-      await api.series.getMerge(series.slug).then(setMergeState).catch(() => {});
+      void api.series.getMerge(requestedSlug).then((m) => {
+        if (activeSlugRef.current === requestedSlug) setMergeState(m);
+      }).catch(() => {});
       onRefresh();
     } catch (error) {
-      setOutroError(errText(error, "Could not generate outro announcement."));
+      if (activeSlugRef.current === requestedSlug) {
+        setOutroError(describeError(error, "Could not generate outro announcement."));
+      }
     } finally {
-      setGeneratingOutro(false);
+      if (activeSlugRef.current === requestedSlug) {
+        setGeneratingOutro(false);
+      }
     }
   }
 
   const outroPanels: OutroCharacterPanel[] =
     outroState?.panels || outroState?.selectedPanels || [];
+  const firstOutroPanel = outroPanels[0];
+  const outroPosterUrl = firstOutroPanel
+    ? String(firstOutroPanel.previewUrl || firstOutroPanel.imageUrl || firstOutroPanel.url || "")
+    : "";
   const outroScript =
     outroState?.script ||
     outroState?.narration ||
     outroState?.text ||
     (Array.isArray(outroState?.lines) ? outroState!.lines.join(" ") : "");
+  const hasOutroVideo = Boolean(
+    outroState?.videoUrl &&
+      (outroState.hasVideo === true || (outroState.hasVideo !== false && outroState.rendered !== false)),
+  );
+  const rawOutroVideoUrl = hasOutroVideo ? String(outroState!.videoUrl) : "";
+  const outroRevision =
+    outroCacheBust ||
+    Number(outroState?.videoUpdatedAt || outroState?.updatedAt || 0) ||
+    (typeof outroState?.generatedAt === "string" ? Date.parse(outroState.generatedAt) || 0 : 0);
+  const outroVideoSrc = rawOutroVideoUrl
+    ? `${rawOutroVideoUrl}${rawOutroVideoUrl.includes("?") ? "&" : "?"}v=${outroRevision || 1}`
+    : "";
+  const outroVideoDownloadHref = rawOutroVideoUrl
+    ? `${rawOutroVideoUrl}${rawOutroVideoUrl.includes("?") ? "&" : "?"}download=1${outroRevision ? `&v=${outroRevision}` : ""}`
+    : "";
+  /** The modal prefers the freshly inspected attachment, falling back to the merge state. */
+  const modalAttachment: SeriesOutroAttachment | undefined =
+    (outroState?.attachment as SeriesOutroAttachment | undefined) ?? attachment;
+  const modalAttached = modalAttachment
+    ? modalAttachment.nextMergeIncludesOutro
+    : Boolean(mergeState?.includesOutro);
+  const modalTarget = modalAttachment?.targetChapter ?? attachmentTarget;
+  const modalCanAttach = canAttachOutro(modalAttachment);
+  const modalStatus = (() => {
+    if (modalAttachment?.missing) return "The attached outro render is missing. Merge is blocked until you regenerate it or detach the attachment.";
+    if (modalAttached) {
+      return `Attached after ${modalTarget ?? "the last chapter"}. The compilation includes this outro once, at the end. Original chapter files stay unchanged.`;
+    }
+    if (modalAttachment?.explicit) return "Not attached. The compilation includes chapters only until you attach this outro.";
+    return "The compilation currently includes this outro automatically. Attach it to save your choice.";
+  })();
 
   return (
-    <div className="space-y-8">
-      <a className="inline-flex min-h-11 items-center text-sm text-[#a2a19f] hover:text-[#f2efe9]" href="#/">
+    <div className="space-y-8 [&_[role=alert]_button]:min-h-11">
+      <a className="inline-flex min-h-11 items-center text-sm text-muted-foreground hover:text-foreground" href="#/">
         ← Library
       </a>
-      <header className="overflow-hidden rounded-2xl border border-[#2b2c30] bg-[#191a1d]">
+      <header className="overflow-hidden rounded-[28px] bg-card">
         <div className="grid gap-0 md:grid-cols-[220px_minmax(0,1fr)]">
-          <div className="aspect-[2/3] bg-[#101113] md:aspect-auto md:min-h-64">
+          <div className="aspect-[16/9] bg-muted md:aspect-auto md:min-h-64">
             {cover ? <Poster slug={series.slug} ch={cover.ch} alt="" className="size-full" eager /> : null}
           </div>
           <div className="flex flex-col justify-end gap-3 p-5 md:p-8">
-            <p className="text-[10px] tracking-[0.18em] text-[#a2a19f] uppercase">Series</p>
-            <h2 className="font-serif text-4xl leading-none">{series.title}</h2>
-            <p className="text-sm text-[#a2a19f]">
+            <h2 className="break-words text-3xl font-semibold leading-tight tracking-[-0.02em] md:text-4xl">{series.title}</h2>
+            <p className="text-sm text-muted-foreground">
               {series.chapters.length} chapter{series.chapters.length === 1 ? "" : "s"} · {fmtLength(totalDuration(series))}
             </p>
             <div className="mt-1 flex flex-wrap items-center gap-2">
               {hasFullVideo ? (
                 <>
                   <a
-                    className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-[#f18b6e] px-3 text-sm font-medium text-[#201713]"
+                    className="inline-flex min-h-11 items-center gap-2 rounded-full bg-primary px-4 text-[14.5px] font-medium text-primary-foreground hover:bg-primary-hover"
                     href={fullDownloadHref}
                     download={`${series.slug}-full.mp4`}
                   >
-                    <Download className="size-4" aria-hidden /> Download Merged Video (full.mp4)
+                    <Download className="size-4 shrink-0" aria-hidden /> Download merged video
                   </a>
                   {privileged ? (
                     <Button
                       type="button"
                       size="sm"
                       variant="outline"
-                      className={cn("min-h-11", mergeStale && "border-[#f18b6e] bg-[#f18b6e]/10 text-[#f18b6e]")}
+                      className={cn("min-h-11", mergeStale && "border-primary bg-primary-soft text-primary-text")}
                       disabled={merging}
                       onClick={() => void runMergeAll(true)}
                     >
@@ -991,7 +1187,7 @@ function SeriesView({
               ) : (
                 <Button
                   type="button"
-                  className="min-h-11 bg-[#f18b6e] text-[#201713] hover:bg-[#f5a087]"
+                  className="min-h-11 bg-primary text-primary-foreground hover:bg-primary-hover"
                   disabled={!privileged || merging || series.chapters.length === 0}
                   onClick={() => void runMergeAll(false)}
                 >
@@ -1001,7 +1197,7 @@ function SeriesView({
                     </>
                   ) : (
                     <>
-                      <Film className="size-4" aria-hidden /> Merge All Chapters
+                      <Film className="size-4" aria-hidden /> Merge all chapters
                     </>
                   )}
                 </Button>
@@ -1018,7 +1214,7 @@ function SeriesView({
                       setExtendOpen(true);
                     }}
                   >
-                    <Plus className="size-4" aria-hidden /> + Add Chapters
+                    <Plus className="size-4" aria-hidden /> Add chapters
                   </Button>
                   <Button
                     type="button"
@@ -1026,10 +1222,10 @@ function SeriesView({
                     className="min-h-11"
                     onClick={openOutroModal}
                   >
-                    <Sparkles className="size-4" aria-hidden /> Outro Announcement
+                    <Sparkles className="size-4" aria-hidden /> Create outro
                   </Button>
                   <a
-                    className="inline-flex min-h-11 items-center px-2 text-sm text-[#f18b6e] underline-offset-4 hover:underline"
+                    className="inline-flex min-h-11 items-center px-2 text-sm text-primary-text underline-offset-4 hover:underline"
                     href={`/new-series.html?series=${encodeURIComponent(series.slug)}`}
                   >
                     Manage chapters
@@ -1038,21 +1234,75 @@ function SeriesView({
               ) : null}
             </div>
             {hasFullVideo && (mergedChapterCount !== undefined || mergedSize > 0) ? (
-              <p className="text-xs text-[#a2a19f]">
+              <p className="text-xs text-muted-foreground">
                 {mergedChapterCount !== undefined ? `${mergedChapterCount} chapter${mergedChapterCount === 1 ? "" : "s"} merged` : "Merged video"}
                 {mergedSize > 0 ? ` · ${fmtSize(mergedSize)}` : ""}
               </p>
             ) : null}
+            <div className="mt-2 rounded-2xl bg-muted p-4 text-sm" data-testid="outro-attachment-status">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span className="text-sm font-medium">Outro</span>
+                <span className={cn("font-medium", attachmentAttached ? "text-primary-text" : "text-muted-foreground")}>
+                  {attachment?.videoAvailable === false ? "Not created" : attachmentAttached ? "Attached" : "Detached"}
+                </span>
+                <Tooltip label={attachmentLabel} side="top"><button type="button" aria-label="Outro information" className="grid size-11 place-items-center text-muted-foreground"><Info className="size-[18px]" strokeWidth={1.75} aria-hidden /></button></Tooltip>
+                {attachment?.stale ? (
+                  <span className="rounded-full bg-warning-soft px-2 py-1 text-xs text-warning">Needs refresh</span>
+                ) : null}
+                {privileged && (outroRendered || hasOutroVideo || attachment?.explicit) ? (
+                  attachment?.explicit && attachment.enabled ? (
+                    <div className="ml-auto flex flex-wrap gap-2">
+                      {canAttachOutro(attachment) ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="min-h-11 px-3 text-xs"
+                          disabled={attachingOutro}
+                          onClick={() => void toggleOutroAttachment(true)}
+                        >
+                          {attachingOutro ? "Saving…" : "Use current outro"}
+                        </Button>
+                      ) : null}
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="min-h-11 px-3 text-xs"
+                        disabled={attachingOutro}
+                        onClick={() => void toggleOutroAttachment(false)}
+                      >
+                        Detach outro
+                      </Button>
+                    </div>
+                  ) : (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="ml-auto min-h-11 px-3 text-xs"
+                      disabled={attachingOutro || !canAttachOutro(attachment)}
+                      onClick={() => void toggleOutroAttachment(true)}
+                    >
+                      {attachingOutro ? "Saving…" : `Use after ${attachment?.tailChapter ?? "last chapter"}`}
+                    </Button>
+                  )
+                ) : null}
+              </div>
+              {attachmentError ? <ErrorNotice className="mt-3" info={requestInfo(attachmentError)} /> : null}
+            </div>
           </div>
         </div>
       </header>
 
+      {mergeError ? <ErrorNotice error={mergeError.error} onRetry={() => void runMergeAll(mergeError.force)} retrying={merging} /> : null}
+
       <Dialog open={extendOpen} onOpenChange={(open) => { if (!extending) setExtendOpen(open); }}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="[&_[data-slot=dialog-close]]:size-11 [&_[role=alert]_button]:min-h-11 sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle className="font-serif text-2xl">Extend Series (+ Add Chapters)</DialogTitle>
-            <DialogDescription>
-              Preserves <code>bible.json</code>, continuity windows, and already-completed chapters ({series.chapters.map((c) => c.ch).join(", ") || "none"}), running only the new chapters.
+            <DialogTitle className="text-2xl font-semibold tracking-[-0.015em]">Add chapters</DialogTitle>
+            <DialogDescription className="sr-only">
+              Add new chapters without changing completed videos or story continuity.
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={(event) => void submitExtend(event)} className="space-y-3">
@@ -1067,7 +1317,7 @@ function SeriesView({
               />
             </label>
             <label className="block text-sm">
-              Optional Google Drive ZIP URL (leave empty to reuse existing series source)
+              Drive link
               <Input
                 className="mt-1 h-11 font-mono"
                 type="url"
@@ -1078,7 +1328,7 @@ function SeriesView({
               />
             </label>
             <label className="block text-sm">
-              Optional ZIP archive of new chapters
+              ZIP archive
               <Input
                 ref={extendFileInput}
                 className="mt-1 h-11"
@@ -1092,7 +1342,7 @@ function SeriesView({
               />
             </label>
             {extendFile ? (
-              <div className="flex items-center justify-between gap-2 text-xs text-[#a2a19f]">
+              <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
                 <span className="min-w-0 truncate">{extendFile.name} · {fmtSize(extendFile.size)}</span>
                 <Button type="button" variant="ghost" disabled={extending} onClick={() => {
                   setExtendFile(null);
@@ -1102,14 +1352,14 @@ function SeriesView({
                 </Button>
               </div>
             ) : null}
-            <p className="text-xs text-[#a2a19f]">Use either a ZIP upload or a Drive URL. Leave the range empty to include all new source chapters.</p>
-            {extendError ? <p className="text-sm text-[#ef6b5b]" role="alert">{extendError}</p> : null}
+            <Tooltip label="Leave the source empty to reuse the existing archive." side="top"><button type="button" aria-label="Source information" className="grid size-11 place-items-center text-muted-foreground"><Info className="size-[18px]" strokeWidth={1.75} aria-hidden /></button></Tooltip>
+            {extendError ? <ErrorNotice info={requestInfo(extendError)} /> : null}
             <DialogFooter>
               <Button type="button" variant="outline" className="min-h-11" disabled={extending} onClick={() => setExtendOpen(false)}>
                 Cancel
               </Button>
               <Button type="submit" className="min-h-11" disabled={extending}>
-                {extending ? extendFile ? "Uploading and queueing…" : "Queueing extension…" : "Extend Series"}
+                {extending ? extendFile ? "Uploading and queueing…" : "Queueing chapters…" : "Add chapters"}
               </Button>
             </DialogFooter>
           </form>
@@ -1117,11 +1367,11 @@ function SeriesView({
       </Dialog>
 
       <Dialog open={outroOpen} onOpenChange={(open) => { if (!generatingOutro) setOutroOpen(open); }}>
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent className="max-h-[90vh] overflow-y-auto [&_[data-slot=dialog-close]]:size-11 [&_[role=alert]_button]:min-h-11 sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle className="font-serif text-2xl">Series Outro Announcement Builder</DialogTitle>
-            <DialogDescription>
-              Selects the best character-focused panels from <code>bible.json</code> and <code>obs_ch*.json</code> and synthesizes a natural narrator outro.
+            <DialogTitle className="text-2xl font-semibold tracking-[-0.015em]">Create a series outro</DialogTitle>
+            <DialogDescription className="sr-only">
+              Create a narrated ending using character panels from this series. Preview it before attaching it to your compilation.
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={(event) => void submitGenerateOutro(event)} className="space-y-4">
@@ -1149,14 +1399,14 @@ function SeriesView({
               <label className="block text-sm">
                 Hook type
                 <select
-                  className="mt-1 h-11 w-full rounded-lg border border-[#3c3e44] bg-[#101113] px-3 text-sm text-[#f2efe9]"
+                  className="mt-1 h-11 w-full rounded-lg border border-border-strong bg-background px-3 text-sm text-foreground"
                   value={hookType}
                   onChange={(event) => setHookType(event.target.value as OutroHookType)}
                 >
-                  <option value="part2">Part 2 call-out (part2)</option>
-                  <option value="next_chapter">Next chapter tease (next_chapter)</option>
-                  <option value="new_series">New series recommendation (new_series)</option>
-                  <option value="custom">Custom prompt (custom)</option>
+                  <option value="part2">Invite viewers to part 2</option>
+                  <option value="next_chapter">Tease the next chapter</option>
+                  <option value="new_series">Recommend a new series</option>
+                  <option value="custom">Custom instruction</option>
                 </select>
               </label>
             </div>
@@ -1172,17 +1422,41 @@ function SeriesView({
               </label>
             ) : null}
 
+            {outroVideoSrc ? (
+              <div className="rounded-xl bg-background p-3" data-testid="outro-video-section">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-[13px] font-medium text-muted-foreground">Outro preview</p>
+                  <a
+                    className="inline-flex min-h-11 items-center gap-1.5 rounded-full bg-primary px-3.5 py-1.5 text-[13.5px] font-medium text-primary-foreground hover:bg-primary-hover"
+                    href={outroVideoDownloadHref}
+                    download={`${series.slug}-outro.mp4`}
+                  >
+                    <Download className="size-3.5" aria-hidden /> Download outro
+                  </a>
+                </div>
+                <video
+                  key={outroVideoSrc}
+                  src={outroVideoSrc}
+                  poster={outroPosterUrl || undefined}
+                  controls
+                  playsInline
+                  preload="metadata"
+                  className="mt-2 aspect-video w-full rounded-lg bg-black"
+                />
+              </div>
+            ) : null}
+
             {outroScript ? (
-              <div className="rounded-xl border border-[#2b2c30] bg-[#101113] p-3">
-                <p className="text-[10px] tracking-[0.14em] text-[#a2a19f] uppercase">Generated Narrator Script</p>
-                <p className="mt-1.5 text-sm leading-relaxed text-[#f2efe9]">{outroScript}</p>
+              <div className="rounded-xl bg-background p-3">
+                <p className="text-[13px] font-medium text-muted-foreground">Narrator script</p>
+                <p className="mt-1.5 text-sm leading-relaxed text-foreground">{outroScript}</p>
               </div>
             ) : null}
 
             {outroPanels.length > 0 ? (
-              <div className="rounded-xl border border-[#2b2c30] bg-[#101113] p-3">
-                <p className="text-[10px] tracking-[0.14em] text-[#a2a19f] uppercase">
-                  Auto-Selected Character Showcase Panels ({outroPanels.length})
+              <div className="rounded-xl bg-background p-3">
+                <p className="text-[13px] font-medium text-muted-foreground">
+                  Selected character panels ({outroPanels.length})
                 </p>
                 <div className="mt-2 grid gap-2 sm:grid-cols-3">
                   {outroPanels.map((panel, idx) => {
@@ -1196,20 +1470,20 @@ function SeriesView({
                     const charLabel = characterNames.join(", ") || "Character";
                     const reason = panel.reason || panel.caption || panel.visual;
                     return (
-                      <div key={`${chLabel}-${idLabel}-${idx}`} className="rounded-lg border border-[#2b2c30] bg-[#191a1d] p-2">
+                      <div key={`${chLabel}-${idLabel}-${idx}`} className="rounded-xl bg-muted p-2">
                         {imgSrc ? (
                           <img src={imgSrc} alt={charLabel} className="mb-1.5 aspect-[4/3] w-full rounded object-cover bg-black" loading="lazy" />
                         ) : null}
                         <div className="flex flex-wrap gap-1">
                           {(characterNames.length ? characterNames : ["Character"]).map((name, index) => (
-                            <span key={`${name}-${index}`} className="rounded-full border border-[#3c3e44] px-1.5 py-0.5 text-[10px] text-[#f2efe9]">{name}</span>
+                            <span key={`${name}-${index}`} className="rounded-full border border-border-strong px-1.5 py-0.5 text-[12px] text-foreground">{name}</span>
                           ))}
                         </div>
-                        <p className="break-all font-mono text-[10px] text-[#a2a19f]">
+                        <p className="break-all font-mono text-[12px] text-muted-foreground">
                           {chLabel} · {idLabel}{panel.shotType ? ` · ${panel.shotType}` : ""}{panel.weight ? ` · w${panel.weight}` : ""}
                         </p>
                         {reason ? (
-                          <p className="mt-1 line-clamp-2 text-[11px] text-[#a2a19f]">{reason}</p>
+                          <p className="mt-1 line-clamp-2 text-[12px] text-muted-foreground">{reason}</p>
                         ) : null}
                       </div>
                     );
@@ -1218,19 +1492,53 @@ function SeriesView({
               </div>
             ) : null}
 
-            {outroError ? <p className="text-sm text-[#ef6b5b]" role="alert">{outroError}</p> : null}
+            {hasOutroVideo || modalAttachment?.explicit ? (
+              <div className="rounded-xl bg-background p-3" data-testid="outro-attach-panel">
+                <div className="flex items-center gap-2"><p className="text-sm font-medium">Compilation outro</p><Tooltip label={modalStatus} side="top"><button type="button" aria-label="Attachment information" className="grid size-11 place-items-center text-muted-foreground"><Info className="size-[18px]" strokeWidth={1.75} aria-hidden /></button></Tooltip></div>
+                {privileged ? (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="min-h-11 bg-primary text-primary-foreground hover:bg-primary-hover"
+                      disabled={attachingOutro || !modalCanAttach}
+                      onClick={() => void toggleOutroAttachment(true)}
+                    >
+                      {attachingOutro
+                        ? "Saving…"
+                        : modalAttachment?.explicit && modalAttachment.enabled
+                          ? "Use current outro"
+                          : `Use after ${modalAttachment?.tailChapter ?? series.chapters[series.chapters.length - 1]?.ch ?? "last chapter"}`}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="min-h-11"
+                      disabled={attachingOutro || !modalAttached}
+                      onClick={() => void toggleOutroAttachment(false)}
+                    >
+                      Detach outro
+                    </Button>
+                  </div>
+                ) : null}
+                {attachmentError ? <ErrorNotice className="mt-3" info={requestInfo(attachmentError)} /> : null}
+              </div>
+            ) : null}
+
+            {outroError ? <ErrorNotice info={requestInfo(outroError)} /> : null}
             <DialogFooter>
               <Button type="button" variant="outline" className="min-h-11" disabled={generatingOutro} onClick={() => setOutroOpen(false)}>
                 Close
               </Button>
-              <Button type="submit" className="min-h-11 bg-[#f18b6e] text-[#201713] hover:bg-[#f5a087]" disabled={generatingOutro}>
+              <Button type="submit" className="min-h-11 bg-primary text-primary-foreground hover:bg-primary-hover" disabled={generatingOutro}>
                 {generatingOutro ? (
                   <>
-                    <RefreshCw className="size-4 animate-spin" aria-hidden /> Generating Outro…
+                    <RefreshCw className="size-4 animate-spin" aria-hidden /> Generating outro…
                   </>
                 ) : (
                   <>
-                    <Sparkles className="size-4" aria-hidden /> Generate Character-Panel Outro
+                    <Sparkles className="size-4" aria-hidden /> Generate outro
                   </>
                 )}
               </Button>
@@ -1240,46 +1548,54 @@ function SeriesView({
       </Dialog>
 
       {series.full ? (
-        <article className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-[#2b2c30] bg-[#191a1d] p-4 md:p-5">
+        <article className="sr-group flex flex-wrap items-center justify-between gap-4 p-4 md:p-5">
           <div>
-            <p className="text-[10px] tracking-[0.16em] text-[#a2a19f] uppercase">Full compilation</p>
-            <h3 className="mt-1 font-serif text-2xl">full.mp4</h3>
-            <p className="text-sm text-[#a2a19f]">{fmtTime(series.full.duration)} · {fmtSize(series.full.size)}</p>
+            <p className="text-[13px] font-medium text-muted-foreground">Full compilation</p>
+            <h3 className="mt-1 text-2xl font-semibold tracking-[-0.015em]">full.mp4</h3>
+            <p className="text-sm text-muted-foreground">{fmtTime(series.full.duration)} · {fmtSize(series.full.size)}</p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <a className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-[#f18b6e] px-3 text-sm font-medium text-[#201713]" href={watchHref(series.slug, "full")}>
+            <a className="inline-flex min-h-11 items-center gap-2 rounded-full bg-primary px-4 text-[14.5px] font-medium text-primary-foreground hover:bg-primary-hover" href={watchHref(series.slug, "full")}>
               <Play className="size-4" aria-hidden /> Play
             </a>
-            <a className="inline-flex min-h-11 items-center gap-2 rounded-lg border border-[#3c3e44] px-3 text-sm" href={`${series.full.url}?download=1`} download={`${series.slug}-full.mp4`}>
+            <a className="inline-flex min-h-11 items-center gap-2 rounded-full bg-background px-4 text-sm hover:bg-raised" href={`${series.full.url}?download=1`} download={`${series.slug}-full.mp4`}>
               <Download className="size-4" aria-hidden /> Download
             </a>
           </div>
         </article>
       ) : null}
 
+      <LanguageVersions
+        slug={series.slug}
+        title={series.title}
+        privileged={privileged}
+        onToast={onToast}
+      />
+      <SeriesSettingsEditor slug={series.slug} privileged={privileged} />
+
       <section aria-label="Chapters">
-        <h3 className="mb-3 font-serif text-2xl">Chapters</h3>
+        <h3 className="mb-3 text-2xl font-semibold tracking-[-0.015em]">Chapters</h3>
         {chapters.length === 0 ? (
-          <p className="text-sm text-[#a2a19f]" role="status">No chapters match that search.</p>
+          <p className="text-sm text-muted-foreground" role="status">No chapters match that search.</p>
         ) : (
-          <ol className="divide-y divide-[#2b2c30] overflow-hidden rounded-2xl border border-[#2b2c30]">
+          <ol className="sr-group overflow-hidden">
             {chapters.map((chapter) => {
               const pos = getPos(series.slug, chapter.ch);
               const pct = progressPct(series.slug, chapter);
               const done = isDone(series.slug, chapter.ch);
               return (
-                <li key={chapter.ch} className="flex items-stretch bg-[#191a1d]">
+                <li key={chapter.ch} className="sr-row flex items-stretch">
                   <a
                     href={watchHref(series.slug, chapter.ch)}
-                    className="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 hover:bg-[#202125]"
+                    className="flex min-w-0 flex-1 items-center gap-4 px-4 py-4 hover:bg-raised"
                     aria-label={`Play chapter ${chapter.num}`}
                   >
-                    <span className="relative block h-16 w-11 shrink-0 overflow-hidden rounded-md bg-[#101113]">
+                    <span className="relative block h-16 w-11 shrink-0 overflow-hidden rounded-md bg-background">
                       <Poster slug={series.slug} ch={chapter.ch} alt="" className="size-full" />
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block text-sm">Chapter {String(chapter.num).padStart(2, "0")}</span>
-                      <span className="mt-1 block text-xs text-[#a2a19f]">
+                      <span className="mt-1 block text-xs text-muted-foreground">
                         {fmtTime(chapter.duration)} · {fmtSize(chapter.size)}
                         {done ? " · Watched" : pos > 5 ? ` · ${fmtTime(pos)} watched` : ""}
                       </span>
@@ -1289,9 +1605,9 @@ function SeriesView({
                     </span>
                   </a>
                   {privileged ? (
-                    <button
+                    <Tooltip label="Delete video" side="top"><button
                       type="button"
-                      className="grid min-w-11 place-items-center px-3 text-[#a2a19f] hover:text-[#ef6b5b]"
+                      className="grid min-w-11 place-items-center px-3 text-muted-foreground hover:text-destructive"
                       aria-label={`Delete chapter ${chapter.num} video`}
                       onClick={() =>
                         onDelete({
@@ -1305,7 +1621,7 @@ function SeriesView({
                       }
                     >
                       <Trash2 className="size-4" aria-hidden />
-                    </button>
+                    </button></Tooltip>
                   ) : null}
                 </li>
               );
@@ -1501,7 +1817,7 @@ function WatchView({
   if (!active || (!chapter && !full)) {
     return (
       <Missing title="This chapter isn’t ready yet.">
-        <a className="inline-flex min-h-11 items-center rounded-lg bg-[#f18b6e] px-3 text-sm font-medium text-[#201713]" href={seriesHref(series.slug)}>
+        <a className="inline-flex min-h-11 items-center rounded-full bg-primary px-4 text-[14.5px] font-medium text-primary-foreground hover:bg-primary-hover" href={seriesHref(series.slug)}>
           Back to series
         </a>
       </Missing>
@@ -1513,16 +1829,16 @@ function WatchView({
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
-        <a className="inline-flex min-h-11 items-center text-sm text-[#a2a19f] hover:text-[#f2efe9]" href={seriesHref(series.slug)}>
+        <a className="inline-flex min-h-11 items-center text-sm text-muted-foreground hover:text-foreground" href={seriesHref(series.slug)}>
           ← {series.title}
         </a>
-        <p className="text-xs text-[#a2a19f]">{isFull ? "full.mp4" : `${index + 1} of ${series.chapters.length}`}</p>
+        <p className="text-xs text-muted-foreground">{isFull ? "full.mp4" : `${index + 1} of ${series.chapters.length}`}</p>
       </div>
       <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
         <div>
-          <h2 className="mb-3 font-serif text-3xl">{heading}</h2>
+          <h2 className="mb-3 break-words text-3xl font-semibold tracking-[-0.02em]">{heading}</h2>
           {showResume ? (
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#2b2c30] bg-[#191a1d] px-4 py-3" role="region" aria-label="Resume playback">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-muted px-4 py-3" role="region" aria-label="Resume playback">
               <p className="text-sm">Left off at <strong className="font-medium">{fmtTime(saved)}</strong>.</p>
               <div className="flex gap-2">
                 <Button type="button" className="min-h-11" onClick={resume}>Resume</Button>
@@ -1530,7 +1846,7 @@ function WatchView({
               </div>
             </div>
           ) : null}
-          <div className="relative overflow-hidden rounded-2xl bg-black ring-1 ring-[#2b2c30]">
+          <div className="relative overflow-hidden rounded-2xl bg-black ring-1 ring-border">
             <video
               key={active.url}
               ref={videoRef}
@@ -1557,7 +1873,7 @@ function WatchView({
               <div
                 ref={endCardRef}
                 tabIndex={-1}
-                className="absolute inset-0 z-10 grid place-items-center bg-black/80 p-6 text-center outline-none"
+                className="absolute inset-0 z-10 grid place-items-center bg-black/80 p-3 text-center text-white outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-white sm:p-6"
                 role="dialog"
                 aria-modal="true"
                 aria-live="polite"
@@ -1565,7 +1881,7 @@ function WatchView({
                 onKeyDown={onEndCardKey}
               >
                 <div>
-                  <p id="endcard-title" className="font-serif text-3xl">
+                  <p id="endcard-title" className="text-xl font-semibold tracking-[-0.02em] sm:text-3xl">
                     {next ? `Up next: Chapter ${next.num}` : "That’s a wrap."}
                   </p>
                   <div className="mt-4 flex flex-wrap justify-center gap-2">
@@ -1574,7 +1890,7 @@ function WatchView({
                         ref={nextRef}
                         type="button"
                         autoFocus
-                        className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-[#f18b6e] px-3 text-sm font-medium text-[#201713]"
+                        className="inline-flex min-h-11 items-center gap-2 rounded-full bg-white px-4 text-[14.5px] font-medium text-black hover:bg-white/85"
                         onClick={() => {
                           window.location.hash = watchHref(series.slug, next.ch);
                         }}
@@ -1582,13 +1898,13 @@ function WatchView({
                         <Play className="size-4" aria-hidden /> Play next chapter
                       </button>
                     ) : (
-                      <a className="inline-flex min-h-11 items-center rounded-lg bg-[#f18b6e] px-3 text-sm font-medium text-[#201713]" href={seriesHref(series.slug)}>
+                      <a className="inline-flex min-h-11 items-center rounded-full bg-white px-4 text-[14.5px] font-medium text-black hover:bg-white/85" href={seriesHref(series.slug)}>
                         Back to series
                       </a>
                     )}
                     <button
                       type="button"
-                      className="inline-flex min-h-11 items-center rounded-lg border border-[#3c3e44] px-3 text-sm"
+                      className="inline-flex min-h-11 items-center rounded-full bg-white/15 px-4 text-[14.5px] font-medium text-white hover:bg-white/25"
                       onClick={() => {
                         setEnded(false);
                         const video = videoRef.current;
@@ -1605,11 +1921,10 @@ function WatchView({
             ) : null}
           </div>
           {playbackError ? (
-            <p className="mt-3 text-sm text-[#ef6b5b]" role="alert">
-              We couldn’t play this video.{" "}
+            <Notice className="mt-3" tone="danger" title="Video unavailable" details={<RawDetails text="Retry, or download the video to watch it locally." />}>
               <button
                 type="button"
-                className="underline"
+                className="mt-2 inline-flex min-h-11 items-center rounded-full bg-background px-4 font-medium"
                 onClick={() => {
                   setPlaybackError(false);
                   const video = videoRef.current;
@@ -1620,15 +1935,15 @@ function WatchView({
               >
                 Retry
               </button>
-            </p>
+            </Notice>
           ) : null}
           <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-sm">{active.name}</p>
-              <p className="text-xs text-[#a2a19f]">{fmtTime(active.duration)} · {fmtSize(active.size)}</p>
+              <p className="text-xs text-muted-foreground">{fmtTime(active.duration)} · {fmtSize(active.size)}</p>
             </div>
             <div className="flex flex-wrap gap-2">
-              <a className="inline-flex min-h-11 items-center gap-2 rounded-lg border border-[#3c3e44] px-3 text-sm" href={`${active.url}?download=1`} download>
+              <a className="inline-flex min-h-11 items-center gap-2 rounded-full bg-card px-4 text-sm hover:bg-muted" href={`${active.url}?download=1`} download>
                 <Download className="size-4" aria-hidden /> Download
               </a>
               {privileged && chapter ? (
@@ -1658,8 +1973,8 @@ function WatchView({
                 key={item}
                 type="button"
                 className={cn(
-                  "min-h-11 min-w-11 rounded-lg border px-2 font-mono text-xs",
-                  item === rate ? "border-[#f18b6e] bg-[#30231f] text-[#f2efe9]" : "border-[#3c3e44] text-[#a2a19f]",
+                  "min-h-11 min-w-11 rounded-full px-3 text-sm",
+                  item === rate ? "bg-primary-soft text-primary-text" : "bg-card text-muted-foreground hover:bg-muted",
                 )}
                 aria-pressed={item === rate}
                 onClick={() => applyRate(item)}
@@ -1674,7 +1989,7 @@ function WatchView({
                 <button
                   key={cut.url}
                   type="button"
-                  className={cn("min-h-11 rounded-lg border px-3 text-sm", index === cutIndex ? "border-[#f18b6e]" : "border-[#3c3e44] text-[#a2a19f]")}
+                  className={cn("min-h-11 rounded-full px-4 text-sm", index === cutIndex ? "bg-primary-soft text-primary-text" : "bg-card text-muted-foreground")}
                   aria-pressed={index === cutIndex}
                   onClick={() => {
                     setCutIndex(index);
@@ -1686,14 +2001,14 @@ function WatchView({
               ))}
             </div>
           ) : null}
-          <p id="player-keys" className="mt-4 text-xs text-[#a2a19f]">
-            <kbd className="rounded border border-[#3c3e44] px-1 font-mono">Space</kbd>{" "}
-            <kbd className="rounded border border-[#3c3e44] px-1 font-mono">K</kbd> play/pause ·{" "}
-            <kbd className="rounded border border-[#3c3e44] px-1 font-mono">←</kbd>{" "}
-            <kbd className="rounded border border-[#3c3e44] px-1 font-mono">→</kbd> seek 5s ·{" "}
-            <kbd className="rounded border border-[#3c3e44] px-1 font-mono">F</kbd> fullscreen ·{" "}
-            <kbd className="rounded border border-[#3c3e44] px-1 font-mono">M</kbd> mute
-          </p>
+          <details className="mt-3 text-xs text-muted-foreground"><summary className="min-h-11 cursor-pointer py-3">Shortcuts</summary><p id="player-keys">
+            <kbd className="rounded border border-border-strong px-1 font-mono">Space</kbd>{" "}
+            <kbd className="rounded border border-border-strong px-1 font-mono">K</kbd> play/pause ·{" "}
+            <kbd className="rounded border border-border-strong px-1 font-mono">←</kbd>{" "}
+            <kbd className="rounded border border-border-strong px-1 font-mono">→</kbd> seek 5s ·{" "}
+            <kbd className="rounded border border-border-strong px-1 font-mono">F</kbd> fullscreen ·{" "}
+            <kbd className="rounded border border-border-strong px-1 font-mono">M</kbd> mute
+          </p></details>
           <div className="mt-4 flex justify-between gap-2">
             {prev ? (
               <a className="inline-flex min-h-11 items-center text-sm" href={watchHref(series.slug, prev.ch)}>← Chapter {prev.num}</a>
@@ -1704,8 +2019,8 @@ function WatchView({
           </div>
         </div>
         {!isFull ? (
-          <aside className="rounded-2xl border border-[#2b2c30] bg-[#191a1d] p-3" aria-label="Chapters">
-            <h3 className="px-2 py-1 font-serif text-xl">Chapters</h3>
+          <aside className="sr-group p-3" aria-label="Chapters">
+            <h3 className="px-2 py-1 text-xl font-semibold tracking-[-0.01em]">Chapters</h3>
             <nav className="max-h-[70vh] overflow-y-auto" aria-label={`Chapters in ${series.title}`}>
               {series.chapters.map((item) => {
                 const current = item.ch === ch;
@@ -1715,12 +2030,12 @@ function WatchView({
                     id={current ? "chapter-current" : undefined}
                     href={watchHref(series.slug, item.ch)}
                     aria-current={current ? "true" : undefined}
-                    className={cn("flex items-center gap-2 rounded-lg px-2 py-2 text-sm", current ? "bg-[#30231f]" : "hover:bg-[#202125]")}
+                    className={cn("flex items-center gap-2 rounded-lg px-2 py-2 text-sm", current ? "bg-primary-soft" : "hover:bg-muted")}
                   >
-                    <span className="w-8 font-mono text-xs text-[#a2a19f]">{String(item.num).padStart(2, "0")}</span>
+                    <span className="w-8 text-sm text-muted-foreground">{String(item.num).padStart(2, "0")}</span>
                     <span className="min-w-0 flex-1">
                       <span className="block">{current ? "Now playing" : `Chapter ${item.num}`}</span>
-                      <span className="block text-xs text-[#a2a19f]">{fmtTime(item.duration)}</span>
+                      <span className="block text-xs text-muted-foreground">{fmtTime(item.duration)}</span>
                     </span>
                   </a>
                 );
@@ -1747,37 +2062,36 @@ function ArtworkView({
   if (!library.thumbnails.length) {
     return (
       <EmptyState title="A blank canvas, for now." text="Generated thumbnails will find their home here.">
-        <a className="inline-flex min-h-11 items-center rounded-lg border border-[#3c3e44] px-3 text-sm" href="#/">Back to library</a>
+        <a className="inline-flex min-h-11 items-center rounded-full bg-card px-4 text-[14.5px] font-medium hover:bg-muted" href="#/">Back to library</a>
       </EmptyState>
     );
   }
   return (
     <section aria-label="Artwork">
       <div className="mb-4">
-        <h2 className="font-serif text-3xl">Beyond the frame.</h2>
-        <p className="mt-1 text-sm text-[#a2a19f]">{library.thumbnails.length} artwork{library.thumbnails.length === 1 ? "" : "s"} from the collection.</p>
+        <h2 className="text-3xl font-semibold tracking-[-0.02em]">Artwork</h2>
       </div>
-      {q ? <p className="mb-3 text-sm text-[#a2a19f]" role="status">{thumbs.length} artwork{thumbs.length === 1 ? "" : "s"} matching “{query.trim()}”</p> : null}
+      {q ? <p className="mb-3 text-sm text-muted-foreground" role="status">{thumbs.length} artwork{thumbs.length === 1 ? "" : "s"} matching “{query.trim()}”</p> : null}
       {thumbs.length === 0 ? (
-        <p className="text-sm text-[#a2a19f]">No artwork matches that search.</p>
+        <p className="text-sm text-muted-foreground">No artwork matches that search.</p>
       ) : (
         <div className="columns-2 gap-4 sm:columns-3 lg:columns-4">
           {thumbs.map((thumb) => {
             const label = artworkLabel(thumb.name);
             const url = thumbUrl(thumb.name, thumb.url);
             return (
-              <article key={thumb.name} className="mb-4 break-inside-avoid">
-                <button type="button" className="block w-full overflow-hidden rounded-xl bg-[#191a1d] text-left" onClick={() => onOpen({ name: thumb.name, url, size: thumb.size })} aria-label={`Preview ${label}`}>
+              <article key={thumb.name} className="mb-4 break-inside-avoid overflow-hidden rounded-[22px] bg-card">
+                <button type="button" className="block w-full overflow-hidden rounded-[22px] bg-muted text-left" onClick={() => onOpen({ name: thumb.name, url, size: thumb.size })} aria-label={`Preview ${label}`}>
                   <img src={url} alt={label} className="w-full" loading="lazy" decoding="async" />
                 </button>
-                <div className="mt-2 flex items-start justify-between gap-2">
+                <div className="flex items-start justify-between gap-2 p-3">
                   <div className="min-w-0">
                     <p className="truncate text-sm">{label}</p>
-                    <p className="text-xs text-[#a2a19f]">{thumb.name.split(".").pop()?.toUpperCase()} · {fmtSize(thumb.size)}</p>
+                    <p className="text-xs text-muted-foreground">{thumb.name.split(".").pop()?.toUpperCase()} · {fmtSize(thumb.size)}</p>
                   </div>
-                  <a className="inline-flex min-h-11 min-w-11 items-center justify-center text-[#a2a19f] hover:text-[#f2efe9]" href={`${url}?download=1`} download={thumb.name} aria-label={`Download ${label}`}>
+                  <Tooltip label="Download" side="top"><a className="inline-flex min-h-11 min-w-11 items-center justify-center text-muted-foreground hover:text-foreground" href={`${url}?download=1`} download={thumb.name} aria-label={`Download ${label}`}>
                     <Download className="size-4" aria-hidden />
-                  </a>
+                  </a></Tooltip>
                 </div>
               </article>
             );
@@ -1798,7 +2112,7 @@ function DeleteChapterDialog({
   onDeleted: (subject: DeleteSubject, message: string) => void;
 }) {
   const [confirm, setConfirm] = useState("");
-  const [error, setError] = useState("");
+  const [error, setError] = useState<string | ErrorInfo>("");
   const [busy, setBusy] = useState(false);
   const expected = subject ? `${subject.slug}/${subject.ch}` : "";
   const ready = confirm.trim().toLowerCase() === expected.toLowerCase() && expected.length > 0;
@@ -1818,27 +2132,27 @@ function DeleteChapterDialog({
       const result = await api.deleteChapter({ slug: subject.slug, chapter: subject.ch, confirm: expected });
       onDeleted(subject, result.message);
     } catch (err) {
-      setError(errText(err, "Could not delete this video."));
+      setError(describeError(err, "Could not delete this video."));
       setBusy(false);
     }
   }
 
   return (
     <Dialog open={Boolean(subject)} onOpenChange={(open) => { if (!busy) onOpenChange(open); }}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="[&_[data-slot=dialog-close]]:size-11 sm:max-w-md">
         <DialogHeader>
-          <DialogTitle className="font-serif text-2xl">Delete this rendered video?</DialogTitle>
+          <DialogTitle className="text-2xl font-semibold tracking-[-0.015em]">Delete this rendered video?</DialogTitle>
           <DialogDescription>
-            This removes the rendered <code>video.mp4</code> only. Source chapters, panel images, narration audio, and caches stay.
+            Source files stay unchanged.
           </DialogDescription>
         </DialogHeader>
         {subject ? (
-          <form onSubmit={(event) => void onSubmit(event)} className="space-y-3">
+          <form onSubmit={(event) => void onSubmit(event)} className="space-y-3 [&_[role=alert]_button]:min-h-11">
             <p className="text-sm">
               <strong>{subject.title}</strong> — Chapter {subject.num}
-              <span className="mt-1 block font-mono text-xs text-[#a2a19f]">{expected}</span>
-              {subject.size ? <span className="mt-1 block text-xs text-[#a2a19f]">Rendered file · {fmtSize(subject.size)}</span> : null}
-              {subject.arms ? <span className="mt-1 block text-xs text-[#a2a19f]">{subject.arms} alternate cut{subject.arms === 1 ? "" : "s"} stay on disk.</span> : null}
+              <span className="mt-1 block font-mono text-xs text-muted-foreground">{expected}</span>
+              {subject.size ? <span className="mt-1 block text-xs text-muted-foreground">Rendered file · {fmtSize(subject.size)}</span> : null}
+              {subject.arms ? <span className="mt-1 block text-xs text-muted-foreground">{subject.arms} alternate cut{subject.arms === 1 ? "" : "s"} stay on disk.</span> : null}
             </p>
             <label className="block text-sm">
               Type <code className="font-mono text-xs">{expected}</code> to confirm
@@ -1852,7 +2166,7 @@ function DeleteChapterDialog({
                 onChange={(event) => setConfirm(event.target.value)}
               />
             </label>
-            {error ? <p className="text-sm text-[#ef6b5b]" role="alert">{error}</p> : null}
+            {error ? <ErrorNotice info={requestInfo(error)} /> : null}
             <DialogFooter>
               <Button type="button" variant="outline" className="min-h-11" disabled={busy} onClick={() => onOpenChange(false)}>
                 Keep it
@@ -1870,10 +2184,10 @@ function DeleteChapterDialog({
 
 function EmptyState({ title, text, children }: { title: string; text: string; children?: ReactNode }) {
   return (
-    <div className="max-w-xl py-12">
-      <h2 className="font-serif text-3xl leading-tight">{title}</h2>
-      <p className="mt-2 text-sm leading-6 text-[#a2a19f]">{text}</p>
-      {children ? <div className="mt-5 flex flex-wrap gap-2">{children}</div> : null}
+    <div className="mx-auto max-w-md rounded-[24px] bg-card px-6 py-10 text-center">
+      <h2 className="text-2xl font-semibold leading-tight tracking-[-0.015em]">{title}</h2>
+      {text ? <Tooltip label={text} side="top"><button type="button" aria-label="More information" className="mx-auto mt-2 grid size-11 place-items-center text-muted-foreground"><Info className="size-[18px]" strokeWidth={1.75} aria-hidden /></button></Tooltip> : null}
+      {children ? <div className="mt-5 flex flex-wrap justify-center gap-2">{children}</div> : null}
     </div>
   );
 }
@@ -1882,8 +2196,8 @@ function Missing({ title, children }: { title: string; children?: ReactNode }) {
   return (
     <EmptyState title={title} text="Head back to the library to see what’s available.">
       {children}
-      <a className="inline-flex min-h-11 items-center rounded-lg border border-[#3c3e44] px-3 text-sm" href="#/">
-        <X className="mr-1 size-4" aria-hidden /> Library
+      <a className="inline-flex min-h-11 items-center rounded-full bg-card px-4 text-[14.5px] font-medium hover:bg-muted" href="#/">
+        Back to library
       </a>
     </EmptyState>
   );

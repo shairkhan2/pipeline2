@@ -43,10 +43,12 @@ import { fileURLToPath } from "node:url";
 import * as renderPolicyMod from "../config/renderPolicy.js";
 import { RenderOverrideError, type PlanLane, type RenderPlan } from "../config/renderPolicy.js";
 import { getStudioSettings, type RenderQuality } from "../config/studioConfig.js";
+import { assertNoSymlinkPath, languageChapterDir, SUPPORTED_LOCALES, validateLocale } from "../config/languages.js";
 import { pyFloatRepr } from "../contracts/hashes.js";
 import { pyRoundFixed } from "../stages/factCheck.js";
 import { withSharedSeriesLock } from "../locks/seriesLock.js";
 import * as telemetryMod from "../telemetry/telemetry.js";
+import { failClass, failureNote, type FailClass } from "../domain/failure.js";
 import * as cloudlaneMod from "./cloudlane.js";
 import * as lappyMod from "./lappy.js";
 import * as nodeRegistryMod from "./nodeRegistry.js";
@@ -714,29 +716,86 @@ function callCloudHealthy(maxAge?: number): [boolean, string] {
  * Core renderlane functions
  * ------------------------------------------------------------------ */
 
+export interface PrepareOptions {
+  /** Language version to prepare (`hi-IN`). Absent/null = English, unchanged. */
+  locale?: string | null;
+  /** Per-run TTS override for the locale; never written to series meta.json. */
+  tts?: Record<string, unknown> | null;
+  /** Environment for TTS credentials/commands (defaults to process.env). */
+  env?: NodeJS.ProcessEnv;
+}
+
 export async function prepare(
   sdir: string,
   ch: string,
   out: string,
+  options: PrepareOptions = {},
 ): Promise<[string, string]> {
   /**
    * TTS + cleaner + shots.json for one scripted chapter. The cleaner step
    * goes to the laptop when this thread's job is remote (`lappy.useRemote()`).
+   *
+   * `options.locale` renders a language version: obs/panels stay SHARED
+   * (`out/obs_<ch>.json`), the localized script and every output live under
+   * `out/languages/<locale>/<ch>/`, and the timeline gets the locale + `tts`
+   * override. Without `locale` this is byte-for-byte the old behaviour.
    */
+  const locale = options.locale ?? null;
+  if (locale !== null && validateLocale(locale) === null) {
+    throw new RuntimeError(
+      `unsupported locale ${pyRepr(String(locale))} (supported: ${SUPPORTED_LOCALES.join(", ")})`,
+    );
+  }
   const timeline = await _hooks.loadTimeline();
   return await withSharedSeriesLock(
     out,
     { directSdir: sdir, requireExists: false },
     async (): Promise<[string, string]> => {
-      const vdir = path.join(out, ch, "video");
+      if (locale === null) {
+        const vdir = path.join(out, ch, "video");
+        fs.mkdirSync(vdir, { recursive: true });
+        // timeline.main resolves engine/voice + script_eleven.md from meta.json itself
+        await timeline.main(
+          sdir,
+          ch,
+          path.join(out, ch, "script.md"),
+          path.join(out, `obs_${ch}.json`),
+          vdir,
+        );
+        return [
+          path.resolve(path.join(vdir, "shots.json")),
+          path.resolve(path.join(vdir, "video.mp4")),
+        ];
+      }
+
+      // Locale: validate the FULL component path (languages/<locale>/<ch>/video)
+      // BEFORE mkdir or any other write, so a symlinked component can never
+      // redirect a locale write onto shared English artifacts.
+      const localeDir = languageChapterDir(out, locale, ch);
+      const vdir = path.join(localeDir, "video");
+      assertNoSymlinkPath(out, vdir);
+      // Shared inputs, locale outputs. The locale script must exist: rendering
+      // the English script with a Hindi voice would silently ship English text.
+      const localeScript = path.join(localeDir, "script.md");
+      if (!fs.existsSync(localeScript)) {
+        throw new RuntimeError(
+          `${locale} script missing: ${localeScript} - run the localize stage first`,
+        );
+      }
       fs.mkdirSync(vdir, { recursive: true });
-      // timeline.main resolves engine/voice + script_eleven.md from meta.json itself
+      // A component could have become a link between the check and the mkdir;
+      // re-assert now that every directory exists.
+      assertNoSymlinkPath(out, vdir);
+      const localeOpts: Record<string, unknown> = { locale };
+      if (options.tts !== undefined && options.tts !== null) localeOpts.tts = options.tts;
+      if (options.env !== undefined && options.env !== null) localeOpts.env = options.env;
       await timeline.main(
         sdir,
         ch,
-        path.join(out, ch, "script.md"),
+        localeScript,
         path.join(out, `obs_${ch}.json`),
         vdir,
+        localeOpts,
       );
       return [
         path.resolve(path.join(vdir, "shots.json")),
@@ -1512,7 +1571,16 @@ export interface ProduceOptions {
   workerId?: string | null;
   worker_id?: string | null;
   lane?: string | null;
+  /** Language version to produce (`hi-IN`). Absent/null = English, unchanged. */
+  locale?: string | null;
+  /** Per-run TTS override (engine/voice_id/language/speed/...). Never persists. */
+  tts?: Record<string, unknown> | null;
+  /** Environment for TTS credentials/commands (defaults to process.env). */
+  env?: NodeJS.ProcessEnv;
 }
+
+/** `[video, duration]`, plus locale warnings when a language version was rendered. */
+export type ProduceResult = [string, number] | [string, number, string[]];
 
 export async function produce(
   sdir: string,
@@ -1522,24 +1590,36 @@ export async function produce(
   remoteArg: boolean | null = null,
   workerIdArg: string | null = null,
   laneArg: string | null = null,
-): Promise<[string, number]> {
+): Promise<ProduceResult> {
   /**
    * Full video for one already-scripted chapter. Returns [path, dur].
    *
    * remote=null -> decide by the health gate now (legacy). `lane` = persisted-plan
    * selection: preparation stays wherever it belongs (a cloud render is prepared
    * locally - cloud never cleans; a laptop render is prepared on the laptop).
+   *
+   * `locale` renders a language version into `out/languages/<locale>/<ch>/video`;
+   * English callers (no locale) get the original behaviour exactly.
    */
   let log: (msg: string) => void;
   let remote: boolean | null;
   let workerId: string | null;
   let lane: string | null;
+  let prepareOptions: PrepareOptions | undefined;
 
   if (typeof logOrOpts === "object" && logOrOpts !== null) {
     log = logOrOpts.log ?? ((m) => console.log(m));
     remote = logOrOpts.remote ?? null;
     workerId = logOrOpts.workerId ?? logOrOpts.worker_id ?? null;
     lane = logOrOpts.lane ?? null;
+    const locale = logOrOpts.locale ?? null;
+    if (locale !== null || logOrOpts.tts != null || logOrOpts.env != null) {
+      const opts: PrepareOptions = {};
+      if (locale !== null) opts.locale = locale;
+      if (logOrOpts.tts != null) opts.tts = logOrOpts.tts;
+      if (logOrOpts.env != null) opts.env = logOrOpts.env;
+      prepareOptions = opts;
+    }
   } else {
     log = logOrOpts ?? ((m) => console.log(m));
     remote = remoteArg;
@@ -1550,7 +1630,7 @@ export async function produce(
   return await withSharedSeriesLock(
     out,
     { directSdir: sdir, requireExists: false },
-    async (): Promise<[string, number]> => {
+    async (): Promise<ProduceResult> => {
       const lp = _hooks.lappy;
       const tel = _hooks.telemetry;
       if (lane !== null && lane !== undefined) {
@@ -1561,7 +1641,7 @@ export async function produce(
       }
       const wid = workerId || (remote ? lp.HOST : "local");
       const isRemote = Boolean(remote);
-      const runScoped = async (): Promise<[string, number]> => {
+      const runScoped = async (): Promise<ProduceResult> => {
         tel.bind({ chapter: ch, worker: wid });
         // Several slots can share one worker id: only the last one to finish may
         // publish "idle", otherwise a busy worker looks free.
@@ -1570,8 +1650,51 @@ export async function produce(
         tel.worker(wid, { kind: _laneWorkerKind(lane, isRemote), status: "busy" });
         lp.setRemoteForThread(isRemote);
         try {
-          const [props, video] = await _hooks.prepare(sdir, ch, out);
-          return await _hooks._render(ch, props, video, log, lane);
+          const [props, video] = prepareOptions === undefined
+            ? await _hooks.prepare(sdir, ch, out)
+            : await _hooks.prepare(sdir, ch, out, prepareOptions);
+          if (prepareOptions?.locale == null) {
+            // English: original behaviour, the lane writes the canonical path.
+            return await _hooks._render(ch, props, video, log, lane);
+          }
+          // Locale: ATOMIC publish. The render target is a unique sibling
+          // candidate, never the published file, so the last good mp4 keeps
+          // serving throughout the render and even through a hard crash
+          // (SIGKILL) - the canonical inode is never opened for writing.
+          _clearStaleLocaleCandidates(video);
+          const candidate = _localeCandidatePath(video);
+          let rendered: [string, number];
+          try {
+            rendered = await _hooks._render(ch, props, candidate, log, lane);
+            // Validate the candidate itself (the lane already rejected an empty
+            // output; re-probe so a truncated file can never be published).
+            const dur = _hooks._probe(candidate);
+            if (!(dur > 0)) {
+              throw new RuntimeError(
+                `locale render produced an empty candidate (duration ${dur}s): ${candidate}`,
+              );
+            }
+            if (!fs.existsSync(candidate) || fs.statSync(candidate).size <= 0) {
+              throw new RuntimeError(
+                `locale render produced an empty candidate (0 bytes): ${candidate}`,
+              );
+            }
+            fs.renameSync(candidate, video);
+            rendered = [video, dur];
+            log(`   render: ${ch} published ${pyFloatRepr(Number(dur))}s -> ${video}`);
+          } catch (err) {
+            // Caught failure: drop the candidate, leave the published file as is.
+            try {
+              if (fs.existsSync(candidate)) fs.unlinkSync(candidate);
+            } catch {
+              // a leftover candidate is never served; cleanup must not mask err
+            }
+            throw err;
+          }
+          const warnings = _readLocaleWarnings(video);
+          return warnings.length
+            ? [rendered[0], rendered[1], warnings]
+            : rendered;
         } finally {
           const left = Math.max(0, (_activeProduceByWorker.get(wid) ?? 1) - 1);
           if (left === 0) _activeProduceByWorker.delete(wid);
@@ -1582,16 +1705,81 @@ export async function produce(
       };
       // Isolate remote routing and telemetry per render: concurrent slots must not
       // clobber each other's AsyncLocalStorage context.
-      const scoped = (): Promise<[string, number]> =>
+      const scoped = (): Promise<ProduceResult> =>
         typeof tel.run === "function"
-          ? (tel.run({ chapter: ch, worker: wid }, runScoped) as Promise<[string, number]>)
+          ? (tel.run({ chapter: ch, worker: wid }, runScoped) as Promise<ProduceResult>)
           : runScoped();
       if (typeof lp.withRemote === "function") {
-        return await (lp.withRemote(isRemote, scoped) as Promise<[string, number]>);
+        return await (lp.withRemote(isRemote, scoped) as Promise<ProduceResult>);
       }
       return await scoped();
     },
   );
+}
+
+/**
+ * Non-fatal findings the locale timeline recorded next to its own output
+ * (dropped panel assignments, held lines). Absent/unreadable -> [].
+ */
+export function _readLocaleWarnings(video: string): string[] {
+  const file = path.join(path.dirname(video), "locale_warnings.json");
+  try {
+    const doc = JSON.parse(fs.readFileSync(file, "utf8")) as { warnings?: unknown };
+    return Array.isArray(doc.warnings)
+      ? doc.warnings.map((w) => String(w)).filter((w) => w.trim() !== "")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Unique sibling candidate for an atomic locale render: `<video>.<pid>.<rand>.candidate.mp4`.
+ *
+ * It lives in the same directory as the published file so the final
+ * `renameSync` is a same-filesystem, atomic replace. It is never the published
+ * path, so a crash mid-encode can only leave a candidate behind - the old
+ * published mp4 keeps its bytes and inode.
+ */
+export function _localeCandidatePath(video: string): string {
+  const abs = path.resolve(video);
+  const rand = Math.random().toString(36).slice(2, 10);
+  return path.join(path.dirname(abs), `.${path.basename(abs)}.${process.pid}.${rand}.candidate.mp4`);
+}
+
+/** True when `name` looks like a locale render candidate for this video basename. */
+function isLocaleCandidate(name: string, base: string): boolean {
+  return name.startsWith(`.${base}.`) && name.endsWith(".candidate.mp4");
+}
+
+/**
+ * Remove candidate files a previous crashed locale render left behind.
+ *
+ * Only candidates for THIS video are touched, and only ones older than the
+ * current call could create (i.e. not the one about to be used): the caller
+ * runs this before generating a fresh candidate name, so every match is stale.
+ */
+export function _clearStaleLocaleCandidates(video: string): number {
+  const abs = path.resolve(video);
+  const dir = path.dirname(abs);
+  const base = path.basename(abs);
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!isLocaleCandidate(name, base)) continue;
+    try {
+      fs.unlinkSync(path.join(dir, name));
+      removed += 1;
+    } catch {
+      // an undeletable stale candidate is never served; ignore
+    }
+  }
+  return removed;
 }
 
 export interface VideoResult {
@@ -1600,7 +1788,11 @@ export interface VideoResult {
   duration?: number;
   error?: string;
   video_attempts?: number;
+  class?: FailClass;
 }
+
+const VIDEO_RETRY_DELAYS_S = [120, 600] as const;
+const VIDEO_MAX_ATTEMPTS = VIDEO_RETRY_DELAYS_S.length + 1;
 
 export async function worker(
   sdir: string,
@@ -1651,8 +1843,12 @@ export async function worker(
       const busy = { lappy: false };
       let stopped = false;
       const pending = new RenderQueue<string>();
+      let waitingRetries = 0;
+      const attempts: Record<string, number> = { ...failcounts };
 
       const runOne = async (ch: string, remote: boolean, tag: string): Promise<void> => {
+        let final = true;
+        attempts[ch] = (attempts[ch] ?? 0) + 1;
         try {
           const [v, dur] = await _hooks.produce(
             sdir,
@@ -1662,26 +1858,38 @@ export async function worker(
             remote,
             remote ? lp.HOST : tag,
           );
-          results[ch] = { status: "video-ok", video: v, duration: dur };
+          results[ch] = { status: "video-ok", video: v, duration: dur, video_attempts: attempts[ch] };
         } catch (e) {
-          tel.failed(ch, e);
           failcounts[ch] = (failcounts[ch] ?? 0) + 1;
+          if (failClass(e) === "transient" && failcounts[ch] < VIDEO_MAX_ATTEMPTS) {
+            final = false;
+            const delay = VIDEO_RETRY_DELAYS_S[failcounts[ch] - 1]!;
+            tel.retrying?.(ch, e, { retryAt: _hooks.time.now() + delay, attempt: failcounts[ch], maxAttempts: VIDEO_MAX_ATTEMPTS });
+            log(`~~ ${ch} retry ${failcounts[ch]}/${VIDEO_MAX_ATTEMPTS} in ${delay}s: ${failureNote(e)}`);
+            waitingRetries++;
+            // The chapter must come back even if the timer fails, or join() would never resolve.
+            void Promise.resolve().then(() => _hooks.time.sleep(delay)).catch(() => undefined)
+              .then(() => { pending.put(ch); }).finally(() => { waitingRetries--; });
+            return;
+          }
+          tel.failed(ch, e);
           process.stderr.write(
             `[video] !! ${ch} FAILED (${failcounts[ch]}x) [${tag}]: ${errText(e).slice(0, 200)}\n`,
           );
           results[ch] = {
             status: "video-failed",
+            class: failClass(e),
             error: errText(e).slice(0, 400),
             // failcounts[ch] was just incremented, so it IS the attempt count.
-            video_attempts: failcounts[ch] ?? 1,
+            video_attempts: attempts[ch],
           };
         } finally {
-          wq.taskDone();
+          if (final) wq.taskDone();
         }
       };
 
       const slot = async (name: string): Promise<void> => {
-        while (!(stopped && pending.empty())) {
+        while (!(stopped && pending.empty() && waitingRetries === 0)) {
           if (name === "lappy" && !callLappyHealthy()[0]) {
             await _hooks.time.sleep(5);
             continue;
@@ -1777,6 +1985,8 @@ export async function _workerOverrideRefused(
         results[ch] = {
           status: "video-failed",
           error: `render override refused: ${reason}`,
+          class: failClass(new RuntimeError(`render override refused: ${reason}`)),
+          video_attempts: 0,
         };
         wq.taskDone();
       }
@@ -1860,6 +2070,8 @@ export async function _workerPlan(
         // reported count is prior failures plus these, so the first failure is
         // 1 and a second failure of the same chapter is 2.
         const priorFailures = failcounts[ch] ?? 0;
+        const priorAttempts = attempts[ch] ?? 0;
+        let final = true;
         let tries = 0;
         try {
           tries += 1;
@@ -1868,7 +2080,7 @@ export async function _workerPlan(
             lane,
             workerId: _workerId(lane),
           });
-          results[ch] = { status: "video-ok", video: v, duration: dur };
+          results[ch] = { status: "video-ok", video: v, duration: dur, video_attempts: priorAttempts + tries };
         } catch (e) {
           // Unpinned (`inherit`) plans may overflow to the next eligible lane;
           // a pinned plan stays strictly pinned and fails here.
@@ -1897,7 +2109,7 @@ export async function _workerPlan(
                   status: "video-ok",
                   video: v,
                   duration: dur,
-                  video_attempts: priorFailures + tries,
+                  video_attempts: priorAttempts + tries,
                 };
                 return;
               } catch (e2) {
@@ -1905,26 +2117,41 @@ export async function _workerPlan(
               }
             }
           }
-          tel.failed(ch, lastErr);
           failcounts[ch] = priorFailures + 1;
+          if (failClass(lastErr) === "transient" && failcounts[ch] < VIDEO_MAX_ATTEMPTS) {
+            final = false;
+            const delay = VIDEO_RETRY_DELAYS_S[failcounts[ch] - 1]!;
+            tel.retrying?.(ch, lastErr, { retryAt: _hooks.time.now() + delay, attempt: failcounts[ch], maxAttempts: VIDEO_MAX_ATTEMPTS });
+            log(`~~ ${ch} retry ${failcounts[ch]}/${VIDEO_MAX_ATTEMPTS} in ${delay}s: ${failureNote(lastErr)}`);
+            waitingRetries++;
+            // The chapter must come back even if the timer fails, or join() would never resolve.
+            void Promise.resolve().then(() => _hooks.time.sleep(delay)).catch(() => undefined)
+              .then(() => { pending.put(ch); }).finally(() => { waitingRetries--; });
+            return;
+          }
+          tel.failed(ch, lastErr);
           process.stderr.write(
             `[video] !! ${ch} FAILED (${failcounts[ch]}x) [${lane}]: ${errText(lastErr).slice(0, 200)}\n`,
           );
           results[ch] = {
             status: "video-failed",
+            class: failClass(lastErr),
             error: errText(lastErr).slice(0, 400),
-            video_attempts: priorFailures + Math.max(1, tries),
+            video_attempts: priorAttempts + Math.max(1, tries),
           };
         } finally {
-          wq.taskDone();
+          attempts[ch] = priorAttempts + tries;
+          if (final) wq.taskDone();
         }
       };
 
       let stopped = false;
       const pending = new RenderQueue<string>();
+      let waitingRetries = 0;
+      const attempts: Record<string, number> = { ...failcounts };
 
       const slotWorker = async (_name: string): Promise<void> => {
-        while (!(stopped && pending.empty())) {
+        while (!(stopped && pending.empty() && waitingRetries === 0)) {
           // Availability is probed OUTSIDE the lock (non-waking, cached health
           // gates); busy counters and the grace clock are updated atomically.
           const availFn = rp.lane_availability ?? rp.laneAvailability;
@@ -1953,7 +2180,7 @@ export async function _workerPlan(
               // this is normal waiting, never a failure.
               idleSince[0] = _hooks.time.now();
             } else if (pending.qsize() > 0 && _hooks.time.now() - idleSince[0] > grace) {
-              _hooks._drainPending(pending, results, failcounts, wq, eligible, plan);
+              _hooks._drainPending(pending, results, failcounts, wq, eligible, plan, attempts);
               idleSince[0] = _hooks.time.now();
             }
             const waitS =
@@ -2020,6 +2247,7 @@ export function _drainPending(
   q: QueueLike<string | null>,
   eligible: ReadonlyArray<PlanLane>,
   plan: RenderPlan,
+  attempts: Record<string, number> = {},
 ): void {
   /** Deterministic failure for chapters that no eligible lane could serve. */
   const ids = eligible.map((l) => l.id).join(",");
@@ -2035,7 +2263,7 @@ export function _drainPending(
       throw e;
     }
     failcounts[ch] = (failcounts[ch] ?? 0) + 1;
-    results[ch] = { status: "video-failed", error: reason };
+    results[ch] = { status: "video-failed", error: reason, class: failClass(new RuntimeError(reason)), video_attempts: attempts[ch] ?? 0 };
     process.stderr.write(`[video] !! ${ch} FAILED [${reason}]\n`);
     wq.taskDone();
   }
@@ -2053,6 +2281,7 @@ export interface TimelineModuleLike {
     scriptPath: string,
     obsPath: string,
     vdir: string,
+    options?: Record<string, unknown>,
   ) => Promise<string> | string;
 }
 

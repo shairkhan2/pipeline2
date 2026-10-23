@@ -71,6 +71,15 @@ export function normalizeRenderLane(raw: unknown): string | null {
   return value;
 }
 
+/**
+ * True when a request field was absent or blank, so it must not override a
+ * persisted default. Applies to `renderQuality`, where `null` means "resolve at
+ * run time"; `renderLane` handles `null` separately because it is a valid value.
+ */
+function isBlankField(raw: unknown): boolean {
+  return raw === null || raw === undefined || String(raw).trim() === '';
+}
+
 export function resolveJobsDir(): string {
   return jobsDir();
 }
@@ -90,6 +99,8 @@ function errorStatus(err: unknown, fallback: number): { status: number; error: s
   return { status: e.statusCode || fallback, error: sanitizeLine(msg) || 'Intake command failed' };
 }
 
+let queueWatchdog: ReturnType<typeof setInterval> | null = null;
+
 export async function initIntakeQueue(): Promise<void> {
   try {
     reconcileJobs();
@@ -97,6 +108,19 @@ export async function initIntakeQueue(): Promise<void> {
     spawnWorkerIfNeeded();
   } catch (err) {
     console.error('intake startup reconcile warning:', (err as Error).message);
+  }
+  // Overnight runs heal without a browser open: a dead run is requeued and a
+  // worker is spawned for any due retry, even when nobody polls the UI.
+  if (!queueWatchdog) {
+    queueWatchdog = setInterval(() => {
+      try {
+        reconcileJobs(undefined, true);
+        spawnWorkerIfNeeded();
+      } catch (err) {
+        console.error('intake watchdog warning:', (err as Error).message);
+      }
+    }, 60_000);
+    queueWatchdog.unref();
   }
 }
 
@@ -504,7 +528,7 @@ export async function handleIntakeRoute(
       const motion = String(urlObj.searchParams.get('motion') || decodeHeader('x-motion') || 'cut').trim();
       const filename = String(urlObj.searchParams.get('filename') || decodeHeader('x-upload-filename') || 'upload.zip').trim();
       const rawRenderLane = urlObj.searchParams.get('renderLane') ?? decodeHeader('x-render-lane');
-      const renderLane = normalizeRenderLane(rawRenderLane);
+      const renderLane = isBlankField(rawRenderLane) ? undefined : normalizeRenderLane(rawRenderLane);
       if (renderLane === null) {
         req.resume();
         return sendJson(res, 400, {
@@ -512,7 +536,7 @@ export async function handleIntakeRoute(
         });
       }
       const rawRenderQuality = urlObj.searchParams.get('renderQuality') ?? decodeHeader('x-render-quality');
-      const renderQuality = normalizeRenderQuality(rawRenderQuality);
+      const renderQuality = isBlankField(rawRenderQuality) ? undefined : normalizeRenderQuality(rawRenderQuality);
       if (renderQuality === null) {
         req.resume();
         return sendJson(res, 400, {
@@ -544,6 +568,8 @@ export async function handleIntakeRoute(
           renderQuality,
           createdBy: session.user,
           outroConfig,
+          style: parseJsonParam(urlObj.searchParams.get('style')) as import('../config/seriesStyle.js').SeriesStyle | undefined,
+          tts: parseJsonParam(urlObj.searchParams.get('tts')) as import('../intake/intake.js').EnqueueOptions['tts'],
         });
         return sendJson(res, 201, job);
       } catch (err) {
@@ -579,13 +605,17 @@ export async function handleIntakeRoute(
         error: 'JSON intake endpoint only accepts sourceType="gdrive". For ZIP uploads, stream the archive body.',
       });
     }
-    const renderLane = normalizeRenderLane(body.renderLane);
+    // A JSON `null` lane is an explicit "inherit" (see normalizeRenderLane); only
+    // an absent or blank field defers to the Studio default.
+    const renderLane = body.renderLane === undefined || (typeof body.renderLane === 'string' && !body.renderLane.trim())
+      ? undefined
+      : normalizeRenderLane(body.renderLane);
     if (renderLane === null) {
       return sendJson(res, 400, {
         error: `Unsupported renderLane: ${String(body.renderLane).slice(0, 32)} (allowed: ${RENDER_LANE_VALUES.join(', ')})`,
       });
     }
-    const renderQuality = normalizeRenderQuality(body.renderQuality);
+    const renderQuality = isBlankField(body.renderQuality) ? undefined : normalizeRenderQuality(body.renderQuality);
     if (renderQuality === null) {
       return sendJson(res, 400, {
         error: `Unsupported renderQuality: ${String(body.renderQuality).slice(0, 16)} (allowed: ${RENDER_QUALITIES.join(', ')})`,
@@ -606,6 +636,8 @@ export async function handleIntakeRoute(
         renderQuality,
         createdBy: session.user,
         outroConfig: parseOutroConfig(body.outroConfig),
+        style: body.style as import('../config/seriesStyle.js').SeriesStyle | undefined,
+        tts: body.tts as import('../intake/intake.js').EnqueueOptions['tts'],
       });
       return sendJson(res, 201, job);
     } catch (err) {

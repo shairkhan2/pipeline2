@@ -1,14 +1,15 @@
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
+import "@fontsource-variable/figtree";
 import { detectAppRoute, type AppRoute } from "@/components/layout/AppShell";
+import { applyTheme } from "@/lib/theme";
 import { LibraryPage } from "@/pages/LibraryPage";
-import { MeterPage } from "@/pages/MeterPage";
 import NewSeriesPage from "@/pages/NewSeriesPage";
 import { SetupPage } from "@/pages/SetupPage";
 import StatusPage from "@/pages/StatusPage";
-import { StudioPage } from "@/pages/StudioPage";
 import "./index.css";
+import "@/pages/studio.css";
 
 type PageId = AppRoute | "setup";
 
@@ -57,12 +58,13 @@ function App() {
   }, []);
 
   if (page === "setup") return <SetupPage />;
-  if (page === "studio") return <StudioPage />;
+  if (page === "studio" || page === "meter") return <LibraryPage />;
   if (page === "status") return <StatusPage />;
-  if (page === "meter") return <MeterPage />;
   if (page === "new-series") return <NewSeriesPage />;
   return <LibraryPage />;
 }
+
+applyTheme();
 
 const root = document.getElementById("root");
 if (root) {

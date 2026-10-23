@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { RotateCcw, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { RotateCcw, Trash2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -10,7 +10,9 @@ import {
   DrawerHeader,
   DrawerTitle,
 } from "@/components/ui/drawer";
-import { api, isApiError, type StudioStorageReport, type TrashItem } from "@/lib/api";
+import { ErrorNotice, Notice } from "@/components/ui/notice";
+import { api, type StudioStorageReport, type TrashItem } from "@/lib/api";
+import { errorLine } from "@/lib/errors";
 
 export function fmtStorageBytes(bytes: number | null | undefined): string {
   const n = Number(bytes) || 0;
@@ -21,50 +23,89 @@ export function fmtStorageBytes(bytes: number | null | undefined): string {
 }
 
 function errText(error: unknown, fallback = "Request failed"): string {
-  if (isApiError(error)) return error.message;
-  if (error instanceof Error && error.message) return error.message;
-  return fallback;
+  return errorLine(error, fallback);
 }
 
 export interface StorageTrashDrawerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   privileged: boolean;
-  onMessage?: (message: string) => void;
+  onMessage?: (message: string, tone?: "success" | "danger") => void;
   onAfterChange?: () => void | Promise<void>;
   onStateLoaded?: (report: StudioStorageReport | null, trash: TrashItem[]) => void;
 }
 
+type Pending = { kind: "purge-one"; item: TrashItem } | { kind: "purge-all" } | null;
+type Feedback = { tone: "success" | "danger"; text: string } | null;
+
 export function StorageTrashDrawer({
-  open,
-  onOpenChange,
+  open, onOpenChange, ...props
+}: StorageTrashDrawerProps) {
+  return <Drawer open={open} onOpenChange={onOpenChange} swipeDirection="right">
+    <DrawerContent>
+      <DrawerHeader className="p-5 pb-3">
+        <div className="flex items-start justify-between gap-3">
+          <div><DrawerTitle className="text-xl">Storage and trash</DrawerTitle>
+            <DrawerDescription className="mt-1 text-[14.5px]">Deleted videos wait in the trash until the server restarts. Restore them before then, or delete them for good.</DrawerDescription></div>
+          <DrawerClose className="grid size-11 shrink-0 place-items-center rounded-full bg-card hover:bg-muted" aria-label="Close storage drawer"><X className="size-4" aria-hidden /></DrawerClose>
+        </div>
+      </DrawerHeader>
+      <div className="overflow-auto px-5 pb-8"><StorageTrashPanel {...props} open={open} /></div>
+    </DrawerContent>
+  </Drawer>;
+}
+
+export function StorageTrashPanel({
+  open = true,
   privileged,
   onMessage,
   onAfterChange,
   onStateLoaded,
-}: StorageTrashDrawerProps) {
+}: Omit<StorageTrashDrawerProps, "open" | "onOpenChange"> & { open?: boolean }) {
   const [storage, setStorage] = useState<StudioStorageReport | null>(null);
   const [trash, setTrash] = useState<TrashItem[]>([]);
   const [busy, setBusy] = useState(false);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [trashFailed, setTrashFailed] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [pending, setPending] = useState<Pending>(null);
+  const [feedback, setFeedback] = useState<Feedback>(null);
+  const onStateLoadedRef = useRef(onStateLoaded);
+  onStateLoadedRef.current = onStateLoaded;
 
-  const loadStorage = useCallback(async () => {
-    setBusy(true);
+  const report = useCallback(
+    (tone: "success" | "danger", text: string) => {
+      setFeedback({ tone, text });
+      onMessage?.(text, tone);
+    },
+    [onMessage],
+  );
+
+  const loadStorage = useCallback(async (manageBusy = true) => {
+    if (manageBusy) setBusy(true);
     try {
-      const [rep, trashRes] = await Promise.all([
-        api.studio.getStorage().catch(() => null),
-        api.studio.getTrash().catch(() => null),
-      ]);
-      if (rep) setStorage(rep);
-      const list = trashRes?.items || trashRes?.trash || rep?.trash || [];
-      setTrash(list);
-      onStateLoaded?.(rep, list);
+      const [rep, trashRes] = await Promise.allSettled([api.studio.getStorage(), api.studio.getTrash()]);
+      const repValue = rep.status === "fulfilled" ? rep.value : null;
+      const trashValue = trashRes.status === "fulfilled" ? trashRes.value : null;
+      // A failed request must not look like an empty trash.
+      setLoadError(rep.status === "rejected" ? rep.reason : trashRes.status === "rejected" ? trashRes.reason : null);
+      setTrashFailed(trashRes.status === "rejected" && !repValue?.trash);
+      if (repValue) setStorage(repValue);
+      const list = trashValue?.items || trashValue?.trash || repValue?.trash || [];
+      if (trashValue || repValue) setTrash(list);
+      setLoaded(true);
+      onStateLoadedRef.current?.(repValue, list);
     } finally {
-      setBusy(false);
+      if (manageBusy) setBusy(false);
     }
-  }, [onStateLoaded]);
+  }, []);
 
   useEffect(() => {
-    if (open) void loadStorage();
+    if (open) {
+      setFeedback(null);
+      setPending(null);
+      void loadStorage();
+    }
   }, [open, loadStorage]);
 
   async function deleteToTrash(payload: { slug: string; chapter?: string; kind?: string }) {
@@ -75,10 +116,11 @@ export function StorageTrashDrawer({
         ...payload,
         confirm: payload.chapter ? `${payload.slug}/${payload.chapter}` : payload.slug,
       });
-      onMessage?.(res.message || `Moved ${payload.slug}${payload.chapter ? `/${payload.chapter}` : ""} to /tmp trash.`);
-      await Promise.all([loadStorage(), onAfterChange?.()]);
+      report("success", res.message || `Moved ${payload.slug}${payload.chapter ? `/${payload.chapter}` : ""} to the trash.`);
+      await Promise.all([loadStorage(false), onAfterChange?.()]);
     } catch (error) {
-      onMessage?.(errText(error, "Could not move item to /tmp trash."));
+      report("danger", errText(error, "Could not move the item to the trash."));
+    } finally {
       setBusy(false);
     }
   }
@@ -89,13 +131,14 @@ export function StorageTrashDrawer({
     setBusy(true);
     try {
       const res = await api.studio.restoreTrash(tid);
-      onMessage?.(
-        res.message ||
-          `Restored ${res.restoredPath || `${item.slug || ""}${item.chapter ? `/${item.chapter}` : ""}` || tid} from /tmp trash.`,
+      report(
+        "success",
+        res.message || `Restored ${res.restoredPath || `${item.slug || ""}${item.chapter ? `/${item.chapter}` : ""}` || tid}.`,
       );
-      await Promise.all([loadStorage(), onAfterChange?.()]);
+      await Promise.all([loadStorage(false), onAfterChange?.()]);
     } catch (error) {
-      onMessage?.(errText(error, "Could not restore item."));
+      report("danger", errText(error, "Could not restore the item."));
+    } finally {
       setBusy(false);
     }
   }
@@ -103,167 +146,173 @@ export function StorageTrashDrawer({
   async function purgeTrash(trashId?: string) {
     if (!privileged) return;
     if (trashId !== undefined && !trashId.trim()) return;
+    setPending(null);
     setBusy(true);
     try {
       const res = await api.studio.purgeTrash(trashId);
-      onMessage?.(
+      report(
+        "success",
         res.message ||
           (trashId
-            ? `Purged ${trashId} from /tmp trash (${fmtStorageBytes(res.freedBytes)}).`
-            : `Emptied /tmp trash (${fmtStorageBytes(res.freedBytes)}).`),
+            ? `Deleted for good, freed ${fmtStorageBytes(res.freedBytes)}.`
+            : `Trash emptied, freed ${fmtStorageBytes(res.freedBytes)}.`),
       );
-      await Promise.all([loadStorage(), onAfterChange?.()]);
+      await Promise.all([loadStorage(false), onAfterChange?.()]);
     } catch (error) {
-      onMessage?.(errText(error, "Could not empty /tmp trash."));
+      report("danger", errText(error, "Could not empty the trash."));
+    } finally {
       setBusy(false);
     }
   }
 
-  return (
-    <Drawer open={open} onOpenChange={onOpenChange} swipeDirection="right">
-      <DrawerContent>
-        <DrawerHeader>
-          <div className="flex items-start justify-between gap-2">
-            <div>
-              <DrawerTitle className="font-serif text-2xl">Storage &amp; recovery</DrawerTitle>
-              <DrawerDescription>
-                Review disk usage and restore deleted videos or artifacts. Items in /tmp trash are recoverable until reboot.
-              </DrawerDescription>
-            </div>
-            <DrawerClose
-              className="min-h-9 rounded-full border border-[#3c3e44] bg-[#101113] px-3 text-xs text-[#f2efe9]"
-              aria-label="Close storage drawer"
-            >
-              Close
-            </DrawerClose>
-          </div>
-        </DrawerHeader>
-        <div className="flex flex-col gap-4 overflow-auto p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#2b2c30] bg-[#191a1d] p-3 text-xs">
-            <div className="flex flex-wrap gap-3">
-              <span>
-                Total disk usage: <strong className="font-mono">{fmtStorageBytes(storage?.totalBytes)}</strong>
-              </span>
-              {storage?.seriesBytes !== undefined ? (
-                <span>
-                  Series: <strong className="font-mono">{fmtStorageBytes(storage.seriesBytes)}</strong>
-                </span>
-              ) : null}
-              {storage?.jobsBytes !== undefined ? (
-                <span>
-                  Jobs: <strong className="font-mono">{fmtStorageBytes(storage.jobsBytes)}</strong>
-                </span>
-              ) : null}
-              <span>
-                /tmp Trash: <strong className="font-mono">{fmtStorageBytes(storage?.trashBytes)}</strong>
-              </span>
-            </div>
-            <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void loadStorage()}>
-              Refresh
-            </Button>
-          </div>
+  const totals: Array<[string, number | undefined]> = [
+    ["Total", storage?.totalBytes],
+    ["Series", storage?.seriesBytes],
+    ["Jobs", storage?.jobsBytes],
+    ["Trash", storage?.trashBytes],
+  ];
 
-          <section aria-label="Recoverable until reboot (/tmp Trash)" className="flex flex-col gap-2">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <h3 className="font-serif text-lg">Deleted items</h3>
+  return (
+        <div className="flex min-w-0 flex-col gap-6">
+          {loadError ? <ErrorNotice error={loadError} onRetry={() => void loadStorage()} retrying={busy} /> : null}
+          {feedback ? <Notice tone={feedback.tone} onDismiss={() => setFeedback(null)}>{feedback.text}</Notice> : null}
+          {!privileged ? <Notice tone="info">Viewer accounts can see storage but can’t delete or restore anything.</Notice> : null}
+
+          <section aria-label="Disk usage">
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="sr-section-label mb-0">Disk usage</h3>
+              <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => void loadStorage()}>
+                <RotateCcw className={busy ? "size-3.5 animate-spin" : "size-3.5"} aria-hidden /> Refresh
+              </Button>
+            </div>
+            <dl className="sr-group">
+              {totals.map(([label, value]) => (
+                <div key={label} className="sr-row justify-between">
+                  <dt className="text-[15px]">{label}</dt>
+                  <dd className="text-[15px] text-muted-foreground tabular-nums">{loaded && storage ? fmtStorageBytes(value) : "—"}</dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+
+          <section aria-label="Recoverable until reboot (/tmp Trash)">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <h3 className="sr-section-label mb-0">Trash</h3>
               {privileged && trash.length > 0 ? (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="destructive"
-                  disabled={busy}
-                  onClick={() => void purgeTrash()}
-                >
-                  Empty Trash
-                </Button>
+                pending?.kind === "purge-all" ? (
+                  <span className="flex items-center gap-1.5">
+                    <Button type="button" size="sm" variant="destructive" disabled={busy} onClick={() => void purgeTrash()}>
+                      Delete {trash.length} for good
+                    </Button>
+                    <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setPending(null)}>
+                      Cancel
+                    </Button>
+                  </span>
+                ) : (
+                  <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setPending({ kind: "purge-all" })}>
+                    Empty trash
+                  </Button>
+                )
               ) : null}
             </div>
             {trash.length === 0 ? (
-              <p className="text-xs text-[#a2a19f]">No deleted chapter videos or artifacts in /tmp trash.</p>
+              <p className="rounded-2xl bg-card px-4 py-4 text-[14.5px] text-muted-foreground">
+                {!loaded ? "Loading…" : trashFailed ? "Trash contents are unknown until the request succeeds." : "The trash is empty."}
+              </p>
             ) : (
-              trash.map((item) => {
-                const tid = item.id || item.trashId || "";
-                return (
-                  <div
-                    key={tid}
-                    className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#2b2c30] bg-[#191a1d] p-3"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate font-mono text-xs text-[#f2efe9]">
-                        {item.label || `${item.slug || "series"}${item.chapter ? `/${item.chapter}` : ""}`} · {item.kind}
-                      </p>
-                      <p className="truncate font-mono text-[11px] text-[#a2a19f]">
-                        {fmtStorageBytes(item.sizeBytes)} · {item.originalPath}
-                      </p>
-                    </div>
-                    <div className="flex gap-1.5">
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        disabled={!privileged || busy}
-                        onClick={() => void restoreItem(item)}
-                      >
-                        <RotateCcw className="size-3.5" aria-hidden /> Restore
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        disabled={!privileged || busy}
-                        onClick={() => void purgeTrash(tid)}
-                      >
-                        Purge
-                      </Button>
-                    </div>
-                  </div>
-                );
-              })
+              <ul className="sr-group">
+                {trash.map((item) => {
+                  const tid = item.id || item.trashId || "";
+                  const confirming = pending?.kind === "purge-one" && (pending.item.id || pending.item.trashId) === tid;
+                  return (
+                    <li key={tid} className="sr-row flex-wrap">
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[15px] font-medium">
+                          {item.label || `${item.slug || "series"}${item.chapter ? ` · ${item.chapter}` : ""}`}
+                        </p>
+                        <p className="truncate text-[13px] text-muted-foreground">
+                          {item.kind} · {fmtStorageBytes(item.sizeBytes)}
+                        </p>
+                      </div>
+                      {confirming ? (
+                        <div className="flex gap-1.5">
+                          <Button type="button" size="sm" variant="destructive" disabled={busy} onClick={() => void purgeTrash(tid)}>
+                            Delete for good
+                          </Button>
+                          <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setPending(null)}>
+                            Cancel
+                          </Button>
+                        </div>
+                      ) : (
+                        <div className="flex gap-1.5">
+                          <Button type="button" size="sm" variant="outline" disabled={!privileged || busy} onClick={() => void restoreItem(item)}>
+                            <RotateCcw className="size-3.5" aria-hidden /> Restore
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            disabled={!privileged || busy}
+                            onClick={() => setPending({ kind: "purge-one", item })}
+                          >
+                            Purge
+                          </Button>
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
             )}
           </section>
 
-          <section aria-label="Per-series disk usage" className="flex flex-col gap-2">
-            <h3 className="font-serif text-lg">Per-series disk usage</h3>
+          <section aria-label="Per-series disk usage">
+            <h3 className="sr-section-label">By series</h3>
             {(storage?.series || []).length === 0 ? (
-              <p className="text-xs text-[#a2a19f]">No series disk usage reported yet.</p>
+              <p className="rounded-2xl bg-card px-4 py-4 text-[14.5px] text-muted-foreground">
+                {loaded && !loadError ? "No series on disk yet." : "—"}
+              </p>
             ) : (
-              (storage?.series || []).map((row) => (
-                <div key={row.slug} className="rounded-xl border border-[#2b2c30] bg-[#191a1d] p-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div>
-                      <strong className="text-sm">{row.title || row.slug}</strong>{" "}
-                      <code className="font-mono text-xs text-[#a2a19f]">{row.slug}</code>
-                    </div>
-                    <span className="font-mono text-xs text-[#f18b6e]">{fmtStorageBytes(row.totalBytes)}</span>
-                  </div>
-                  <p className="mt-1 font-mono text-[11px] text-[#a2a19f]">
-                    Videos {fmtStorageBytes(row.videoBytes)} · Audio {fmtStorageBytes(row.audioBytes)} · Panels{" "}
-                    {fmtStorageBytes(row.panelsBytes)} · Caches {fmtStorageBytes(row.cacheBytes)}
-                  </p>
-                  {row.chapters?.length ? (
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      {row.chapters
-                        .filter((ch) => ch.hasVideo || ch.videoBytes > 0)
-                        .map((ch) => (
-                          <button
-                            key={ch.ch}
-                            type="button"
-                            className="inline-flex min-h-7 items-center gap-1 rounded-full border border-[#2b2c30] bg-[#101113] px-2 text-[11px] text-[#f2efe9] hover:border-[#f0a096] hover:text-[#f0a096] disabled:opacity-50"
-                            disabled={!privileged || busy}
-                            onClick={() => void deleteToTrash({ slug: row.slug, chapter: ch.ch, kind: "chapter-video" })}
-                            title={`Move ${row.slug}/${ch.ch} video to /tmp trash`}
-                          >
-                            <Trash2 className="size-3" aria-hidden /> {ch.ch} ({fmtStorageBytes(ch.videoBytes)})
-                          </button>
-                        ))}
-                    </div>
-                  ) : null}
-                </div>
-              ))
+              <ul className="sr-group">
+                {(storage?.series || []).map((row) => {
+                  const videos = (row.chapters || []).filter((ch) => ch.hasVideo || ch.videoBytes > 0);
+                  return (
+                    <li key={row.slug} className="sr-row block">
+                      <div className="flex items-baseline justify-between gap-3">
+                        <strong className="min-w-0 truncate text-[15px] font-medium">{row.title || row.slug}</strong>
+                        <span className="shrink-0 text-[14px] font-semibold tabular-nums">{fmtStorageBytes(row.totalBytes)}</span>
+                      </div>
+                      <details className="mt-1 text-[13px] text-muted-foreground"><summary className="cursor-pointer">Details</summary><p className="mt-1 tabular-nums">
+                        Videos {fmtStorageBytes(row.videoBytes)}, audio {fmtStorageBytes(row.audioBytes)}, panels{" "}
+                        {fmtStorageBytes(row.panelsBytes)}, caches {fmtStorageBytes(row.cacheBytes)}
+                      </p></details>
+                      {videos.length && privileged ? (
+                        <details className="mt-2">
+                          <summary className="cursor-pointer text-[13.5px] text-primary-text select-none">
+                            Chapter videos ({videos.length})
+                          </summary>
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {videos.map((ch) => (
+                              <button
+                                key={ch.ch}
+                                type="button"
+                                className="inline-flex min-h-8 items-center gap-1 rounded-full bg-muted px-3 text-[13px] text-foreground hover:bg-destructive-soft hover:text-destructive disabled:opacity-50"
+                                disabled={busy}
+                                onClick={() => void deleteToTrash({ slug: row.slug, chapter: ch.ch, kind: "chapter-video" })}
+                                title={`Move ${row.slug}/${ch.ch} video to the trash`}
+                              >
+                                <Trash2 className="size-3" aria-hidden /> {ch.ch} · {fmtStorageBytes(ch.videoBytes)}
+                              </button>
+                            ))}
+                          </div>
+                        </details>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
             )}
           </section>
         </div>
-      </DrawerContent>
-    </Drawer>
   );
 }

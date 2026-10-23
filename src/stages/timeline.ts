@@ -7,8 +7,17 @@
  * buildShots is synchronous. Panel pixel size is read from the JPEG/PNG header
  * (PIL Image.size, no EXIF transpose), not from async sharp().metadata().
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { pyRound, pyRoundFixed } from "./factCheck.js";
@@ -38,6 +47,8 @@ import {
   ttsLinesVertex,
   ttsLinesGrok,
   edgeRateFromSpeed,
+  LOCALE_EDGE_RATE,
+  stripEmotionControls,
   ValueError,
   VOICE,
   RATE,
@@ -56,8 +67,17 @@ import {
   NEG_KEY,
   type OrderKey,
 } from "../domain/panels.js";
-import { Block, ensure as ensurePromoBlock } from "../intake/promoBlock.js";
+import { Block, ensure as ensurePromoBlock, load as loadPromoBlock } from "../intake/promoBlock.js";
 import { getStudioSettings, type RenderQuality } from "../config/studioConfig.js";
+import { GEMINI_LOCALE_REQUEST_REV, isGeminiTtsVoiceId } from "../llm/vertexTts.js";
+import {
+  assertNoSymlinkPath,
+  getLanguageEntry,
+  languageRootDir,
+  languageStagingId,
+  SUPPORTED_LOCALES,
+  validateLocale,
+} from "../config/languages.js";
 import { stage } from "../telemetry/telemetry.js";
 
 export {
@@ -89,6 +109,8 @@ export {
   ttsLines,
   ttsConcat,
   edgeRateFromSpeed as edge_rate_from_speed,
+  LOCALE_EDGE_RATE as locale_edge_rate,
+  stripEmotionControls as strip_emotion_controls,
   _trimSilence as _trim_silence,
   _probeDuration as _probe_duration,
   _parseExternalCommand as _parse_external_command,
@@ -167,6 +189,17 @@ export interface MainOptions {
   noAudioCheck?: boolean;
   argv?: readonly string[];
   env?: NodeJS.ProcessEnv;
+  /**
+   * Language version to render (`hi-IN`). Absent/null = English, unchanged.
+   * The caller supplies `scriptPath`/`obsPath`/`outDir` already resolved for the
+   * locale (see `languageChapterDir`); `outDir` is the LOCALE output dir.
+   */
+  locale?: string | null;
+  /**
+   * Per-run TTS override for the locale (engine/voice_id/language/speed/...).
+   * Merged over the series meta for THIS run only; meta.json is never written.
+   */
+  tts?: Record<string, unknown> | null;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -812,12 +845,149 @@ export function buildShots(
   return shots;
 }
 
+export interface DroppedPanelAssignment {
+  /** Script line index that cited the panel. */
+  line: number;
+  /** Panel id the script asked for. */
+  panel: string;
+}
+
+/**
+ * Explicit `@pXXXX` assignments that produced no shot on their line.
+ *
+ * buildShots drops a tag when the panel is unknown, its artwork is missing, or
+ * the whole line resolved to nothing. That silently changes the creative intent,
+ * so the caller warns instead of shipping the degraded cut. A panel swapped by
+ * `pickPanels` for a legitimate neighbour is NOT reported as long as one of the
+ * line's cited panels is still shown.
+ */
+export function droppedPanelAssignments(
+  lines: ReadonlyArray<readonly [string, readonly string[]]>,
+  shots: ReadonlyArray<TimelineShot>,
+): DroppedPanelAssignment[] {
+  const byLine = new Map<number, Set<string>>();
+  for (const s of shots) {
+    const pid = String(s.panel).replace(/\.(?:jpg|jpeg|png)$/i, "");
+    const lineId = s.line_id;
+    if (typeof lineId !== "number") continue;
+    let set = byLine.get(lineId);
+    if (!set) {
+      set = new Set<string>();
+      byLine.set(lineId, set);
+    }
+    set.add(pid);
+  }
+  const dropped: DroppedPanelAssignment[] = [];
+  for (let li = 0; li < lines.length; li++) {
+    const tags = lines[li]![1];
+    if (tags.includes("@hold")) continue;
+    const cited = tags.filter((t) => isPid(t));
+    if (cited.length === 0) continue;
+    const shown = byLine.get(li) ?? new Set<string>();
+    if (cited.some((p) => shown.has(p))) continue;
+    for (const pid of cited) {
+      // The line cited this panel and the finished cut shows none of them: the
+      // resolver dropped the assignment (unknown id, missing artwork, empty run).
+      dropped.push({ line: li, panel: pid });
+    }
+  }
+  return dropped;
+}
+
 export function seriesMeta(seriesDir: string): Record<string, unknown> {
   try {
     return JSON.parse(readFileSync(join(seriesDir, "meta.json"), "utf8")) as Record<string, unknown>;
   } catch {
     return {};
   }
+}
+
+/** Version tag for locale narration cache identity. Bump only with a layout change. */
+export const LOCALE_CACHE_VERSION = "loc-v1";
+
+/**
+ * Per-locale narration cache identity.
+ *
+ * The English key formula (`narrationCacheKey` in contracts/hashes.ts) is a paid
+ * artifact contract and MUST NOT change. A localized run therefore derives its
+ * own versioned key from the unchanged English base key plus the locale and the
+ * effective provider settings, so a Hindi narration can never be mistaken for an
+ * English one (and a voice/provider change re-bills).
+ */
+export function localeNarrationCacheKey(
+  baseKey: string,
+  locale: string,
+  tts?: Record<string, unknown> | null,
+): string {
+  const entry = getLanguageEntry(locale);
+  if (entry === null) {
+    throw new ValueError(`unsupported locale ${pyRepr(String(locale))}`);
+  }
+  const t = tts ?? {};
+  const speed = typeof t.speed === "number" && Number.isFinite(t.speed) ? t.speed : 1;
+  const model = typeof t.model === "string" && t.model.trim() ? t.model.trim() : "";
+  const engine = typeof t.engine === "string" && t.engine ? t.engine : entry.defaultEngine;
+  const voiceId = typeof t.voice_id === "string" && t.voice_id ? t.voice_id : entry.defaultVoiceId;
+  // Only a localized Vertex Gemini take embeds the request revision: those takes
+  // were once billed with an instruction wrapper Gemini spoke aloud, so an old
+  // key must never satisfy the new transcript-only request. Edge (and every
+  // other engine) keeps its key byte-identical.
+  const geminiRev = engine === "vertex" && isGeminiTtsVoiceId(voiceId) ? GEMINI_LOCALE_REQUEST_REV : null;
+  const identity: Record<string, unknown> = {
+    locale: entry.locale,
+    engine,
+    voice_id: voiceId,
+    language: typeof t.language === "string" && t.language ? t.language : entry.locale,
+    speed,
+    provider: typeof t.provider === "string" ? t.provider : null,
+    // Only a provider that names a model contributes it, so every existing
+    // Edge (and pre-Vertex) Hindi narration key stays byte-identical.
+    ...(model ? { model } : {}),
+    ...(geminiRev === null ? {} : { request_rev: geminiRev }),
+    revision: typeof t.revision === "string" ? t.revision : null,
+    command: t.command ?? null,
+    style: t.style ?? null,
+    settings: t.settings ?? null,
+  };
+  const digest = createHash("sha256")
+    .update(`${pyJsonDumps(identity, { sortKeys: true })}|${baseKey}`, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+  return `${LOCALE_CACHE_VERSION}:${entry.locale}:${digest}`;
+}
+
+/**
+ * Effective `tts` block for a localized run: catalog defaults, plus the shared
+ * series' provider settings, then the per-run override.
+ *
+ * The series' English identity fields (engine / voice_id / language) are dropped:
+ * a Hindi render must never inherit the English voice. `meta.json` is not written.
+ */
+export function localeTtsMeta(
+  seriesTts: Record<string, unknown> | null | undefined,
+  override: Record<string, unknown> | null | undefined,
+  locale: string,
+): Record<string, unknown> {
+  const entry = getLanguageEntry(locale);
+  if (entry === null) {
+    throw new ValueError(`unsupported locale ${pyRepr(String(locale))}`);
+  }
+  const base: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(seriesTts ?? {})) {
+    if (k === "engine" || k === "voice_id" || k === "language") continue;
+    base[k] = v;
+  }
+  const merged: Record<string, unknown> = {
+    ...base,
+    engine: entry.defaultEngine,
+    voice_id: entry.defaultVoiceId,
+    language: entry.locale,
+    speed: typeof base.speed === "number" ? base.speed : 1,
+  };
+  for (const [k, v] of Object.entries(override ?? {})) {
+    if (v !== undefined) merged[k] = v;
+  }
+  return merged;
 }
 
 export function _applyCleaned(
@@ -829,22 +999,22 @@ export function _applyCleaned(
   for (const s of shots) {
     const pid = String(s.panel).slice(0, -4);
     const it = items[pid];
-    if (it != null && it.promo_full) {
+    const c = res[pid];
+    if (it != null && it.promo_full && !(c && c.includes("/covered/"))) {
       throw new RuntimeError(
-        `promo safety: ${pid} is a reader-classified FULL advert page; `
-        + `refusing to display it in any form`,
+        `promo safety: ${pid} is a reader-classified FULL advert page and no `
+        + `obscured cover exists; refusing to display it`,
       );
     }
-    const c = res[pid];
     if (c) {
       s.panel = basename(c);
       s._src = c;
       nClean += 1;
     } else if (it != null && it.promo_item) {
+      // Last resort only: both the promo mask and the cover fallback failed.
       throw new RuntimeError(
-        `promo safety: ${pid} could not be verified-clean (promo text `
-        + `present, cleaner returned no result); refusing to render the `
-        + `original advert`,
+        `promo safety: ${pid} could not be cleaned or covered (promo text `
+        + `present, no result); refusing to render the original advert`,
       );
     }
   }
@@ -978,10 +1148,49 @@ export async function main(
   options: MainOptions = {},
 ): Promise<string> {
   stage(ch, "audio");
-  const proj = `${basename(seriesDir)}_${ch}`;
-  const block = ensurePromoBlock(seriesDir, dirname(obsPath));
+  const localeRaw = options.locale ?? null;
+  const locale = localeRaw === null ? null : validateLocale(localeRaw);
+  if (localeRaw !== null && locale === null) {
+    throw new SystemExit(
+      `unsupported locale ${pyRepr(String(localeRaw))} (supported: ${SUPPORTED_LOCALES.join(", ")})`,
+    );
+  }
+  // Staging id must be locale-unique: an English and a Hindi render of ch1 must
+  // never share public/<id> (audio, panels and narration would clobber each other).
+  const proj = locale === null
+    ? `${basename(seriesDir)}_${ch}`
+    : languageStagingId(basename(seriesDir), ch, locale);
+  // obs/panels/bible and the promo block are SHARED, English-owned inputs. A
+  // locale run reads them; it never rebuilds the shared block (no cache rewrite).
+  const sharedOut = dirname(obsPath);
+  const localeRoot = locale === null ? null : languageRootDir(sharedOut, locale);
+  if (localeRoot !== null) {
+    // Refuse a symlinked locale tree before reading or writing anything in it:
+    // a link here could redirect locale writes onto the shared English cache.
+    assertNoSymlinkPath(sharedOut, localeRoot);
+    // The output dir must live inside the locale tree. A caller that points it at
+    // the English video dir would overwrite English narration/shots.
+    const relOut = relative(localeRoot, resolve(outDir));
+    if (relOut === "" || relOut.startsWith("..") || isAbsolute(relOut)) {
+      throw new SystemExit(
+        `${locale} output dir must be inside ${localeRoot}, got ${outDir}`,
+      );
+    }
+    assertNoSymlinkPath(localeRoot, outDir);
+  }
+  const block = locale === null
+    ? ensurePromoBlock(seriesDir, sharedOut)
+    : loadPromoBlock(sharedOut);
+  if (locale !== null && block === null) {
+    console.warn(
+      `promo_block: no shared ${join(sharedOut, "promo_block.json")} for the ${locale} render; `
+      + `continuing with explicit promo pages only (shared cache left untouched)`,
+    );
+  }
   const fullMeta = seriesMeta(seriesDir);
-  const meta = (pyGet(fullMeta, "tts", {}) ?? {}) as Record<string, unknown>;
+  const seriesTts = (pyGet(fullMeta, "tts", {}) ?? {}) as Record<string, unknown>;
+  // Per-run override only; meta.json is never written.
+  const meta = locale === null ? seriesTts : localeTtsMeta(seriesTts, options.tts, locale);
   const engineRaw = pyGet(meta, "engine", "edge");
   if (
     engineRaw !== "edge" && engineRaw !== "eleven" && engineRaw !== "external"
@@ -992,8 +1201,17 @@ export async function main(
     );
   }
   const engine = engineRaw as "edge" | "eleven" | "external" | "vertex" | "grok";
-  const voiceId = meta.voice_id as string | undefined;
+  // English keeps the original pass-through; a locale run requires a usable voice.
+  const voiceId = (locale === null
+    ? meta.voice_id
+    : (typeof meta.voice_id === "string" && meta.voice_id.trim() ? meta.voice_id : undefined)
+  ) as string | undefined;
   const ttsSpeed = typeof meta.speed === "number" && Number.isFinite(meta.speed) ? meta.speed : 1;
+  if (locale !== null && voiceId === undefined) {
+    throw new SystemExit(
+      `${locale} render has no tts.voice_id and the catalog default could not be applied`,
+    );
+  }
   const visuals = pyGet(fullMeta, "visuals", {});
   const background = String(pyGet(visuals, "background", pyGet(fullMeta, "background", "starfield")));
   const motion = String(pyGet(visuals, "motion", pyGet(fullMeta, "motion", "cut")));
@@ -1011,20 +1229,29 @@ export async function main(
   }
   if (engine === "eleven") {
     const cand = scriptPath.replaceAll("script.md", "script_eleven.md");
-    if (!existsSync(cand)) {
+    if (existsSync(cand)) {
+      scriptPath = cand;
+    } else if (locale === null) {
       throw new SystemExit(
         `engine=eleven but ${cand} missing - run the writer first (python run.py <series> ${ch})`,
       );
     }
-    scriptPath = cand;
+    // Locale run: the localize stage writes script.md only, so fall back to it.
   } else if (engine === "external") {
     const cand = scriptPath.replaceAll("script.md", "script_voice.md");
-    if (!existsSync(cand)) {
+    if (existsSync(cand)) {
+      scriptPath = cand;
+    } else if (locale === null) {
       throw new SystemExit(
         `engine=external but ${cand} missing - run the writer first (python run.py <series> ${ch})`,
       );
     }
-    scriptPath = cand;
+    // Locale run: the localize stage writes script.md only, so fall back to it.
+  }
+  if (locale !== null && !existsSync(scriptPath)) {
+    throw new SystemExit(
+      `${locale} script missing: ${scriptPath} - run the localize stage first`,
+    );
   }
   const lines = parseScript(scriptPath);
   stage(ch, "audio", "running", { total: lines.length, unit: "lines", engine });
@@ -1051,7 +1278,11 @@ export async function main(
   mkdirSync(outDir, { recursive: true });
   const mp3 = join(outDir, "narration.mp3");
   const tmpdir = join(outDir, "tts_lines_" + engine);
-  const key = _narrationCacheKey(lines, engine, voiceId, extCfg, ttsSpeed);
+  const baseKey = _narrationCacheKey(lines, engine, voiceId, extCfg, ttsSpeed);
+  // English keeps the golden key formula verbatim. A locale run wraps it in a
+  // versioned locale fingerprint, so Hindi audio can never satisfy an English
+  // narration.key (or vice versa) and a voice/provider change re-bills.
+  const key = locale === null ? baseKey : localeNarrationCacheKey(baseKey, locale, meta);
   const stamp = join(outDir, "narration.key");
   const argv = options.argv ?? process.argv;
   const noAudioCheck = options.noAudioCheck ?? argv.includes("--no-audio-check");
@@ -1081,16 +1312,21 @@ export async function main(
       spans = await ttsLinesExternal(lines, tmpdir, meta, options.env);
       lst = writeIndexConcat(tmpdir, lines.length);
     } else if (engine === "vertex") {
-      spans = await ttsLinesVertex(lines, tmpdir, meta, options.env);
+      spans = await ttsLinesVertex(lines, tmpdir, meta, options.env, locale);
       lst = writeIndexConcat(tmpdir, lines.length);
     } else if (engine === "grok") {
       spans = await ttsLinesGrok(lines, tmpdir, meta, options.env);
       lst = writeIndexConcat(tmpdir, lines.length);
     } else {
       // Series-selected Edge voice and speed must actually reach edge-tts.
+      // English keeps the legacy +6% default; a locale version must match the
+      // Studio preview's mapping (speed 1 -> +0%) so preview == final render.
       const gen = await ttsLines(lines, tmpdir, {
         voice: voiceId || VOICE,
-        rate: edgeRateFromSpeed(ttsSpeed),
+        rate: locale === null
+          ? edgeRateFromSpeed(ttsSpeed)
+          : edgeRateFromSpeed(ttsSpeed, LOCALE_EDGE_RATE),
+        locale,
       });
       spans = gen[0];
       lst = gen[1];
@@ -1155,6 +1391,34 @@ export async function main(
     opensWithHook,
   );
   if (shots.length === 0) throw new Error("max() arg is an empty sequence");
+  // A dropped panel assignment silently changes the creative intent. Detect it
+  // (missing artwork, a line whose every tag resolved to nothing) and surface it.
+  const droppedPanels = droppedPanelAssignments(lines, shots);
+  if (locale !== null && droppedPanels.length) {
+    // A localized cut must not silently lose a cited panel: warn, record it in
+    // the chapter's timeline stage, and leave a machine-readable sidecar next to
+    // the locale output (never in the shared English tree).
+    const detail = droppedPanels.slice(0, 8).map((d) => `${d.line}:${d.panel}`).join(", ");
+    console.warn(
+      `panel intent (${locale}): ${droppedPanels.length} explicit assignment(s) produced no shot: `
+      + detail + (droppedPanels.length > 8 ? ", ..." : ""),
+    );
+    stage(ch, "timeline", "running", {
+      droppedPanels: droppedPanels.length,
+      droppedPanelIds: droppedPanels.slice(0, 20).map((d) => d.panel),
+    });
+    writeFileSync(
+      join(outDir, "locale_warnings.json"),
+      pyJsonPretty({
+        locale,
+        warnings: droppedPanels.map((d) => `dropped panel ${d.panel} on line ${d.line}`),
+      }),
+    );
+  } else if (locale !== null) {
+    // A clean rerun must not leave a stale warning sidecar behind.
+    const stale = join(outDir, "locale_warnings.json");
+    if (existsSync(stale)) unlinkSyncSafe(stale);
+  }
   const dReal = _probeDuration(mp3);
   const totalSpans = Math.max(...shots.map((s) => s.end_s));
   if (dReal > totalSpans + 0.05) {
@@ -1164,7 +1428,15 @@ export async function main(
     );
     shots[shots.length - 1]!.end_s = dReal + 0.15;
   }
-  const cleanedDir = join(dirname(obsPath), "cleaned", ch);
+  // Locale runs write their cleaner/crop artifacts under the locale tree and
+  // reuse valid SHARED artifacts read-only (copy, never move or rewrite). The
+  // English cache stays byte-identical.
+  const cleanedDir = localeRoot === null
+    ? join(sharedOut, "cleaned", ch)
+    : join(localeRoot, "cleaned", ch);
+  const cropsDir = localeRoot === null
+    ? join(sharedOut, "render_crops", ch)
+    : join(localeRoot, "render_crops", ch);
   const byId: Record<string, Record<string, unknown>> = {};
   for (const p of (obs as { panels: Array<Record<string, unknown>> }).panels) byId[String(p.id)] = p;
   const cleaner = await loadSibling("cleaner");
@@ -1179,6 +1451,17 @@ export async function main(
   const items: Record<string, Record<string, unknown>> = {};
   if (!shouldClean) {
     throw new RuntimeError("cleaner.ts is not ported yet (need shouldClean); refusing to render unverified panels");
+  }
+  if (localeRoot !== null) {
+    // Reuse paid SHARED artifacts read-only, then write any missing one under
+    // the locale tree. The English caches are never touched.
+    const seeded = seedLocaleArtifacts(
+      join(sharedOut, "cleaned", ch),
+      cleanedDir,
+      join(sharedOut, "render_crops", ch),
+      cropsDir,
+    );
+    if (seeded) console.log(`locale ${locale}: reused ${seeded} shared cleaned/crop artifact(s)`);
   }
   for (const s of shots) {
     const pid = s.panel.slice(0, -4);
@@ -1208,7 +1491,35 @@ export async function main(
     }
     stage(ch, "timeline", "done", { shots: shots.length });
     stage(ch, "clean", "running", { total: Object.keys(items).length, unit: "panels" });
-    const res = await cleanBatch(Object.values(items), panelsDir, cleanedDir);
+    let res: Record<string, string | null>;
+    try {
+      res = await cleanBatch(Object.values(items), panelsDir, cleanedDir);
+    } catch (e) {
+      // Ordinary panels ship uncleaned; promo items get the cover fallback below.
+      console.error(`bubble-cleaner: failed (${e instanceof Error ? e.message : String(e)}); using originals`);
+      res = {};
+      for (const pid of Object.keys(items)) res[pid] = null;
+    }
+    // Promo panels never stop the run: a failed mask (or a FULL advert page) is
+    // replaced by an obscured cover of the reader's promo regions / whole panel.
+    const coverPromo = cleaner
+      ? (cleaner.coverPromoPanel ?? cleaner.cover_promo_panel) as
+        ((it: unknown, panelsDir: string, cleanedDir: string) => Promise<string | null>) | undefined
+      : undefined;
+    for (const [pid, it] of Object.entries(items)) {
+      if (!(it.promo_item || it.promo_full)) continue;
+      if (res[pid] && !it.promo_full) continue;
+      if (!coverPromo) continue;
+      try {
+        const covered = await coverPromo(it, panelsDir, cleanedDir);
+        if (covered) {
+          res[pid] = covered;
+          console.error(`promo-cover: ${pid} covered (promo clean unavailable or full advert page)`);
+        }
+      } catch (e) {
+        console.error(`promo-cover: ${pid} failed (${e instanceof Error ? e.message : String(e)})`);
+      }
+    }
     const nClean = _applyCleaned(shots as unknown as Array<Record<string, unknown>>, items, res);
     if (nClean) console.log(`bubble-cleaner: ${nClean} shots cleaned`);
     stage(ch, "clean", "done", { completed: Object.keys(items).length, cleaned: nClean });
@@ -1228,10 +1539,14 @@ export async function main(
     shots,
     obs,
     panelsDir,
-    join(dirname(obsPath), "render_crops", ch),
+    cropsDir,
   );
   console.log(`visual framing: ${pyRepr(framing)}`);
   const pub = join(STUDIO_PUBLIC, proj);
+  if (localeRoot !== null) {
+    // A symlinked staging dir could silently overwrite the English render assets.
+    assertNoSymlinkPath(STUDIO_PUBLIC, pub);
+  }
   mkdirSync(pub, { recursive: true });
   for (const s of shots) {
     const src = s._src ?? join(panelsDir, s.panel);
@@ -1261,6 +1576,59 @@ export async function main(
     + `${join(outDir, "video.mp4")} --props=${propsPath} --log=error`,
   );
   return propsPath;
+}
+
+/**
+ * Copy the SHARED English cleaner/crop artifacts into the locale tree so a
+ * localization reuses paid work READ-ONLY. Never moves, never rewrites, never
+ * deletes a shared file: the English cache stays byte-identical.
+ *
+ * Only files that already exist in the shared cache are seeded, and only when
+ * the locale has no copy yet (a locale-specific re-clean always wins).
+ */
+export function seedLocaleArtifacts(
+  sharedCleanedDir: string,
+  localeCleanedDir: string,
+  sharedCropsDir: string,
+  localeCropsDir: string,
+): number {
+  let copied = 0;
+  const seedDir = (srcDir: string, dstDir: string, accept: (name: string) => boolean): void => {
+    let names: string[];
+    try {
+      names = readdirSyncSafe(srcDir);
+    } catch {
+      return;
+    }
+    mkdirSync(dstDir, { recursive: true });
+    for (const name of names) {
+      if (!accept(name)) continue;
+      const src = join(srcDir, name);
+      const dst = join(dstDir, name);
+      if (existsSync(dst)) continue;
+      try {
+        copyFileSync(src, dst);
+        copied += 1;
+      } catch {
+        // A failed seed only costs a recompute; never fail the render for it.
+      }
+    }
+  };
+  // Cleaner: png + its .done/.rej stamp + the promo sidecar. Hashes are content
+  // based (source panel + config), so a copied stamp is exactly as valid here.
+  seedDir(
+    sharedCleanedDir,
+    localeCleanedDir,
+    (n) => n.endsWith(".png") || n.endsWith(".png.done") || n.endsWith(".png.rej")
+      || n.endsWith(".promo_boxes.json"),
+  );
+  // Framing: crop files are content-addressed (<pid>-<digest>.png).
+  seedDir(sharedCropsDir, localeCropsDir, (n) => n.endsWith(".png"));
+  return copied;
+}
+
+function readdirSyncSafe(dir: string): string[] {
+  return readdirSync(dir);
 }
 
 function unlinkSyncSafe(p: string): void {

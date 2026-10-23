@@ -5,7 +5,8 @@
 - Docker Engine with Compose 2.24 or newer.
 - Linux/amd64 is the initial target. The backend includes Chromium, ffmpeg/ffprobe, flock, SSH/rsync, and Edge TTS. It runs as UID/GID 1000.
 - The frontend contains only static assets and Nginx. The backend contains the API, pipeline, and local Remotion renderer. Both images have independent health checks.
-- Manga-image-translator, its model weights/Python environment, the optional agy rotator, external voice adapters, and cloud/SSH credentials are deployment-specific integrations. They are **not bundled**. Full cleaning/render jobs require the configured cleaner or an appropriate remote execution setup. API health alone does not assert pipeline readiness.
+- The backend bundles the bubble cleaner: PanelCleaner (pinned upstream commit, CPU torch) at `/opt/panelcleaner`, its verified text-detector and LaMa weights, and Tesseract English. Promo OCR uses the same detector. If the cleaner fails, it is retried once per batch; after repeated failed batches it pauses (`MANHWA_CLEANER_MAX_FAILS`, default 3; `MANHWA_CLEANER_COOLDOWN_S`, default 1800) and ordinary panels ship uncleaned instead of failing the render.
+- The optional agy rotator, external voice adapters, and cloud/SSH credentials are deployment-specific integrations. They are **not bundled**. API health alone does not assert pipeline readiness.
 - Keep one backend replica. The current scheduler and local durable-file queue are not a multi-host distributed service.
 
 ## Build and start
@@ -69,6 +70,7 @@ docker compose exec backend node -e \
 docker compose exec backend ffprobe -version
 docker compose exec backend /opt/tts/bin/python -m edge_tts --help
 docker compose exec backend chromium --version
+docker compose exec backend /opt/panelcleaner/venv/bin/python -m pcleaner.main --version
 docker compose logs --tail=100 backend frontend
 ```
 

@@ -341,16 +341,27 @@ describe('live job and lane controls', () => {
     expect(() => pauseJob(id)).toThrow('no longer alive');
   });
 
-  it('holds future lane jobs and only resumes lane-owned pauses', async () => {
+  it('refuses lane-wide control and leaves every job untouched', async () => {
     chapter(1);
     const job = await createJob({ slug, chapters: '1', spawnWorker: false });
-    expect(controlRenderLane('local', 'pause')).toMatchObject({ ok: true, paused: true, affectedJobs: [job.id] });
-    expect(getJob(String(job.id))).toMatchObject({ status: 'paused', paused: true });
-    expect(controlRenderLane('local', 'resume')).toMatchObject({ ok: true, paused: false, affectedJobs: [job.id] });
-    pauseJob(String(job.id));
-    controlRenderLane('local', 'pause');
-    controlRenderLane('local', 'resume');
-    expect(getJob(String(job.id))).toMatchObject({ status: 'paused', paused: true });
+    const before = fs.readFileSync(jobFile(String(job.id)), 'utf8');
+    for (const action of ['pause', 'resume', 'stop'] as const) {
+      const result = controlRenderLane('local', action);
+      expect(result).toMatchObject({
+        ok: false, supported: false, statusCode: 409, laneId: 'local', action, affectedJobs: [],
+      });
+      expect(String(result.error)).toMatch(/run/i);
+    }
+    // No job mutation, no lane-controls.json side effect.
+    expect(fs.readFileSync(jobFile(String(job.id)), 'utf8')).toBe(before);
+    expect(getJob(String(job.id))).toMatchObject({ status: 'queued', paused: false });
+    expect(fs.existsSync(path.join(root, 'out', 'config', 'lane-controls.json'))).toBe(false);
+    // A legacy lane-controls.json can no longer hold queued jobs.
+    json(path.join(root, 'out', 'config', 'lane-controls.json'), { schemaVersion: 1, lanes: { local: { paused: true, updatedAt: 1 } } });
+    expect(getJob(String(job.id))).toMatchObject({ status: 'queued' });
+    const result = await runWorkerOnce({ runCmdOverride: [process.execPath, '-e', 'process.exit(0)', '--'] });
+    expect(result.processed).toBe(1);
+    expect(getJob(String(job.id))).not.toMatchObject({ status: 'queued' });
   });
 
   it('keeps live control state across worker progress writes and stops its process group', async () => {
@@ -412,15 +423,39 @@ describe('Studio V2 HTTP boundaries', () => {
     expect(reset.status).toBe(200);
     expect(await reset.json()).toMatchObject({ prompts: { reader: { content: prompts.defaults.reader, isCustom: false } } });
     const settings = await (await request('/api/studio/settings')).json() as any;
+    expect(settings.defaultRenderLane).toBe('inherit');
     const changed = await request('/api/studio/settings', 'PUT', { expectedRevision: settings.revision, renderQuality: '720p' });
     expect(changed.status).toBe(200);
-    expect(await changed.json()).toMatchObject({ renderQuality: '720p' });
+    expect(await changed.json()).toMatchObject({ renderQuality: '720p', defaultRenderLane: 'inherit' });
     expect((await request('/api/studio/settings', 'PUT', { renderQuality: '1080p' }, { 'X-CSRF-Token': '' })).status).toBe(403);
     expect((await request('/api/studio/prompts', 'PUT', {}, { cookie: viewerCookie })).status).toBe(403);
     expect((await request('/api/studio/settings', 'PUT', { renderQuality: 'bad' })).status).toBe(400);
+    // Lane validation: built-ins and registered nodes only.
+    const laneSet = await request('/api/studio/settings', 'PUT', { defaultRenderLane: 'local' });
+    expect(laneSet.status).toBe(200);
+    expect(await laneSet.json()).toMatchObject({ defaultRenderLane: 'local' });
+    expect((await request('/api/studio/settings', 'PUT', { defaultRenderLane: 'not-a-lane' })).status).toBe(400);
+    expect((await request('/api/studio/settings', 'PUT', { defaultRenderLane: '../etc' })).status).toBe(400);
+    expect((await request('/api/studio/settings', 'PUT', { defaultRenderLane: 42 })).status).toBe(400);
+    // An omitted field keeps the stored lane; explicit inherit resets it.
+    const kept = await request('/api/studio/settings', 'PUT', { renderQuality: '720p' });
+    expect(await kept.json()).toMatchObject({ defaultRenderLane: 'local' });
+    const inherited = await request('/api/studio/settings', 'PUT', { defaultRenderLane: 'inherit' });
+    expect(await inherited.json()).toMatchObject({ defaultRenderLane: 'inherit' });
   });
 
-  it('exposes job pause/resume/stop and lane controls only to privileged CSRF-checked requests', async () => {
+  it('publishes defaultRenderQuality and defaultRenderLane on the intake catalog', async () => {
+    const { request } = await startServer();
+    const catalog = await (await request('/api/intake/catalog')).json() as any;
+    expect(catalog.defaultRenderQuality).toBe('1080p');
+    expect(catalog.defaultRenderLane).toBe('inherit');
+    await request('/api/studio/settings', 'PUT', { renderQuality: '720p', defaultRenderLane: 'local' });
+    const updated = await (await request('/api/intake/catalog')).json() as any;
+    expect(updated.defaultRenderQuality).toBe('720p');
+    expect(updated.defaultRenderLane).toBe('local');
+  });
+
+  it('exposes job pause/resume/stop only to privileged CSRF-checked requests and retires lane control', async () => {
     chapter(1);
     const job = await createJob({ slug, chapters: '1', spawnWorker: false });
     const { request, viewerCookie } = await startServer();
@@ -429,7 +464,11 @@ describe('Studio V2 HTTP boundaries', () => {
     expect((await request(url + '/pause', 'POST', {}, { cookie: viewerCookie })).status).toBe(403);
     expect(await (await request(url + '/pause', 'POST')).json()).toMatchObject({ job: { status: 'paused', paused: true } });
     expect(await (await request(url + '/resume', 'POST')).json()).toMatchObject({ job: { status: 'queued', paused: false } });
-    expect(await (await request('/api/studio/lanes/control', 'POST', { laneId: 'local', action: 'pause' })).json()).toMatchObject({ ok: true, paused: true });
+    // The legacy lane route answers 409 and never touches the queued job.
+    const lane = await request('/api/studio/lanes/control', 'POST', { laneId: 'local', action: 'pause' });
+    expect(lane.status).toBe(409);
+    expect(await lane.json()).toMatchObject({ ok: false, supported: false, affectedJobs: [] });
+    expect(getJob(String(job.id))).toMatchObject({ status: 'queued', paused: false });
     expect((await request('/api/studio/lanes/control', 'POST', { laneId: 'local', action: 'invalid' })).status).toBe(400);
     expect((await request(url + '/stop', 'POST')).status).toBe(200);
   });

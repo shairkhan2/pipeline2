@@ -24,6 +24,11 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { PACING, resolveSeriesStyle, type SeriesStyle } from "../config/seriesStyle.js";
+
+const pacingContext = new AsyncLocalStorage<{ SHOT_S: number; RUN_S: number; SHOT_MIN_S: number; JAB_GAP: number; MAX_RUN: number }>();
+const currentPacing = () => pacingContext.getStore() ?? PACING.normal;
 
 import {
   EMOTION_BLOCK,
@@ -670,6 +675,7 @@ export function setLastWindow(v: string): void {
 }
 
 export interface WriteScriptOptions {
+  style?: SeriesStyle;
   maxPanels?: number;
   maxH?: number;
   outDir?: string | null;
@@ -696,6 +702,15 @@ export async function writeScript(
   outPath: string,
   opts: WriteScriptOptions = {},
 ): Promise<string> {
+  const resolved = resolveSeriesStyle(opts.style);
+  return pacingContext.run(resolved.pacing, () => writeScriptWithStyle(obs, bible, panelsDir, outPath, opts));
+}
+
+async function writeScriptWithStyle(
+  obs: ObsLike, bible: BibleLike, panelsDir: string, outPath: string, opts: WriteScriptOptions,
+): Promise<string> {
+  const { RUN_S, SHOT_S } = currentPacing();
+  const resolved = resolveSeriesStyle(opts.style);
   const {
     outDir = null,
     emotion = false,
@@ -704,7 +719,7 @@ export async function writeScript(
     mode: modeOpt = null,
     diagnosticsDir: diagnosticsOpt = null,
   } = opts;
-  const mode = modeOpt ?? process.env.WRITER_MODE ?? "legacy";
+  const mode = modeOpt ?? resolved.writerMode;
   if (mode !== "legacy" && mode !== "story") {
     throw new ValueError("WRITER_MODE must be legacy or story");
   }
@@ -745,7 +760,7 @@ export async function writeScript(
       block,
       wps: emotion ? 3.7 : 3.2,
       panelsDir,
-      mode: "semantic",
+      mode: resolved.matchMode === 'auto' ? "semantic" : resolved.matchMode,
       diagnosticsDir: diagnosticsDir ? path.join(diagnosticsDir, "match") : null,
     });
     // Never replace a previous script with a partial draft or failed match.
@@ -787,7 +802,7 @@ export async function writeScript(
   const wps = emotion ? 3.7 : 3.2;
   const runPanel = Math.round(RUN_S * wps); // words one extra cut inside a line must pay for
   const nEvents = Math.max(8, (obs.events ?? []).length);
-  const budget = Math.min(340, Math.max(220, nEvents * 11));
+  const budget = Math.round(Math.min(340, Math.max(220, nEvents * 11)) * SHOT_S / PACING.normal.SHOT_S);
   LAST_BUDGET = budget;
   console.log(
     `   word budget: ${budget} (story-driven from ${(obs.events ?? []).length} events, `
@@ -837,6 +852,7 @@ export async function writeScript(
   const matchDiag = diagnosticsOpt
     ?? (outPath ? path.join(path.dirname(path.resolve(outPath)), "match_diagnostics") : null);
   script = await matchPanels(script, obs, {
+    mode: resolved.matchMode,
     block,
     perPanel: runPanel,
     wps,
@@ -883,6 +899,7 @@ const TAG_RE = /\s*@p\d+(?:_\d+)?/g;
  * Returns (script, n_steps, n_jabs) or (null, 0, 0) when there are no steps.
  */
 export function stepsToScript(txt: string): [string | null, number, number] {
+  const { JAB_GAP } = currentPacing();
   let d: unknown;
   try {
     d = parseJson(txt);
@@ -999,7 +1016,7 @@ export async function _matchPanelsVisual(
   }
   return (visualMatcher.match_script as VisualMatch)(script, eligible, panelsDir, {
     wps,
-    min_panel_s: 1.2,
+    min_panel_s: 1.2 * currentPacing().RUN_S / PACING.normal.RUN_S,
     diagnostics_dir: diagnosticsDir,
     verify: true,
     ...extra,
@@ -1047,7 +1064,8 @@ export async function matchPanels(
     panelsDir = null,
     diagnosticsDir = null,
   } = opts;
-  const mode = opts.mode ?? process.env.MATCH_MODE ?? (panelsDir ? "semantic" : "caption");
+  const selectedMode = opts.mode ?? process.env.MATCH_MODE;
+  const mode = selectedMode == null || selectedMode === 'auto' ? (panelsDir ? "semantic" : "caption") : selectedMode;
   if (!["caption", "visual", "semantic"].includes(mode)) {
     throw new ValueError(`MATCH_MODE must be caption, visual or semantic, got ${pyRepr(mode)}`);
   }
@@ -1281,7 +1299,7 @@ export async function matchPanels(
   console.log(
     `   matcher: run extension +${extAdded} panel(s) into validated runs `
     + `(adjacent+unused, mean overlap within KEEP_TOL=${KEEP_TOL} of the anchor, `
-    + `capped by the line's own word count and MAX_RUN=${MAX_RUN}); `
+    + `capped by the line's own word count and MAX_RUN=${currentPacing().MAX_RUN}); `
     + `${headAdded} prepended at the head; ${extRefused} candidate(s) refused`
     + (empties ? `; reserved ${empties} panel(s) for ${empties} empty beat(s)` : ""),
   );
@@ -1812,6 +1830,7 @@ export function _overlap(ws: Set<string>, visual: unknown): number {
  * cap = max(1, min(physical, MAX_RUN, editorial))
  */
 export function _runCap(line: string, runPanel: number | null = null, wps = 3.2): number {
+  const { RUN_S, MAX_RUN, SHOT_MIN_S } = currentPacing();
   const wpp = runPanel || Math.round(RUN_S * wps);
   const w = _spokenWords(line);
   const editorial = Math.min(MAX_RUN, Math.floor(w / Math.max(1, wpp)));
@@ -1836,7 +1855,7 @@ export function _bestRun(
   candidates: string[],
   byPid: Record<string, PanelRec>,
   byKey: Record<string, OrderKey>,
-  cap: number = MAX_RUN,
+  cap: number = currentPacing().MAX_RUN,
   succ: Map<string, OrderKey> | null = null,
 ): string[] {
   if (!candidates.length) return [];

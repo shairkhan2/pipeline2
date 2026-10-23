@@ -3,9 +3,15 @@
  *
  * TypeScript port of manhwa-pipeline/pipeline/cleaner.py.
  *
- * Tool: manga-image-translator at MANHWA_MIT_DIR (default /opt/manga-image-translator),
- * venv MANHWA_MIT_PY (default /opt/mit-venv312/bin/python), config cleaner_config.json
- * (craft/ctd detector + lama_large).
+ * Tool: PanelCleaner (VoxelCubes/PanelCleaner) at MANHWA_PCLEANER_DIR (default
+ * /opt/panelcleaner), python MANHWA_PCLEANER_PY (default <dir>/venv/bin/python),
+ * profile panelcleaner_profile.ini (CTD detector + Tesseract eng + LaMa inpainting).
+ * Promo OCR uses the same detector through tools/promo_ocr_export.py.
+ *
+ * Failure policy (long series runs): one batch = one CLI call, retried once;
+ * if it still fails, ordinary panels ship uncleaned (no .rej, retried next run).
+ * Repeated failed batches open a circuit breaker that skips cleaning for a
+ * cooldown. Promo panels still fail closed in timeline.
  *
  * Rules (approved design):
  * - clean ONLY: overlay text >= 40 chars AND no world text AND art >= 0.5
@@ -17,16 +23,15 @@
  * - cache: out/cleaned/<ch>/<panel>.png + stamp; failure -> null (use original)
  *
  * Hooks: pipeline internals call `_hooks.*` for
- * `_runOcrExport`, `_verifyPromoMask`, `_visionFullVsStory`, `_runBatch`,
+ * `_runOcrExport`, `_verifyPromoMask`, `_visionFullVsStory`, `_runPanelCleaner`,
  * `residualOverlay`, `promoGone`, and `_runAdapter`. Replace those properties
  * to mock a stage. The exported functions are the real implementations.
  */
 import { spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { threadId } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 
 import sharp from "sharp";
@@ -55,9 +60,19 @@ export { PROMO_ALGO_VERSION, PROMO_ROI_PAD_FRAC };
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-export const MIT_DIR = process.env.MANHWA_MIT_DIR || "/opt/manga-image-translator";
-export const MIT_PY = process.env.MANHWA_MIT_PY || "/opt/mit-venv312/bin/python";
-export const CONFIG = path.join(HERE, "cleaner_config.json");
+/**
+ * Install root holds `venv/bin/python`, `config/pcleaner/pcleanerrc` and the
+ * verified detector + LaMa weights under `cache/model`.
+ */
+export const PCLEANER_PROFILE = path.join(HERE, "panelcleaner_profile.ini");
+export const PCLEANER_DETECTOR = "comictextdetector.pt.onnx";
+/** PanelCleaner attempts per batch before shipping originals. */
+export const PCLEANER_ATTEMPTS = 2;
+/**
+ * sha1 of the retired MIT cleaner_config.json. Verified outputs stamped by the
+ * old cleaner stay valid, so a switch does not re-clean finished chapters.
+ */
+const LEGACY_MIT_CONFIG_SHA1 = "ded371ca22ab991d1fe3afc4b9dce8ef7b992e7f";
 export const OVERLAY_MIN = 40;
 export const ART_MIN = 0.5;
 /** Empirical: cleaned px fraction per overlay char (ctd+lama). */
@@ -99,7 +114,7 @@ export interface CleanerHooks {
   _runOcrExport: typeof _runOcrExport;
   _verifyPromoMask: typeof _verifyPromoMask;
   _visionFullVsStory: typeof _visionFullVsStory;
-  _runBatch: typeof _runBatch;
+  _runPanelCleaner: typeof _runPanelCleaner;
   residualOverlay: typeof residualOverlay;
   promoGone: typeof promoGone;
   /** Not in the required six, but `_runOcrExport` calls it so scale-back is testable. */
@@ -186,16 +201,6 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-class MemLog {
-  buf = "";
-  write(chunk: string): void {
-    this.buf += chunk;
-  }
-  tail(n = 300): string {
-    return this.buf.slice(-n);
-  }
-}
-
 function readStamp(p: string): string | null {
   try {
     return pyStrip(fs.readFileSync(p, "utf8"));
@@ -224,8 +229,92 @@ function sourceSha1(srcPath: string): string | null {
   }
 }
 
-function toolInstalled(): boolean {
-  return isDir(MIT_DIR) && fs.existsSync(MIT_PY);
+function pcleanerDir(): string {
+  return process.env.MANHWA_PCLEANER_DIR || "/opt/panelcleaner";
+}
+
+function pcleanerPy(): string {
+  return process.env.MANHWA_PCLEANER_PY || path.join(pcleanerDir(), "venv", "bin", "python");
+}
+
+function pcleanerModel(): string {
+  return path.join(pcleanerDir(), "cache", "model", PCLEANER_DETECTOR);
+}
+
+export function pcleanerInstalled(): boolean {
+  return (
+    fs.existsSync(pcleanerPy()) &&
+    fs.existsSync(path.join(pcleanerDir(), "config", "pcleaner", "pcleanerrc")) &&
+    fs.existsSync(pcleanerModel()) &&
+    fs.existsSync(PCLEANER_PROFILE)
+  );
+}
+
+function pcleanerEnv(cacheRoot: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    PYTHONDONTWRITEBYTECODE: "1",
+    XDG_CONFIG_HOME: path.join(pcleanerDir(), "config"),
+    // Log/lock files and mask cache per run, so parallel lanes never collide.
+    XDG_CACHE_HOME: path.join(cacheRoot, "cache"),
+    GUARDED_CLEANER_CACHE: path.join(cacheRoot, "masks"),
+    HF_HUB_OFFLINE: "1",
+    TRANSFORMERS_OFFLINE: "1",
+    CUDA_VISIBLE_DEVICES: process.env.CUDA_VISIBLE_DEVICES ?? "",
+    OMP_NUM_THREADS: "4",
+    MKL_NUM_THREADS: "4",
+    OPENBLAS_NUM_THREADS: "4",
+  };
+}
+
+/**
+ * Circuit breaker for long-running series sessions: after N consecutive batches
+ * where the cleaner failed, stop spawning it for a cooldown and ship
+ * ordinary panels uncleaned. Promo panels still fail closed in timeline.
+ */
+export const _breaker = {
+  fails: 0,
+  openUntil: 0,
+  reset(): void {
+    this.fails = 0;
+    this.openUntil = 0;
+  },
+};
+
+function breakerLimit(): number {
+  const n = Number(process.env.MANHWA_CLEANER_MAX_FAILS);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 3;
+}
+
+function breakerCooldownMs(): number {
+  const s = Number(process.env.MANHWA_CLEANER_COOLDOWN_S);
+  return (Number.isFinite(s) && s >= 0 ? s : 1800) * 1000;
+}
+
+export function cleanerCircuitOpen(now = Date.now()): boolean {
+  if (_breaker.openUntil && now < _breaker.openUntil) return true;
+  if (_breaker.openUntil && now >= _breaker.openUntil) {
+    // Half-open: allow the next batch to probe; one more failure re-opens.
+    _breaker.openUntil = 0;
+    _breaker.fails = Math.max(0, breakerLimit() - 1);
+  }
+  return false;
+}
+
+function recordBatchOutcome(ok: boolean): void {
+  if (ok) {
+    _breaker.fails = 0;
+    _breaker.openUntil = 0;
+    return;
+  }
+  _breaker.fails += 1;
+  if (_breaker.fails >= breakerLimit()) {
+    _breaker.openUntil = Date.now() + breakerCooldownMs();
+    elog(
+      `  cleaner: ${_breaker.fails} consecutive batch failures; circuit open for ` +
+        `${Math.round(breakerCooldownMs() / 1000)}s, shipping uncleaned panels`,
+    );
+  }
 }
 
 async function loadRgb(file: string): Promise<RgbImage> {
@@ -557,126 +646,6 @@ export function validatePromoSidecar(outPath: string, srcPath: string, h: string
   return true;
 }
 
-// --------------------------------------------------------------------------- //
-// tool batch (erase path)
-// --------------------------------------------------------------------------- //
-
-export function _runToolRemote(
-  srcDir: string,
-  outDir: string,
-  cfgPath: string,
-  timeout: number,
-  textExport: string | null = null,
-): void {
-  const job = `${lappy.RDIR}/jobs/clean_${process.pid}_${threadId}_${Math.floor(Date.now() / 1000)}`;
-  const flag = textExport ? ` --save-text-file ~/${job}/out/${PROMO_OCR_NAME}` : "";
-  const log = new MemLog();
-  try {
-    lappy.ssh(`mkdir -p ${job}/in ${job}/out`, log, 60);
-    lappy.push(srcDir.replace(/\/+$/, "") + "/", `${job}/in/`, log);
-    lappy.push(cfgPath, `${job}/cfg.json`, log);
-    lappy.ssh(
-      `cd ${lappy.RDIR}/mit && OMP_NUM_THREADS=$(nproc) ` +
-        `../mit-venv/bin/python -m manga_translator local ` +
-        `--config-file ~/${job}/cfg.json -f png --overwrite ` +
-        `-i ~/${job}/in -o ~/${job}/out${flag}`,
-      log,
-      timeout,
-    );
-    if (textExport) {
-      const qjob = lappy.shQuote(job);
-      const collect =
-        `if [ ! -s ${qjob}/out/${PROMO_OCR_NAME} ]; then ` +
-        `for f in ${qjob}/in/*_translations.txt; do ` +
-        `[ -e "$f" ] && cat "$f"; done > ` +
-        `${qjob}/out/${PROMO_OCR_NAME}; fi`;
-      lappy.ssh(collect, log, 60);
-    }
-    fs.mkdirSync(outDir, { recursive: true });
-    lappy.pull(`${job}/out/`, outDir.replace(/\/+$/, "") + "/", log);
-  } catch (e) {
-    throw new Error(`${errMsg(e)} | ${log.tail()}`);
-  } finally {
-    lappy.rm(job, log);
-  }
-}
-
-export async function _runBatch(
-  srcDir: string,
-  outDir: string,
-  cfgPath: string,
-  timeout: number | null = null,
-  textExport: string | null = null,
-): Promise<Record<string, RgbImage>> {
-  const n = fs.readdirSync(srcDir).filter((f) => f.endsWith(".jpg")).length;
-  const limit = timeout || 120 + n * 90;
-  let stderr = "";
-  let done = false;
-  if (lappy.useRemote() && lappy.healthy(0, false)[0]) {
-    try {
-      _runToolRemote(srcDir, outDir, cfgPath, limit, textExport);
-      if (textExport) {
-        const pulled = path.join(outDir, PROMO_OCR_NAME);
-        if (fs.existsSync(pulled) && path.resolve(pulled) !== path.resolve(textExport)) {
-          fs.copyFileSync(pulled, textExport);
-        }
-      }
-      lappy.report(true);
-      done = true;
-      elog(`  cleaner: ${n} panels on ${lappy.HOST}`);
-    } catch (e) {
-      lappy.report(false);
-      elog(`  cleaner: remote failed (${errMsg(e).slice(0, 160)}) -> local`);
-      fs.rmSync(outDir, { recursive: true, force: true });
-    }
-  }
-  if (!done) {
-    const cmd = [
-      MIT_PY, "-m", "manga_translator", "local",
-      "--config-file", cfgPath, "-f", "png", "--overwrite",
-      "-i", srcDir, "-o", outDir,
-    ];
-    if (textExport) cmd.push("--save-text-file", textExport);
-    const r = await lappy.withHeavy(() =>
-      spawnSync(cmd[0]!, cmd.slice(1), {
-        cwd: MIT_DIR,
-        encoding: "utf8",
-        timeout: limit * 1000,
-        env: { ...process.env, OMP_NUM_THREADS: "4" },
-        maxBuffer: 32 * 1024 * 1024,
-      }),
-    );
-    if (r.error) throw r.error;
-    stderr = r.stderr ?? "";
-    if (r.status !== 0) {
-      const rc = r.status ?? r.signal ?? "killed";
-      elog(`  cleaner: batch run failed (rc=${rc}): ${stderr.slice(-300)}`);
-      const err = new Error(
-        `cleaner batch failed (rc=${rc}): ${stderr.slice(-200).trim()}`,
-      );
-      err.name = "RuntimeError";
-      throw err;
-    }
-  }
-  const out: Record<string, RgbImage> = {};
-  if (!isDir(outDir)) {
-    elog(`  cleaner: batch run failed: ${stderr.slice(-300)}`);
-    return out;
-  }
-  for (const f of fs.readdirSync(outDir)) {
-    if (!f.endsWith(".png")) continue;
-    const pid = f.slice(0, -4);
-    const im = await loadRgb(path.join(outDir, f));
-    const srcf = path.join(srcDir, pid + ".jpg");
-    if (fs.existsSync(srcf)) {
-      const [sw, sh] = await imageSize(srcf);
-      if (im.width !== sw || im.height !== sh) continue;
-    }
-    out[pid] = im;
-  }
-  return out;
-}
-
 export function _changedFrac(a: RgbImage, b: RgbImage): number {
   if (a.width !== b.width || a.height !== b.height) {
     throw new Error("image size mismatch");
@@ -734,7 +703,7 @@ export function _promoRulesHash(it: Record<string, unknown>): string {
 }
 
 export function _promoCacheHash(it: Record<string, unknown>, srcPath: string): string {
-  return promoCacheHash(it, srcPath, { configPath: CONFIG, adapterPath: PROMO_ADAPTER });
+  return promoCacheHash(it, srcPath, { configPath: PCLEANER_PROFILE, adapterPath: PROMO_ADAPTER });
 }
 
 function protectedStrings(it: CleanItem, matcher: Matcher): string[] {
@@ -810,75 +779,33 @@ export function _validRecords(raw: unknown): RegionRecord[] {
 // OCR adapter
 // --------------------------------------------------------------------------- //
 
-export function _runAdapterRemote(srcd: string, cfgPath: string, outJson: string): void {
-  const job = `${lappy.RDIR}/jobs/ocr_${process.pid}_${threadId}_${Math.floor(Date.now() / 1000)}`;
-  const log = new MemLog();
-  try {
-    lappy.ssh(`mkdir -p ${job}/in ${job}/out`, log, 60);
-    lappy.push(PROMO_ADAPTER, `${job}/promo_ocr_export.py`, log);
-    lappy.push(cfgPath, `${job}/cfg.json`, log);
-    lappy.push(srcd.replace(/\/+$/, "") + "/", `${job}/in/`, log);
-    lappy.ssh(
-      `cd ~/${lappy.RDIR}/mit && ` +
-        `MANHWA_MIT_DIR=$HOME/${lappy.RDIR}/mit ` +
-        `$HOME/${lappy.RDIR}/mit-venv/bin/python ` +
-        `~/${job}/promo_ocr_export.py --config ~/${job}/cfg.json ` +
-        `--output ~/${job}/out/promo_ocr.json ~/${job}/in/*.jpg`,
-      log,
-      PROMO_ADAPTER_TIMEOUT,
-    );
-    fs.mkdirSync(path.dirname(outJson) || ".", { recursive: true });
-    lappy.pull(`${job}/out/promo_ocr.json`, outJson, log);
-  } catch (e) {
-    throw new Error(`${errMsg(e)} | ${log.tail()}`);
-  } finally {
-    lappy.rm(job, log);
-  }
-}
-
-export async function _runAdapter(srcd: string, cfgPath: string, outJson: string): Promise<boolean> {
-  if (lappy.useRemote()) {
-    const [ok, why] = lappy.healthy(0, false);
-    if (ok) {
-      try {
-        _runAdapterRemote(srcd, cfgPath, outJson);
-        lappy.report(true);
-        elog(`  cleaner: promo OCR adapter on ${lappy.HOST}`);
-        return fs.existsSync(outJson);
-      } catch (e) {
-        lappy.report(false);
-        elog(`  cleaner: remote adapter failed (${errMsg(e).slice(0, 160)}) -> local`);
-      }
-    } else {
-      elog(
-        `  cleaner: remote configured (${lappy.HOST}) but unavailable (${why}); running promo OCR adapter LOCALLY`,
-      );
-    }
-  } else {
-    const why = !lappy.HOST ? "not configured" : "thread not dispatched remote";
-    elog(`  cleaner: promo OCR adapter running LOCALLY (remote ${why})`);
-  }
+export async function _runAdapter(srcd: string, outJson: string): Promise<boolean> {
   const jpgs = fs
     .readdirSync(srcd)
     .filter((f) => f.endsWith(".jpg"))
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
     .map((f) => path.join(srcd, f));
-  const cmd = [MIT_PY, PROMO_ADAPTER, "--config", cfgPath, "--output", outJson, ...jpgs];
-  const r = await lappy.withHeavy(() =>
-    spawnSync(cmd[0]!, cmd.slice(1), {
-      cwd: MIT_DIR,
-      encoding: "utf8",
-      timeout: PROMO_ADAPTER_TIMEOUT * 1000,
-      env: { ...process.env, OMP_NUM_THREADS: "4" },
-      maxBuffer: 32 * 1024 * 1024,
-    }),
-  );
-  if (r.error) throw r.error;
-  if (r.status !== 0) {
-    elog(`  cleaner: promo OCR adapter rc=${r.status}: ${(r.stderr ?? "").slice(-300)}`);
-    return false;
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "pcleaner_ocr_"));
+  try {
+    const cmd = [pcleanerPy(), PROMO_ADAPTER, "--model", pcleanerModel(), "--output", outJson, ...jpgs];
+    const r = await lappy.withHeavy(() =>
+      spawnSync(cmd[0]!, cmd.slice(1), {
+        cwd: scratch,
+        encoding: "utf8",
+        timeout: PROMO_ADAPTER_TIMEOUT * 1000,
+        env: pcleanerEnv(scratch),
+        maxBuffer: 32 * 1024 * 1024,
+      }),
+    );
+    if (r.error) throw r.error;
+    if (r.status !== 0) {
+      elog(`  cleaner: promo OCR adapter rc=${r.status ?? r.signal}: ${(r.stderr ?? "").slice(-300)}`);
+      return false;
+    }
+    return fs.existsSync(outJson);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
   }
-  return fs.existsSync(outJson);
 }
 
 function offsetLines(lines: number[][], ox: number, oy: number, scale: number): number[][] {
@@ -893,7 +820,7 @@ export async function _runOcrExport(
   it: CleanItem | null = null,
   scale = 1,
 ): Promise<Record<string, RegionRecord[]> | null> {
-  if (!toolInstalled()) return null;
+  if (!pcleanerInstalled()) return null;
   if (!fs.existsSync(PROMO_ADAPTER)) {
     elog(`  cleaner: promo OCR adapter missing at ${PROMO_ADAPTER}`);
     return null;
@@ -920,15 +847,9 @@ export async function _runOcrExport(
         crops.push({ pid, name: pid, ox: 0, oy: 0 });
       }
     }
-    const cfgPath = _writeCfg(null);
     const outJson = path.join(workRoot, `promo_ocr_${scale}x.json`);
     if (fs.existsSync(outJson)) fs.unlinkSync(outJson);
-    let ok = false;
-    try {
-      ok = Boolean(await _hooks._runAdapter(srcd, cfgPath, outJson));
-    } finally {
-      fs.unlinkSync(cfgPath);
-    }
+    const ok = Boolean(await _hooks._runAdapter(srcd, outJson));
     if (!ok || !fs.existsSync(outJson)) return null;
     let payload: unknown;
     try {
@@ -1084,6 +1005,61 @@ export async function cleanPromoMask(
   }
 }
 
+async function obscureRegion(src: string, left: number, top: number, w: number, h: number): Promise<Buffer> {
+  const small = await sharp(src)
+    .removeAlpha()
+    .extract({ left, top, width: w, height: h })
+    .resize(Math.max(1, Math.round(w / 24)), Math.max(1, Math.round(h / 24)), { fit: "fill" })
+    .toBuffer();
+  return sharp(small)
+    .resize(w, h, { fit: "fill", kernel: "nearest" })
+    .blur(Math.max(2, Math.min(w, h) / 20))
+    .png()
+    .toBuffer();
+}
+
+/**
+ * Last-resort promo cover: pixelate + blur the reader's promo regions (padded
+ * ROI), or the whole panel when there are none or it is a FULL advert page.
+ * No OCR, model or network. Written under `covered/` without a stamp, so the
+ * next run still tries a proper promo clean.
+ */
+export async function coverPromoPanel(
+  it: CleanItem,
+  panelsDir: string,
+  cleanedDir: string,
+): Promise<string | null> {
+  const src = path.join(panelsDir, it.id + ".jpg");
+  if (!fs.existsSync(src)) return null;
+  const dir = path.join(cleanedDir, "covered");
+  fs.mkdirSync(dir, { recursive: true });
+  const out = path.join(dir, it.id + ".png");
+  let W = 800;
+  let H = 1100;
+  try {
+    [W, H] = await imageSize(src);
+    // Only a reader-confirmed partial promo keeps the rest of the panel visible.
+    const boxes = truthy(it.promo_full) || it.promo_page !== false ? [] : _roiPixelBoxes(it, W, H, 1);
+    if (boxes.length === 0) {
+      fs.writeFileSync(out, await obscureRegion(src, 0, 0, W, H));
+      return out;
+    }
+    const layers = [];
+    for (const [x0, y0, x1, y1] of boxes) {
+      layers.push({ input: await obscureRegion(src, x0, y0, x1 - x0, y1 - y0), left: x0, top: y0 });
+    }
+    await sharp(src).removeAlpha().composite(layers).png().toFile(out);
+    return out;
+  } catch (e) {
+    // Unreadable source: a flat dark frame still never shows the advert.
+    elog(`  cleaner: ${it.id} promo cover blur failed (${errMsg(e)}); using a blank frame`);
+    await sharp({ create: { width: W, height: H, channels: 3, background: { r: 16, g: 17, b: 19 } } })
+      .png()
+      .toFile(out);
+    return out;
+  }
+}
+
 function isPromoItem(it: CleanItem): boolean {
   return Boolean(
     truthy(it.promo_item) ||
@@ -1101,10 +1077,9 @@ export async function cleanBatch(
   items: readonly CleanItem[],
   panelsDir: string,
   cleanedDir: string,
-  maxPasses = 2,
 ): Promise<Record<string, string | null>> {
-  if (!toolInstalled()) {
-    elog("  cleaner: tool not installed, using originals");
+  if (!pcleanerInstalled()) {
+    elog("  cleaner: PanelCleaner not installed, using originals");
     const early: Record<string, string | null> = {};
     for (const it of items) early[it.id] = null;
     return early;
@@ -1115,7 +1090,17 @@ export async function cleanBatch(
   for (const it of items) {
     // Dispatch on actual promo status, never on the mere presence of promo_rules.
     if (isPromoItem(it)) {
-      results[it.id] = await cleanPromoMask(it, panelsDir, cleanedDir);
+      // A promo failure (OCR crash, verifier outage) is retried once; after that
+      // timeline covers the panel instead of stopping the run.
+      results[it.id] = null;
+      for (let attempt = 1; attempt <= PCLEANER_ATTEMPTS; attempt++) {
+        try {
+          results[it.id] = await cleanPromoMask(it, panelsDir, cleanedDir);
+          break;
+        } catch (e) {
+          elog(`  cleaner: ${it.id} promo clean attempt ${attempt}/${PCLEANER_ATTEMPTS} failed (${errMsg(e).slice(0, 200)})`);
+        }
+      }
       continue;
     }
     // I-55: a world-text item must never enter a batch.
@@ -1127,8 +1112,11 @@ export async function cleanBatch(
     const out = path.join(cleanedDir, it.id + ".png");
     const stamp = out + ".done";
     const rej = out + ".rej";
-    const h = _cfgHash(worldPromoTexts(it));
-    if (fs.existsSync(out) && fs.existsSync(stamp) && readStamp(stamp) === h) {
+    const h = _cleanHash(worldPromoTexts(it));
+    const done = fs.existsSync(stamp) ? readStamp(stamp) : null;
+    // Verified outputs from the retired MIT cleaner stay valid; its rejections
+    // do not match `h`, so those panels get one PanelCleaner retry.
+    if (fs.existsSync(out) && (done === h || done === _legacyMitHash(worldPromoTexts(it)))) {
       results[it.id] = out;
     } else if (fs.existsSync(rej) && readStamp(rej) === h) {
       results[it.id] = null;
@@ -1156,17 +1144,7 @@ export async function cleanBatch(
     const orig = new Map<string, RgbImage>();
     for (const [pid, im] of cur) orig.set(pid, copyRgb(im));
 
-    for (let pass = 0; pass < maxPasses; pass++) {
-      const ids = [...cur.keys()];
-      if (ids.length === 0) break;
-      const outd = fs.mkdtempSync(path.join(os.tmpdir(), "cleaner_out_"));
-      const cfgPath = _writeCfg(null);
-      let batch: Record<string, RgbImage> = {};
-      try {
-        batch = await _hooks._runBatch(work, outd, cfgPath);
-      } finally {
-        fs.unlinkSync(cfgPath);
-      }
+    const applyPass = async (ids: string[], batch: Record<string, RgbImage>): Promise<void> => {
       for (const pid of ids) {
         const res = batch[pid];
         const prev = cur.get(pid);
@@ -1178,70 +1156,44 @@ export async function cleanBatch(
         cur.set(pid, res);
         await saveJpeg(res, path.join(work, pid + ".jpg"), 92);
       }
-      fs.rmSync(outd, { recursive: true, force: true });
+    };
+
+    // Ordinary bubble text never fails the render: one PanelCleaner call per
+    // batch, retried once; if it still fails the panels ship uncleaned (no .rej,
+    // so a later run retries them). Repeated failed batches open a circuit so a
+    // long series run stops paying for a dead tool.
+    if (cur.size && cleanerCircuitOpen()) {
+      elog(`  cleaner: circuit open after repeated failures; shipping ${cur.size} panel(s) uncleaned`);
+      cur.clear();
+    } else if (cur.size) {
+      let ran = false;
+      for (let attempt = 1; attempt <= PCLEANER_ATTEMPTS && !ran; attempt++) {
+        const ids = [...cur.keys()];
+        const outd = fs.mkdtempSync(path.join(os.tmpdir(), "cleaner_pc_"));
+        try {
+          const batch = await _hooks._runPanelCleaner(work, outd);
+          if (Object.keys(batch).length === 0) throw new Error("PanelCleaner produced no outputs");
+          await applyPass(ids, batch);
+          ran = true;
+        } catch (e) {
+          elog(`  cleaner: PanelCleaner attempt ${attempt}/${PCLEANER_ATTEMPTS} failed (${errMsg(e).slice(0, 200)})`);
+          // A hung run already burned its full timeout; retrying would double it.
+          if ((e as NodeJS.ErrnoException)?.code === "ETIMEDOUT") break;
+        } finally {
+          fs.rmSync(outd, { recursive: true, force: true });
+        }
+      }
+      recordBatchOutcome(ran);
+      if (!ran) {
+        elog(`  cleaner: PanelCleaner failed; shipping ${cur.size} panel(s) uncleaned`);
+        cur.clear();
+      }
     }
 
     for (const [pid, im] of [...cur.entries()]) {
       const it = meta.get(pid)!;
       const out = path.join(cleanedDir, pid + ".png");
-      const promo = asStrings(it.promo);
-      const h = _cfgHash(worldPromoTexts(it));
-      if (promo.length) {
-        await savePng(im, out);
-        if (!(await _hooks.promoGone(out, promo))) {
-          const base = orig.get(pid)!;
-          const up = await resizeRgb(base, base.width * 2, base.height * 2);
-          const w2 = fs.mkdtempSync(path.join(os.tmpdir(), "cleaner_up_"));
-          try {
-            await saveJpeg(up, path.join(w2, pid + ".jpg"), 92);
-            const o2 = fs.mkdtempSync(path.join(os.tmpdir(), "cleaner_upo_"));
-            const cfg2 = _writeCfg(null);
-            try {
-              const r2 = (await _hooks._runBatch(w2, o2, cfg2))[pid];
-              if (r2) {
-                const back = await resizeRgb(r2, base.width, base.height);
-                await savePng(back, out);
-              }
-            } finally {
-              fs.unlinkSync(cfg2);
-              fs.rmSync(o2, { recursive: true, force: true });
-            }
-          } finally {
-            fs.rmSync(w2, { recursive: true, force: true });
-          }
-        }
-        if (!(await _hooks.promoGone(out, promo))) {
-          elog(`  cleaner: ${pid} promo STILL VISIBLE; keeping original`);
-          fs.unlinkSync(out);
-          fs.writeFileSync(out + ".rej", h);
-          results[pid] = null;
-          continue;
-        }
-        const bubbles = asStrings(it.overlay).filter((t) => !promo.includes(t));
-        const joined = bubbles.join(" ");
-        let resid = 0.0;
-        if (joined && joined.length >= OVERLAY_MIN) {
-          try {
-            resid = await _hooks.residualOverlay(out, bubbles);
-          } catch (e) {
-            elog(`  cleaner: ${pid} verifier unavailable (${errMsg(e)}); keeping original`);
-            fs.unlinkSync(out);
-            fs.writeFileSync(out + ".rej", h);
-            results[pid] = null;
-            continue;
-          }
-        }
-        if (resid > 0.15) {
-          elog(`  cleaner: ${pid} residual ${(resid * 100).toFixed(0)}% after promo-clean; keeping original`);
-          fs.unlinkSync(out);
-          fs.writeFileSync(out + ".rej", h);
-          results[pid] = null;
-          continue;
-        }
-        fs.writeFileSync(out + ".done", h);
-        results[pid] = out;
-        continue;
-      }
+      const h = _cleanHash(worldPromoTexts(it));
       const base = orig.get(pid)!;
       const coverage = _changedFrac(base, im);
       const chars = typeof it.overlay_chars === "number" ? it.overlay_chars : 0;
@@ -1259,9 +1211,9 @@ export async function cleanBatch(
         try {
           resid = await _hooks.residualOverlay(out, overlay);
         } catch (e) {
+          // Transient outage: no .rej, so the next run retries this panel.
           elog(`  cleaner: ${pid} verifier unavailable (${errMsg(e)}); keeping original`);
           fs.unlinkSync(out);
-          fs.writeFileSync(out + ".rej", h);
           results[pid] = null;
           continue;
         }
@@ -1285,20 +1237,67 @@ export async function cleanBatch(
   }
 }
 
-export function _cfgHash(worldTexts: readonly string[]): string {
-  return cfgHash(worldTexts, CONFIG);
+export function _cleanHash(worldTexts: readonly string[]): string {
+  return `pc|${cfgHash(worldTexts, PCLEANER_PROFILE)}`;
 }
 
-export function _writeCfg(filterRegex: string | null = null): string {
-  if (filterRegex) {
-    throw new Error(
-      "I-55: filter_text forces translator=original (full redraw); the cleaner must stay in erase mode",
+/** Stamp the retired MIT cleaner wrote (cfgHash over cleaner_config.json). */
+export function _legacyMitHash(worldTexts: readonly string[]): string {
+  const worlds = createHash("sha1").update(pySorted(worldTexts).join("|"), "utf8").digest("hex");
+  return `${LEGACY_MIT_CONFIG_SHA1}|${worlds}`;
+}
+
+/**
+ * One PanelCleaner CLI run over every JPEG in `srcDir` (always local). Throws on spawn error, non-zero exit or timeout.
+ */
+export async function _runPanelCleaner(
+  srcDir: string,
+  outDir: string,
+  timeout: number | null = null,
+): Promise<Record<string, RgbImage>> {
+  const n = fs.readdirSync(srcDir).filter((f) => f.endsWith(".jpg")).length;
+  const limit = timeout || 300 + n * 120;
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "pcleaner_run_"));
+  try {
+    const cmd = [
+      pcleanerPy(), "-m", "pcleaner.main", "clean", srcDir,
+      `--output_dir=${outDir}`, `--profile=${PCLEANER_PROFILE}`,
+      "--save-only-cleaned", "--hide-analytics",
+    ];
+    const r = await lappy.withHeavy(() =>
+      spawnSync(cmd[0]!, cmd.slice(1), {
+        cwd: scratch,
+        encoding: "utf8",
+        timeout: limit * 1000,
+        maxBuffer: 64 * 1024 * 1024,
+        env: pcleanerEnv(scratch),
+      }),
     );
+    if (r.error) throw r.error;
+    if (r.status !== 0) {
+      const rc = r.status ?? r.signal ?? "killed";
+      const tail = `${r.stderr ?? ""}${r.stdout ?? ""}`.slice(-300).trim();
+      elog(`  cleaner: panelcleaner run failed (rc=${rc}): ${tail}`);
+      const err = new Error(`panelcleaner failed (rc=${rc}): ${tail}`);
+      err.name = "RuntimeError";
+      throw err;
+    }
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
   }
-  const cfg = JSON.parse(fs.readFileSync(CONFIG, "utf8")) as unknown;
-  const dest = path.join(os.tmpdir(), `cleaner_${randomBytes(8).toString("hex")}.json`);
-  fs.writeFileSync(dest, JSON.stringify(cfg));
-  return dest;
+  const out: Record<string, RgbImage> = {};
+  if (!isDir(outDir)) return out;
+  for (const f of fs.readdirSync(outDir)) {
+    if (!f.endsWith("_clean.png")) continue;
+    const pid = f.slice(0, -"_clean.png".length);
+    const srcf = path.join(srcDir, pid + ".jpg");
+    if (!fs.existsSync(srcf)) continue;
+    const im = await loadRgb(path.join(outDir, f));
+    const [sw, sh] = await imageSize(srcf);
+    if (im.width !== sw || im.height !== sh) continue;
+    out[pid] = im;
+  }
+  return out;
 }
 
 export async function ensureClean(
@@ -1308,13 +1307,11 @@ export async function ensureClean(
   overlayChars = 100,
   worldTexts: readonly string[] = [],
   overlayTexts: readonly string[] = [],
-  maxPasses = 2,
 ): Promise<string | null> {
   const r = await cleanBatch(
     [{ id: panelId, overlay_chars: overlayChars, world: [...worldTexts], overlay: [...overlayTexts] }],
     panelsDir,
     cleanedDir,
-    maxPasses,
   );
   return r[panelId] ?? null;
 }
@@ -1324,7 +1321,7 @@ export async function ensureClean(
 _hooks._runOcrExport = _runOcrExport;
 _hooks._verifyPromoMask = _verifyPromoMask;
 _hooks._visionFullVsStory = _visionFullVsStory;
-_hooks._runBatch = _runBatch;
+_hooks._runPanelCleaner = _runPanelCleaner;
 _hooks.residualOverlay = residualOverlay;
 _hooks.promoGone = promoGone;
 _hooks._runAdapter = _runAdapter;
@@ -1340,8 +1337,6 @@ export const _vision_full_vs_story = _visionFullVsStory;
 export const promo_page_boundary = promoPageBoundary;
 export const write_promo_sidecar = writePromoSidecar;
 export const validate_promo_sidecar = validatePromoSidecar;
-export const _run_tool_remote = _runToolRemote;
-export const _run_batch = _runBatch;
 export const _changed_frac = _changedFrac;
 export const _whole_string_matcher = _wholeStringMatcher;
 export const _promo_matcher = _promoMatcher;
@@ -1349,13 +1344,12 @@ export const _promo_rules_hash = _promoRulesHash;
 export const _promo_cache_hash = _promoCacheHash;
 export const _roi_pixel_boxes = _roiPixelBoxes;
 export const _valid_records = _validRecords;
-export const _run_adapter_remote = _runAdapterRemote;
 export const _run_adapter = _runAdapter;
 export const _run_ocr_export = _runOcrExport;
 export const _apply_promo_mask = _applyPromoMask;
 export const _verify_promo_mask = _verifyPromoMask;
 export const clean_promo_mask = cleanPromoMask;
+export const cover_promo_panel = coverPromoPanel;
 export const clean_batch = cleanBatch;
-export const _write_cfg = _writeCfg;
-export const _cfg_hash = _cfgHash;
+export const _clean_hash = _cleanHash;
 export const ensure_clean = ensureClean;

@@ -54,6 +54,7 @@ import {
   type PyFloatMarker,
 } from "../contracts/hashes.js";
 import * as promoBlockMod from "../intake/promoBlock.js";
+import { failClass } from "../domain/failure.js";
 import { LANES, log, pagesIn } from "../llm/client.js";
 import { withSharedSeriesLock } from "../locks/seriesLock.js";
 import * as factCheckMod from "../stages/factCheck.js";
@@ -141,26 +142,7 @@ export class RuntimeError extends Error {
 // I-15 policy: classify a chapter failure. Permanent = retrying cannot help the
 // provider (moderation, auth, gate, structural) -> halt at once. Everything else
 // (timeouts, 429, connection, empty-200, unparseable) is transient -> retry here.
-export const PERMANENT =
-  /401|403|422|moderation|violence|data_inspection|continuity gate|0 narration lines|AuthError|voice_id is empty|unknown tts\.engine/i;
-export const TRANSIENT =
-  /429|timeout|timed out|connection|reset|refused|empty content|5\d\d|unparseable|missing after assembly|temporarily|overload/i;
-
-export type FailClass = "permanent" | "transient" | "unknown";
-
-export function failClass(e: unknown): FailClass {
-  if (
-    e !== null &&
-    typeof e === "object" &&
-    "permanent" in e &&
-    Boolean((e as { permanent?: unknown }).permanent)
-  ) {
-    return "permanent"; // story/semantic gates must not trigger whole-draft rewrite loops
-  }
-  const s = e instanceof Error ? e.message || String(e) : String(e);
-  return PERMANENT.test(s) ? "permanent" : TRANSIENT.test(s) ? "transient" : "unknown";
-}
-export const fail_class = failClass;
+export { failClass, failClass as fail_class, PERMANENT, TRANSIENT, type FailClass } from "../domain/failure.js";
 
 export const RETRY_ROUNDS = 2; // in-place retries for transient/unknown failures
 export const RETRY_WAITS: number[] = [60, 240]; // seconds before each retry (provider needs air)
@@ -780,7 +762,22 @@ export async function _runLocked(
 
   // video lane: queue + one worker task (renderlane.worker guards RAM/CPU)
   const vq = new RenderQueue<string | null>();
-  const vresults: Record<string, VideoResult> = {};
+  const vresults: Record<string, VideoResult> = new Proxy({}, {
+    set(target: Record<string, VideoResult>, ch: string, result: VideoResult) {
+      target[ch] = result;
+      // Persist every final outcome immediately; telemetry/report I/O is fail-open.
+      try {
+        const report = path.join(out, ch, "report.json");
+        let prior = {};
+        try { prior = JSON.parse(fs.readFileSync(report, "utf8")); } catch { /* no prior report */ }
+        fs.mkdirSync(path.dirname(report), { recursive: true });
+        const tmp = `${report}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, pyJsonPretty({ ...prior, ...result }, 1));
+        fs.renameSync(tmp, report);
+      } catch { /* a report write must not break queue accounting */ }
+      return true;
+    },
+  });
   let vt: Promise<void> | null = null;
   let videoWorkerError: string | null = null;
   /** Drain chapters still queued after the worker died so vq.join() can resolve. */
@@ -799,6 +796,8 @@ export async function _runLocked(
       vresults[ch] = {
         status: "video-failed",
         error: `render worker failed: ${(videoWorkerError ?? "unknown error").slice(0, 300)}`,
+        class: failClass(new Error(videoWorkerError ?? "unknown error")),
+        video_attempts: 0,
       };
       vq.taskDone();
     }
@@ -845,8 +844,11 @@ export async function _runLocked(
       continue;
     }
 
+    let scriptStage = "reader";
     for (let attempt = 0; attempt <= RETRY_ROUNDS; attempt++) {
       try {
+        if (attempt > 0) _hooks.telemetry.stage(ch, scriptStage, "queued");
+        scriptStage = "reader";
         const tag = attempt === 0 ? "" : ` (retry ${attempt}/${RETRY_ROUNDS})`;
         console.log(`== ${ch}: READER${tag}`);
         _hooks.telemetry.bind({ chapter: ch });
@@ -884,8 +886,10 @@ export async function _runLocked(
         }
 
         let meta: Record<string, unknown> = {};
+        let seriesStyle: import('../config/seriesStyle.js').SeriesStyle | undefined;
         try {
           const parsedMeta = JSON.parse(fs.readFileSync(path.join(sdir, "meta.json"), "utf8"));
+          if (isRecord(parsedMeta)) seriesStyle = parsedMeta.style as typeof seriesStyle;
           if (isRecord(parsedMeta) && isRecord(parsedMeta.tts)) {
             meta = parsedMeta.tts;
           }
@@ -912,7 +916,8 @@ export async function _runLocked(
         }
         const eleven = engine === "eleven";
         const external = engine === "external";
-        const expressive = eleven || external;
+        const emotionSetting = seriesStyle?.emotionTags ?? process.env.EMOTION_TAGS ?? 'auto';
+        const expressive = emotionSetting === 'auto' ? eleven || external : emotionSetting === 'on';
 
         // I-15 CONTINUITY GATE
         const n = chN;
@@ -941,6 +946,7 @@ export async function _runLocked(
             ? "v2 EMOTION-TAGGED for external voice"
             : "one shot";
         console.log(`== ${ch}: WRITER (${writerModeLabel})`);
+        scriptStage = "writer";
         _hooks.telemetry.stage(ch, "writer");
 
         const cdir = path.join(out, ch);
@@ -1013,6 +1019,7 @@ export async function _runLocked(
             {
               outDir: out,
               emotion: expressive,
+              style: seriesStyle,
               block: block as unknown as BlockLike | null,
               opening,
               taken: hookTaken,
@@ -1037,6 +1044,7 @@ export async function _runLocked(
               {
                 outDir: out,
                 emotion: expressive,
+                style: seriesStyle,
                 block: block as unknown as BlockLike | null,
                 opening,
                 taken: hookTaken,
@@ -1072,6 +1080,7 @@ export async function _runLocked(
         }
 
         _hooks.telemetry.stage(ch, "writer", "done");
+        scriptStage = "check";
         _hooks.telemetry.stage(ch, "check");
 
         const charNames: string[] = [];
@@ -1128,8 +1137,11 @@ export async function _runLocked(
           `   script: ${nlines} lines | fact_check: ` +
             (issues.length === 0 ? "PASS" : `FAIL (${issues.length})`),
         );
-        _hooks.telemetry.stage(ch, "check", issues.length > 0 ? "warning" : "done", {
+        // UNGROUNDED is advisory: factCheck.ts documents its measured F1 of 0.35.
+        const flagged = issues.filter((issue) => !/^UNGROUNDED\b/.test(String(issue)));
+        _hooks.telemetry.stage(ch, "check", flagged.length > 0 ? "warning" : "done", {
           findings: issues.length,
+          flagged: flagged.length,
           lines: nlines,
           words: nwords,
         });
@@ -1159,7 +1171,6 @@ export async function _runLocked(
         }
         break; // success: leave the retry loop
       } catch (e) {
-        _hooks.telemetry.failed(ch, e);
         const cls = failClass(e);
         const errMsg = e instanceof Error ? e.message : String(e);
         process.stderr.write(`  !! ${ch} FAILED (${cls}): ${errMsg.slice(0, 200)}\n`);
@@ -1167,13 +1178,15 @@ export async function _runLocked(
         if (cls !== "permanent" && attempt < RETRY_ROUNDS) {
           const w = RETRY_WAITS[Math.min(attempt, RETRY_WAITS.length - 1)]!;
           console.log(`     retrying ${ch} in ${w}s (per-batch cache resumes)...`);
-          _hooks.telemetry.stage(ch, "reader", "retrying", {
+          _hooks.telemetry.retrying(ch, e, {
             retryAt: _hooks.time.now() + w,
-            note: `Retry ${attempt + 1} in ${w}s`,
+            attempt: attempt + 1,
+            maxAttempts: RETRY_ROUNDS + 1,
           });
           await _hooks.time.sleep(w);
           continue;
         }
+        _hooks.telemetry.failed(ch, e);
         const cdir = path.join(out, ch);
         fs.mkdirSync(cdir, { recursive: true });
         const reportPath = path.join(cdir, "report.json");
@@ -1253,7 +1266,9 @@ export async function _runLocked(
         }
       }
       Object.assign(rep, vresults[c]);
-      fs.writeFileSync(rp, pyJsonPretty(rep, 1));
+      const tmp = `${rp}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, pyJsonPretty(rep, 1));
+      fs.renameSync(tmp, rp);
     }
     console.log(
       `videos: ${vok.length} ok` + (vbad.length > 0 ? ` | FAILED: ${vbad.join(", ")}` : ""),

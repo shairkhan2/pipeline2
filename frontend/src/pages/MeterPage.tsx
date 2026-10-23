@@ -4,6 +4,7 @@ import { RefreshCw } from "lucide-react";
 import { AppShell } from "@/components/layout/AppShell";
 import { Button } from "@/components/ui/button";
 import { api, isApiError, type ProviderView } from "@/lib/api";
+import { Notice, NoticeButton } from "@/components/ui/notice";
 
 const POOL_NAME: Record<string, string> = {
   gemini: "Gemini",
@@ -258,35 +259,13 @@ function last30(daily: DailyBar[]): DailyBar[] {
 function QuotaRing({ pool, info, labelOverride }: { pool: string; info: PoolInfo | null; labelOverride?: string }) {
   const remaining = info ? info.remaining : null;
   const known = remaining != null;
-  const pct = known ? Math.max(0, Math.min(100, remaining)) : 0;
-  const low = known && remaining <= 20;
-  const empty = known && remaining <= 0;
-  const radius = 15;
-  const circumference = 2 * Math.PI * radius;
-  const arc = known && !empty ? (circumference * pct) / 100 : 0;
+   const low = known && remaining <= 20;
   const displayPool = labelOverride || formatPoolName(pool);
   const label = `${displayPool}: ${known ? `${remaining}% left` : "quota unavailable"}${known && info?.reset_ts ? `, ${when(info.reset_ts)}` : ""}`;
-  const stroke = !known || empty ? "transparent" : low ? "#ef6b5b" : pool === "gemini" ? "#f18b6e" : "#d6b57b";
   return (
-    <div className="grid w-14 justify-items-center gap-0.5" role="img" aria-label={label} title={label}>
-      <svg className="size-10" viewBox="0 0 34 34" aria-hidden>
-        <circle cx="17" cy="17" r={radius} fill="none" stroke="#101113" strokeWidth="3.5" />
-        <circle
-          cx="17"
-          cy="17"
-          r={radius}
-          fill="none"
-          stroke={known && !empty ? stroke : "transparent"}
-          strokeWidth="3.5"
-          strokeLinecap="round"
-          strokeDasharray={`${arc.toFixed(2)} ${circumference.toFixed(2)}`}
-          transform="rotate(-90 17 17)"
-        />
-        <text x="17" y="18.5" textAnchor="middle" fill={low ? "#ef6b5b" : "#f2efe9"} fontSize="8" fontFamily="JetBrains Mono, ui-monospace, monospace">
-          {known ? `${Math.round(remaining)}` : "—"}
-        </text>
-      </svg>
-      <span className={`truncate max-w-full text-[10px] ${low ? "text-[#ef6b5b]" : "text-[#a2a19f]"}`}>{displayPool}</span>
+    <div className="flex items-baseline gap-1.5" aria-label={label} title={label}>
+      <span className={`text-[15px] tabular-nums ${low ? "text-destructive" : "text-foreground"}`}>{known ? `${Math.round(remaining)}%` : "—"}</span>
+      <span className="text-[13px] text-muted-foreground">{displayPool}</span>
     </div>
   );
 }
@@ -299,10 +278,10 @@ function BreakdownTable({
   rows: Array<{ name: string; kind: string; total: number; calls: number; share: number }>;
 }) {
   return (
-    <div className="overflow-x-auto rounded-xl border border-[#2b2c30]">
+    <div className="overflow-x-auto rounded-xl border border-border">
       <table className="w-full min-w-[520px] text-left text-sm">
         <caption className="sr-only">{caption}</caption>
-        <thead className="bg-[#191a1d] text-xs tracking-[0.14em] text-[#a2a19f] uppercase">
+        <thead className="bg-muted text-[13px] font-medium text-muted-foreground">
           <tr>
             <th className="px-3 py-2 font-medium" scope="col">Name</th>
             <th className="px-3 py-2 font-medium" scope="col">Kind</th>
@@ -314,19 +293,19 @@ function BreakdownTable({
         <tbody>
           {rows.length === 0 ? (
             <tr>
-              <td className="px-3 py-4 text-[#a2a19f]" colSpan={5}>Nothing recorded yet.</td>
+              <td className="px-3 py-4 text-muted-foreground" colSpan={5}>Nothing recorded yet.</td>
             </tr>
           ) : (
             rows.map((row) => (
-              <tr key={`${row.kind}:${row.name}`} className="border-t border-[#2b2c30]">
+              <tr key={`${row.kind}:${row.name}`} className="border-t border-border">
                 <th className="max-w-[240px] truncate px-3 py-2 font-normal" scope="row" title={row.name}>{row.name}</th>
-                <td className="px-3 py-2 text-[#a2a19f]">{row.kind}</td>
+                <td className="px-3 py-2 text-muted-foreground">{row.kind}</td>
                 <td className="px-3 py-2 font-mono text-xs">{human(row.total)}</td>
                 <td className="px-3 py-2 font-mono text-xs">{row.calls}</td>
                 <td className="px-3 py-2">
-                  <span className="mb-1 block font-mono text-xs text-[#a2a19f]">{row.share.toFixed(0)}%</span>
-                  <span className="block h-1 overflow-hidden rounded-full bg-[#101113]" aria-hidden>
-                    <span className="block h-full bg-[#f18b6e]" style={{ width: `${row.share}%` }} />
+                  <span className="mb-1 block font-mono text-xs text-muted-foreground">{row.share.toFixed(0)}%</span>
+                  <span className="block h-1 overflow-hidden rounded-full bg-background" aria-hidden>
+                    <span className="block h-full rounded-full bg-chart-1" style={{ width: `${row.share}%` }} />
                   </span>
                 </td>
               </tr>
@@ -352,7 +331,7 @@ function rowsFrom(map: Record<string, SpendBucket>, kind: string, labels?: Recor
     }));
 }
 
-export function MeterPage() {
+export function MeterPage({ embedded = false, privileged = true }: { embedded?: boolean; privileged?: boolean }) {
   const [data, setData] = useState<AgyData | null>(null);
   const [providers, setProviders] = useState<ProviderView[] | null>(null);
   const [source, setSource] = useState<Source | null>(null);
@@ -367,6 +346,15 @@ export function MeterPage() {
   const load = useCallback(async (fresh: boolean) => {
     setBusy(true);
     try {
+      if (!privileged) {
+        const state = await api.studio.providers();
+        setProviders(state.providers ?? []);
+        setSource("providers");
+        setError("");
+        setStamp(`Updated ${new Date().toLocaleTimeString()}`);
+        seen.current = true;
+        return;
+      }
       const payload = await api.agy(fresh);
       const parsed = readAgy(payload);
       if (!parsed) throw new Error("agy rotator unavailable");
@@ -388,7 +376,7 @@ export function MeterPage() {
         setData(null);
         setSource("providers");
         setError("");
-        setStamp("Studio providers updated");
+        setStamp("Provider status updated");
         seen.current = true;
       } catch (fallback) {
         if (!seen.current) {
@@ -399,7 +387,7 @@ export function MeterPage() {
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [privileged]);
 
   useEffect(() => {
     void load(false);
@@ -436,40 +424,41 @@ export function MeterPage() {
     windowTabRefs.current[next]?.focus();
   }
 
-  return (
-    <AppShell
-      active="meter"
-      eyebrow="Quota and spend"
-      title="Meter Room"
-      actions={
-        <div className="flex items-center gap-3">
-          <span className="text-xs text-[#a2a19f]" role="status">{stamp}</span>
-          <Button type="button" variant="outline" className="min-h-11" disabled={busy} onClick={() => void load(true)}>
+  const actions = <div className="flex flex-wrap items-center gap-3">
+          <span className="text-xs text-muted-foreground" role="status">{stamp}</span>
+           <Button type="button" variant="outline" className="min-h-11" disabled={busy} onClick={() => void load(true)}>
             <RefreshCw className={`size-4 ${busy ? "animate-spin" : ""}`} aria-hidden />
-            {busy ? "Checking…" : "Check live quota"}
+            {busy ? "Checking…" : "Refresh"}
           </Button>
+        </div>;
+  const content = <>
+      <header className="mb-6 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          {!embedded ? <h2 className="text-xl font-semibold">Usage</h2> : null}
         </div>
-      }
-    >
+        {embedded ? actions : null}
+      </header>
+      {!privileged ? <Notice tone="info" className="mb-5">Provider status only</Notice> : null}
       {error ? (
-        <div className="max-w-xl py-8" role="alert">
-          <h2 className="font-serif text-3xl">The meter endpoint didn’t answer</h2>
-          <p className="mt-2 text-sm text-[#a2a19f]">{error}</p>
-          <Button type="button" className="mt-4 min-h-11" onClick={() => void load(true)}>Retry</Button>
-        </div>
+        <Notice
+          tone="danger"
+          title="Usage didn’t load"
+          className="max-w-2xl"
+          actions={<NoticeButton onClick={() => void load(true)}>Retry</NoticeButton>}
+        >
+          {error}
+        </Notice>
       ) : null}
 
       {!error && !data && !providers ? (
         <div className="py-10" aria-busy="true">
-          <p className="font-serif text-3xl">Reading the meters</p>
-          <p className="mt-2 text-sm text-[#a2a19f]">Asking each account how much is left.</p>
+          <p className="text-sm text-muted-foreground">Loading usage…</p>
         </div>
       ) : null}
 
       {source === "agy" && data && !data.hasAccounts ? (
-        <div className="mb-8 max-w-xl">
-          <h2 className="font-serif text-3xl">Provider status</h2>
-          <p className="mt-2 text-sm text-[#a2a19f]">Live quota is not available. Check your connected accounts below.</p>
+        <div className="mb-6 max-w-xl">
+          <h2 className="text-xl font-semibold tracking-[-0.01em]">Provider status</h2>
         </div>
       ) : null}
 
@@ -477,27 +466,26 @@ export function MeterPage() {
         <div className="space-y-8">
           <section aria-label="Quota left">
             <div className="mb-3">
-              <h2 className="font-serif text-2xl">Quota left</h2>
-              <p className="text-sm text-[#a2a19f]">One ring per meter. The arc length is the quota still left.</p>
+              <h2 className="text-xl font-semibold tracking-[-0.01em]">Quota left</h2>
             </div>
-            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            <div className="sr-group">
               {data.accounts.map((account) => {
                 const mono = account.label.replace(/[^a-z0-9]/gi, "").slice(0, 2).toUpperCase() || "•";
                 const parkedUntil = account.parked.length ? Math.min(...account.parked.map(([, ts]) => ts)) : 0;
                 return (
-                  <article key={account.email || account.label} className="rounded-xl border border-[#2b2c30] bg-[#191a1d] p-3" title={account.email ? `${account.label} — ${account.email}` : account.label}>
+                  <article key={account.email || account.label} className="sr-row flex-wrap justify-between" title={account.email ? `${account.label} — ${account.email}` : account.label}>
                     <div className="flex items-center gap-2">
-                      <span className="grid size-7 place-items-center rounded-md bg-[#101113] font-mono text-[10px] text-[#f18b6e]" aria-hidden>{mono}</span>
+                      <span className="grid size-7 place-items-center rounded-md bg-background font-mono text-[12px] text-primary-text" aria-hidden>{mono}</span>
                       <span className="min-w-0 truncate text-sm">{account.label}</span>
                     </div>
-                    <p className={`mt-1 truncate text-xs ${account.parked.length ? "text-[#ef6b5b]" : account.active.length ? "text-[#d6b57b]" : "text-[#a2a19f]"}`}>
+                    <p title={account.parked.length ? new Date(parkedUntil * 1000).toLocaleString() : undefined} className={`truncate text-xs ${account.parked.length ? "text-destructive" : account.active.length ? "text-warning" : "text-muted-foreground"}`}>
                       {account.parked.length
-                        ? `Parked until ${new Date(parkedUntil * 1000).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" })}`
+                        ? "Cooling"
                         : account.active.length
-                          ? `Carrying ${account.active.map((pool) => formatPoolName(pool)).join(" and ")}`
+                          ? "Active"
                           : "Idle"}
                     </p>
-                    <div className="mt-3 flex flex-wrap gap-3">
+                    <div className="flex flex-wrap gap-3">
                       {Object.entries(account.pools).map(([poolKey, poolInfo]) => (
                         <QuotaRing key={poolKey} pool={poolKey} info={poolInfo} />
                       ))}
@@ -510,11 +498,10 @@ export function MeterPage() {
 
           <section aria-label="Tokens spent">
             <div className="mb-3">
-              <h2 className="font-serif text-2xl">Tokens spent</h2>
-              <p className="text-sm text-[#a2a19f]">Usage per call over the last 30 days.</p>
+              <h2 className="text-2xl font-semibold tracking-[-0.015em]">Tokens spent</h2>
             </div>
             {data.windows.length ? (
-              <div className="mb-3 flex gap-1 overflow-x-auto" role="tablist" aria-label="Usage window" onKeyDown={onWindowTabKey}>
+              <div className="mb-3 flex w-fit max-w-full gap-0.5 overflow-x-auto rounded-full bg-card p-1" role="tablist" aria-label="Usage window" onKeyDown={onWindowTabKey}>
                 {data.windows.map((item, index) => (
                   <button
                     key={`${item.label}-${index}`}
@@ -527,7 +514,7 @@ export function MeterPage() {
                     ref={(node) => {
                       windowTabRefs.current[index] = node;
                     }}
-                    className={`min-h-11 shrink-0 rounded-lg border px-3 text-sm ${index === windowIdx ? "border-[#f18b6e] bg-[#30231f]" : "border-[#3c3e44] text-[#a2a19f]"}`}
+                    className={`min-h-10 shrink-0 rounded-full px-4 text-[14.5px] font-medium transition-colors ${index === windowIdx ? "bg-background text-foreground shadow-float" : "text-muted-foreground hover:text-foreground"}`}
                     onClick={() => setWindowIdx(index)}
                   >
                     {item.label}
@@ -540,11 +527,11 @@ export function MeterPage() {
                 id="usage-window-panel"
                 role="tabpanel"
                 aria-labelledby={data.windows.length ? `usage-tab-${windowIdx}` : undefined}
-                className="mb-4 grid gap-4 rounded-xl border border-[#2b2c30] bg-[#191a1d] p-4 sm:grid-cols-2 lg:grid-cols-4"
+                className="sr-group mb-4"
               >
-                <div className="sm:col-span-2 lg:col-span-1">
-                  <p className="font-serif text-4xl leading-none">{human(windowStat.total)}</p>
-                  <p className="mt-1 text-xs text-[#a2a19f]">tokens across {windowStat.calls} call{windowStat.calls === 1 ? "" : "s"}</p>
+                <div className="sr-row justify-between">
+                  <span>Tokens</span>
+                  <span className="tabular-nums text-muted-foreground">{human(windowStat.total)}</span>
                 </div>
                 {[
                   ["Input", human(windowStat.input)],
@@ -555,9 +542,9 @@ export function MeterPage() {
                   ["Quota switches", String(windowStat.quota_switches)],
                   ["Processing time", dur(windowStat.wall_s)],
                 ].map(([label, value]) => (
-                  <div key={label}>
-                    <p className="text-xs text-[#a2a19f]">{label}</p>
-                    <p className="font-mono text-sm">{value}</p>
+                  <div key={label} className="sr-row justify-between">
+                    <span>{label}</span>
+                    <span className="tabular-nums text-muted-foreground">{value}</span>
                   </div>
                 ))}
               </div>
@@ -567,7 +554,7 @@ export function MeterPage() {
               <BreakdownTable caption="Token spend by meter, account, and model" rows={breakdown} />
             </div>
             {windowStat?.unknown_token_calls ? (
-              <p className="mt-3 text-xs text-[#a2a19f]">
+              <p className="mt-3 text-xs text-muted-foreground">
                 {windowStat.unknown_token_calls} call(s) in this window had no token data. The ACP lane doesn’t report counts, so it is logged by volume and time instead.
               </p>
             ) : null}
@@ -579,11 +566,11 @@ export function MeterPage() {
         <ProviderFallback providers={providers} />
       ) : null}
 
-      <p className="mt-8 text-xs leading-5 text-[#a2a19f]">
+      <p className="mt-8 text-xs leading-5 text-muted-foreground">
         Account quotas refresh every minute when available. Token usage stays on this machine.
       </p>
-    </AppShell>
-  );
+    </>;
+  return embedded ? content : <AppShell active="meter" title="Usage" actions={actions}>{content}</AppShell>;
 }
 
 function LedgerChart({ days, maxDay }: { days: DailyBar[]; maxDay: number }) {
@@ -591,10 +578,10 @@ function LedgerChart({ days, maxDay }: { days: DailyBar[]; maxDay: number }) {
     ? `Token spend over the last 30 days. Peak day ${human(maxDay)} tokens.`
     : "No tokens recorded in the last 30 days.";
   return (
-    <div className="rounded-xl border border-[#2b2c30] bg-[#191a1d] p-4">
-      <div className="mb-3 flex flex-wrap gap-4 text-xs text-[#a2a19f]">
-        <span><span className="mr-1 inline-block size-2 bg-[#f18b6e]" aria-hidden />Gemini</span>
-        <span><span className="mr-1 inline-block size-2 bg-[#d6b57b]" aria-hidden />Claude</span>
+    <div className="rounded-[22px] bg-card p-5">
+      <div className="mb-3 flex flex-wrap gap-4 text-[13px] text-muted-foreground">
+        <span><span className="mr-1.5 inline-block size-2.5 rounded-full bg-chart-1" aria-hidden />Gemini</span>
+        <span><span className="mr-1.5 inline-block size-2.5 rounded-full bg-chart-2" aria-hidden />Claude</span>
         <span>last 30 days</span>
       </div>
       <div className="flex h-24 items-end gap-[3px]" role="img" aria-label={summary}>
@@ -607,8 +594,8 @@ function LedgerChart({ days, maxDay }: { days: DailyBar[]; maxDay: number }) {
           return (
             <div key={day.day} className="flex h-full min-w-0 flex-1 flex-col justify-end" title={label}>
               <div className="flex h-full flex-col justify-end">
-                <div className="bg-[#d6b57b]" style={{ height: `${other.toFixed(2)}%` }} />
-                <div className="bg-[#f18b6e]" style={{ height: `${gemini.toFixed(2)}%` }} />
+                <div className="rounded-t-[3px] bg-chart-2" style={{ height: `${other.toFixed(2)}%` }} />
+                <div className="bg-chart-1" style={{ height: `${gemini.toFixed(2)}%` }} />
               </div>
             </div>
           );
@@ -627,11 +614,11 @@ function ProviderFallback({ providers }: { providers: ProviderView[] | null }) {
   const rows = providers ?? [];
   return (
     <section className="mt-8" aria-label="Studio providers">
-      <h2 className="font-serif text-2xl">Providers</h2>
-      <div className="overflow-x-auto rounded-xl border border-[#2b2c30]">
+      <h2 className="text-2xl font-semibold tracking-[-0.015em]">Providers</h2>
+      <div className="overflow-x-auto rounded-xl border border-border">
         <table className="w-full min-w-[640px] text-left text-sm">
           <caption className="sr-only">Studio provider connections</caption>
-          <thead className="bg-[#191a1d] text-xs tracking-[0.14em] text-[#a2a19f] uppercase">
+          <thead className="bg-muted text-[13px] font-medium text-muted-foreground">
             <tr>
               <th className="px-3 py-2 font-medium" scope="col">Provider</th>
               <th className="px-3 py-2 font-medium" scope="col">Account / Plan</th>
@@ -643,16 +630,16 @@ function ProviderFallback({ providers }: { providers: ProviderView[] | null }) {
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-4 text-[#a2a19f]" colSpan={5}>Nothing connected yet. Add a provider in Studio.</td>
+                <td className="px-3 py-4 text-muted-foreground" colSpan={5}>Nothing connected yet. <a className="text-primary-text underline" href="?settings=providers">Add provider</a></td>
               </tr>
             ) : (
               rows.map((provider) => (
-                <tr key={provider.id} className="border-t border-[#2b2c30]">
+                <tr key={provider.id} className="border-t border-border">
                   <th className="px-3 py-2 font-normal" scope="row">{provider.label}</th>
-                  <td className="px-3 py-2 text-[#a2a19f]">{provider.auth.accountEmail || provider.auth.accountName || "—"}{provider.auth.accountPlan ? <span className="ml-2 inline-flex rounded-full border border-[#3c3e44] px-2 py-0.5 text-xs text-[#aed1a8]">{provider.auth.accountPlan}</span> : null}</td>
+                  <td className="px-3 py-2 text-muted-foreground">{provider.auth.accountEmail || provider.auth.accountName || "—"}{provider.auth.accountPlan ? <span className="ml-2 inline-flex rounded-full border border-border-strong px-2 py-0.5 text-xs text-success">{provider.auth.accountPlan}</span> : null}</td>
                   <td className="px-3 py-2 font-mono text-xs">{provider.models?.length ?? 0}</td>
                   <td className="px-3 py-2 font-mono text-xs">{provider.lastTest ? `${provider.lastTest.latencyMs} ms` : "—"}</td>
-                  <td className="px-3 py-2"><span className={`inline-flex rounded-full border px-2 py-0.5 text-xs ${!provider.enabled ? "border-[#3c3e44] text-[#a2a19f]" : provider.lastTest && !provider.lastTest.ok ? "border-[#69453e] text-[#f0a096]" : provider.lastTest?.ok || provider.auth.hasSecret || provider.auth.mode === "none" ? "border-[#3d523b] text-[#aed1a8]" : "border-[#605139] text-[#d6b57b]"}`}>{!provider.enabled ? "Off" : provider.lastTest ? (provider.lastTest.ok ? "Connected" : "Error") : provider.auth.hasSecret || provider.auth.mode === "none" ? "Connected" : "Not connected"}</span></td>
+                  <td className="px-3 py-2"><span className={`inline-flex rounded-full border px-2 py-0.5 text-xs ${!provider.enabled ? "border-border-strong text-muted-foreground" : provider.lastTest && !provider.lastTest.ok ? "border-destructive/40 text-destructive" : provider.lastTest?.ok || provider.auth.hasSecret || provider.auth.mode === "none" ? "border-success/40 text-success" : "border-warning/40 text-warning"}`}>{!provider.enabled ? "Off" : provider.lastTest ? (provider.lastTest.ok ? "Connected" : "Error") : provider.auth.hasSecret || provider.auth.mode === "none" ? "Connected" : "Not connected"}</span></td>
                 </tr>
               ))
             )}

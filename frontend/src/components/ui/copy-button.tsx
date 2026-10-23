@@ -28,26 +28,33 @@ export interface CopyButtonProps extends Omit<React.ComponentProps<'button'>, 'v
   onCopyError?: (error: unknown) => void;
 }
 
-const copyWithExecCommand = (text: string) => {
+const copyWithExecCommand = (text: string, container?: HTMLElement | null) => {
   const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const host = container || document.body;
   const textarea = document.createElement('textarea');
   textarea.value = text;
   textarea.setAttribute('readonly', '');
   textarea.style.position = 'fixed';
   textarea.style.opacity = '0';
-  document.body.appendChild(textarea);
+  textarea.style.pointerEvents = 'none';
+  host.appendChild(textarea);
+  textarea.focus({ preventScroll: true });
   textarea.select();
+  textarea.setSelectionRange(0, text.length);
   try {
     if (typeof document.execCommand !== 'function' || !document.execCommand('copy')) {
       throw new Error('Copy command was rejected');
     }
   } finally {
-    document.body.removeChild(textarea);
+    host.removeChild(textarea);
     previousFocus?.focus({ preventScroll: true });
   }
 };
 
-const writeClipboard = async (text: string) => {
+const writeClipboard = async (text: string, container?: HTMLElement | null) => {
+  if (!text.trim()) {
+    throw new Error('Nothing to copy');
+  }
   if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(text);
@@ -57,7 +64,7 @@ const writeClipboard = async (text: string) => {
       // Permission denied or unfocused document: fall through to execCommand.
     }
   }
-  copyWithExecCommand(text);
+  copyWithExecCommand(text, container);
 };
 
 const CopyButton = ({
@@ -93,9 +100,11 @@ const CopyButton = ({
     async (event: React.MouseEvent<HTMLButtonElement>) => {
       onClick?.(event);
       if (event.defaultPrevented) return;
+      const dialogHost = event.currentTarget.closest<HTMLElement>('[role="dialog"]');
       try {
-        const text = typeof value === 'function' ? value() : value;
-        await writeClipboard(text);
+        const raw = typeof value === 'function' ? value() : value;
+        const text = typeof raw === 'string' ? raw : '';
+        await writeClipboard(text, dialogHost);
         settle('copied');
         onCopy?.(text);
       } catch (error) {
@@ -107,7 +116,8 @@ const CopyButton = ({
   );
 
   const copied = state === 'copied';
-  const hasLabel = children != null;
+  const displayLabel = children ?? (label && label !== 'Copy to clipboard' ? label : null);
+  const hasLabel = displayLabel != null;
   const announcement = state === 'copied' ? copiedLabel : state === 'error' ? errorLabel : '';
 
   return (
@@ -118,7 +128,7 @@ const CopyButton = ({
         size={hasLabel ? 'sm' : size === 'sm' ? 'icon-xs' : 'icon-sm'}
         data-slot="copy-button"
         data-state={state}
-        aria-label={hasLabel ? undefined : label}
+        aria-label={label}
         onClick={handleCopy}
         className={cn(size === 'sm' ? '[&_svg]:size-3.5' : '[&_svg]:size-4', className)}
         {...props}
@@ -137,7 +147,7 @@ const CopyButton = ({
             )}
           />
         </span>
-        {hasLabel && <span>{copied ? copiedLabel : children}</span>}
+        {hasLabel && <span>{copied ? copiedLabel : displayLabel}</span>}
       </Button>
       <span data-slot="copy-button-status" role="status" aria-live="polite" className="sr-only">
         {announcement}

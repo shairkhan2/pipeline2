@@ -24,6 +24,7 @@ import {
   PROVIDER_PRESETS,
   STAGES,
   StudioConfigError,
+  StudioProviderConflictError,
   VERTEX_OAUTH_AUTHORIZE_URL,
   VERTEX_OAUTH_DEFAULT_CLIENT_ID,
   VERTEX_OAUTH_DEFAULT_CLIENT_SECRET,
@@ -43,6 +44,7 @@ import {
   getPromptsConfig,
   isVertexOAuthSecret,
   mintVertexAccessToken,
+  persistDiscoveredModels,
   putPromptsConfig,
   resetPromptStage,
   getStudioSettings,
@@ -58,6 +60,8 @@ import {
   testProviderConnection,
   upsertProvider,
   upsertRenderNodeConfig,
+  validateProviderUpsertInput,
+  type DiscoveredModel,
   type ProviderUpsertInput,
   type RenderNodeUpsertInput,
 } from "../config/studioConfig.js";
@@ -572,6 +576,7 @@ async function exchangeCodeForProvider(
     tokenUrl,
     clientId,
     ...(clientSecret ? { clientSecret } : {}),
+    persistSecret: false,
     outDir,
   });
   // Persist the full bundle whenever the exchange returned any renewable or
@@ -654,25 +659,38 @@ function hasProviderCredentials(body: Record<string, unknown>): boolean {
 /**
  * Live verification for `verifyBeforeSave: true`.
  *
- * Returns `null` when the provider answers `/models` (or a connection probe), or a
- * short reason string when it does not. Callers roll back a provider created by the
- * same request so an unusable key never lands in the catalog.
+ * Probes the candidate provider configuration in memory (`persist: false`) before
+ * any secret or provider record is written, so a failed verification never mutates
+ * `providers.json`, `secrets.json`, `stages.json`, or `studio-audit.log`.
  */
-async function verifyProviderBeforeSave(providerId: string, outDir: string): Promise<string | null> {
+async function verifyProviderBeforeSave(
+  target: string | ProviderUpsertInput,
+  outDir: string,
+  extraOpts?: { ignoreStoredSecret?: boolean },
+): Promise<{ failure: string | null; models: DiscoveredModel[] | null }> {
+  const probeOpts = {
+    outDir,
+    timeoutMs: 8000,
+    persist: false,
+    ...(extraOpts?.ignoreStoredSecret ? { ignoreStoredSecret: true } : {}),
+  };
   try {
-    const models = await discoverProviderModels(providerId, { outDir, timeoutMs: 8000, persist: true });
-    if (models.length > 0) return null;
+    const models = await discoverProviderModels(target, probeOpts);
+    if (models.length > 0) return { failure: null, models };
   } catch {
     // `/models` may be unsupported by this endpoint: fall back to a connection probe.
   }
   try {
     // A minimal inference turn proves the credential even when the endpoint has
     // no `GET /models` (Anthropic messages, custom gateways that 404 there).
-    const probe = await probeProviderInference(providerId, { outDir, timeoutMs: 8000 });
-    if (probe.ok) return null;
-    return probe.error || `HTTP ${probe.status}`;
+    const probe = await probeProviderInference(target, probeOpts);
+    if (probe.ok) return { failure: null, models: null };
+    return { failure: probe.error || `HTTP ${probe.status}`, models: null };
   } catch (err) {
-    return (err instanceof Error ? err.message : String(err)).slice(0, 240);
+    return {
+      failure: (err instanceof Error ? err.message : String(err)).slice(0, 240),
+      models: null,
+    };
   }
 }
 
@@ -846,8 +864,10 @@ export async function handleStudioRoute(
     if (pathname === "/api/studio/lanes/control") {
       if (method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
       if (!["pause", "resume", "stop"].includes(String(body.action))) return sendJson(res, 400, { error: "action must be pause, resume or stop" });
+      // Retired: a lane is a placement hint, not a switchboard. This route never
+      // signals or mutates a job; run-scoped controls replace it.
       const result = controlRenderLane(String(body.laneId || ""), body.action as "pause" | "resume" | "stop", undefined, outDir);
-      return sendJson(res, result.ok ? 200 : 409, result);
+      return sendJson(res, Number(result.statusCode) || 409, result);
     }
     /* ---------- GET /api/studio/catalog ---------- */
     if (pathname === "/api/studio/catalog") {
@@ -902,56 +922,61 @@ export async function handleStudioRoute(
         return sendJson(res, 200, getProvidersState(outDir));
       }
       if (method === "POST") {
-        const input = await exchangeCodeForProvider(body, String(body.id ?? body.preset ?? "").trim(), outDir);
-        const providerId = String((input as Record<string, unknown>).id ?? "").trim();
-        const existedBefore = Boolean(providerId && getProvider(providerId, outDir));
-        // Snapshot the previous record and raw secret: a failed verification must
-        // leave an already-existing provider exactly as it was.
-        const previousRecord = existedBefore ? getProviderRecord(providerId, outDir) : null;
-        const previousSecretRef = previousRecord?.auth?.secretRef || `provider:${providerId}`;
-        const previousSecret = existedBefore ? getSecret(previousSecretRef, outDir) : null;
-        const verifyBeforeSave = body.verifyBeforeSave === true;
-        if (verifyBeforeSave && providerId) {
-          const presetKey = String(
-            (input as Record<string, unknown>).preset ?? providerId,
-          ).trim();
-          const authMode = String(
-            ((input as Record<string, unknown>).auth as Record<string, unknown> | undefined)?.mode
-              ?? PROVIDER_PRESETS[presetKey]?.authMode
-              ?? PROVIDER_PRESETS[providerId]?.authMode
-              ?? "bearer",
-          );
-          const hasSecretInput = hasProviderCredentials(input as Record<string, unknown>)
-            || Boolean(getSecret(`provider:${providerId}`, outDir));
-          if (authMode === "bearer" && !hasSecretInput) {
-            return sendJson(res, 400, { error: "API key is required to verify and add this provider." });
-          }
+        const createOnly = body.createOnly === true;
+        const initialId = String(body.id ?? body.preset ?? "").trim();
+        if (createOnly && initialId && getProvider(initialId, outDir)) {
+          throw new StudioProviderConflictError(initialId);
         }
-        let provider = upsertProvider(
-          {
-            ...(input as unknown as ProviderUpsertInput),
-            updatedBy: session.user,
-          },
-          outDir,
-        );
+        const input = await exchangeCodeForProvider(body, initialId, outDir);
+        const providerId = String((input as Record<string, unknown>).id ?? "").trim();
+        if (createOnly && providerId && getProvider(providerId, outDir)) {
+          throw new StudioProviderConflictError(providerId);
+        }
+        const upsertInput: ProviderUpsertInput = {
+          ...(input as unknown as ProviderUpsertInput),
+          ...(createOnly ? { createOnly: true } : {}),
+          updatedBy: session.user,
+        };
+        const verifyBeforeSave = body.verifyBeforeSave === true;
+        let preDiscoveredModels: DiscoveredModel[] | null = null;
         if (verifyBeforeSave) {
-          const failure = await verifyProviderBeforeSave(provider.id, outDir);
-          if (failure) {
-            if (previousRecord) {
-              // Restore the record and the secret it had before this request.
-              restoreProviderRecord(previousRecord, outDir, session.user);
-              if (previousSecret !== null) putSecret(previousSecretRef, previousSecret, outDir);
-              else deleteSecret(previousSecretRef, outDir);
-            } else {
-              deleteProvider(provider.id, outDir);
+          if (providerId) {
+            const presetKey = String(
+              (input as Record<string, unknown>).preset ?? providerId,
+            ).trim();
+            const authMode = String(
+              ((input as Record<string, unknown>).auth as Record<string, unknown> | undefined)?.mode
+                ?? PROVIDER_PRESETS[presetKey]?.authMode
+                ?? PROVIDER_PRESETS[providerId]?.authMode
+                ?? "bearer",
+            );
+            const hasSecretInput = hasProviderCredentials(input as Record<string, unknown>)
+              || (!createOnly && Boolean(getSecret(`provider:${providerId}`, outDir)));
+            if (authMode === "bearer" && !hasSecretInput) {
+              return sendJson(res, 400, { error: "API key is required to verify and add this provider." });
             }
-            resetLlmSnapshot();
-            return sendJson(res, 400, { error: `Provider verification failed: ${failure}` });
           }
+          validateProviderUpsertInput(upsertInput, outDir);
+          const verification = await verifyProviderBeforeSave(upsertInput, outDir, {
+            ignoreStoredSecret: createOnly,
+          });
+          if (verification.failure) {
+            resetLlmSnapshot();
+            return sendJson(res, 400, { error: `Provider verification failed: ${verification.failure}` });
+          }
+          preDiscoveredModels = verification.models;
+        }
+        let provider = upsertProvider(upsertInput, outDir);
+        if (preDiscoveredModels && preDiscoveredModels.length > 0 && body.models === undefined) {
+          persistDiscoveredModels(provider.id, preDiscoveredModels, outDir);
           provider = getProvider(provider.id, outDir) ?? provider;
         }
-        const discovered = await maybeAutoDiscoverModels(provider.id, body, outDir);
-        if (discovered.models) provider = getProvider(provider.id, outDir) ?? provider;
+        const discovered = verifyBeforeSave
+          ? { models: preDiscoveredModels, error: null }
+          : await maybeAutoDiscoverModels(provider.id, body, outDir);
+        if (!verifyBeforeSave && discovered.models) {
+          provider = getProvider(provider.id, outDir) ?? provider;
+        }
         const vertex = isVertexProvider(provider.id, body, outDir)
           ? await maybeAutoDetectVertexProject(provider.id, body, outDir)
           : null;
@@ -989,21 +1014,66 @@ export async function handleStudioRoute(
           if (!existing && method === "PATCH") {
             return sendJson(res, 404, { error: `Provider '${providerId}' not found` });
           }
-          if (body.revokeSecret === true) {
-            const secretRef = existing?.auth?.secretRef || `provider:${providerId}`;
-            deleteSecret(secretRef, outDir);
-          }
-          const input = await exchangeCodeForProvider(body, providerId, outDir);
-          let updated = upsertProvider(
+          const revokeSecret = body.revokeSecret === true;
+          const verifyBeforeSave = body.verifyBeforeSave === true;
+          validateProviderUpsertInput(
             {
-              ...(input as unknown as ProviderUpsertInput),
+              ...(body as unknown as ProviderUpsertInput),
               id: providerId,
               updatedBy: session.user,
             },
             outDir,
           );
-          const discovered = await maybeAutoDiscoverModels(updated.id, body, outDir);
-          if (discovered.models) updated = getProvider(updated.id, outDir) ?? updated;
+          const input = await exchangeCodeForProvider(body, providerId, outDir);
+          const upsertInput: ProviderUpsertInput = {
+            ...(input as unknown as ProviderUpsertInput),
+            id: providerId,
+            updatedBy: session.user,
+          };
+          let preDiscoveredModels: DiscoveredModel[] | null = null;
+          if (verifyBeforeSave) {
+            const presetKey = String(
+              (input as Record<string, unknown>).preset ?? existing?.preset ?? providerId,
+            ).trim();
+            const authMode = String(
+              ((input as Record<string, unknown>).auth as Record<string, unknown> | undefined)?.mode
+                ?? existing?.auth?.mode
+                ?? PROVIDER_PRESETS[presetKey]?.authMode
+                ?? PROVIDER_PRESETS[providerId]?.authMode
+                ?? "bearer",
+            );
+            const existingSecretRef = existing?.auth?.secretRef || `provider:${providerId}`;
+            const hasSecretInput = hasProviderCredentials(input as Record<string, unknown>)
+              || (!revokeSecret && Boolean(getSecret(existingSecretRef, outDir)));
+            if (authMode === "bearer" && !hasSecretInput) {
+              return sendJson(res, 400, { error: "API key is required to verify and add this provider." });
+            }
+            validateProviderUpsertInput(upsertInput, outDir);
+            const verification = await verifyProviderBeforeSave(upsertInput, outDir, {
+              ignoreStoredSecret: revokeSecret,
+            });
+            if (verification.failure) {
+              resetLlmSnapshot();
+              return sendJson(res, 400, { error: `Provider verification failed: ${verification.failure}` });
+            }
+            preDiscoveredModels = verification.models;
+          }
+          validateProviderUpsertInput(upsertInput, outDir);
+          if (revokeSecret) {
+            const secretRef = existing?.auth?.secretRef || `provider:${providerId}`;
+            deleteSecret(secretRef, outDir);
+          }
+          let updated = upsertProvider(upsertInput, outDir);
+          if (preDiscoveredModels && preDiscoveredModels.length > 0 && body.models === undefined) {
+            persistDiscoveredModels(updated.id, preDiscoveredModels, outDir);
+            updated = getProvider(updated.id, outDir) ?? updated;
+          }
+          const discovered = verifyBeforeSave
+            ? { models: preDiscoveredModels, error: null }
+            : await maybeAutoDiscoverModels(updated.id, body, outDir);
+          if (!verifyBeforeSave && discovered.models) {
+            updated = getProvider(updated.id, outDir) ?? updated;
+          }
           const vertex = isVertexProvider(updated.id, body, outDir)
             ? await maybeAutoDetectVertexProject(updated.id, body, outDir)
             : null;

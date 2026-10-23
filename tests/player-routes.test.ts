@@ -54,6 +54,7 @@ describe('player routes and setup reachability', () => {
   it.each([
     ['/status', 'status.html'],
     ['/meter', 'meter.html'],
+    ['/settings', 'studio.html'],
     ['/new-series', 'new-series.html'],
   ])('serves extensionless %s as %s', async (route, file) => {
     const res = await fetch(`${base}${route}`, { headers: { cookie } });

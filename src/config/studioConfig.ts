@@ -64,7 +64,9 @@ export interface ProviderModelCapabilities {
   image?: boolean;
 }
 
-export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 
 export interface ProviderModelConfig {
   id: string;
@@ -554,6 +556,20 @@ export class StudioRevisionConflictError extends StudioConfigError {
   }
 }
 
+export class StudioProviderConflictError extends StudioConfigError {
+  providerId: string;
+
+  constructor(providerId: string) {
+    super(
+      `Provider '${providerId}' already exists. Choose a unique Provider ID or update the existing connection.`,
+      409,
+      "provider_already_exists",
+    );
+    this.name = "StudioProviderConflictError";
+    this.providerId = providerId;
+  }
+}
+
 export interface ValidateUrlOptions {
   allowPrivateNetwork?: boolean;
 }
@@ -776,6 +792,7 @@ export interface ProviderUpsertInput {
   };
   models?: Array<string | Partial<ProviderModelConfig> & { id: string }>;
   expectedRevision?: number;
+  createOnly?: boolean;
   updatedBy?: string;
 }
 
@@ -1124,20 +1141,37 @@ function normalizeModelEntry(
       tts: Boolean(caps.tts ?? false),
       image: Boolean(caps.image ?? false),
     },
-    thinking: raw.thinking === undefined ? null : raw.thinking,
+    thinking: normalizeThinking(raw.thinking),
     stream: Boolean(raw.stream ?? false),
     reasoningEffort: normalizeReasoningEffort(raw.reasoningEffort),
     contextWindow: typeof raw.contextWindow === "number" ? raw.contextWindow : undefined,
-    maxOutputTokens: typeof raw.maxOutputTokens === "number" ? raw.maxOutputTokens : undefined,
+    maxOutputTokens: normalizeMaxOutputTokens(raw.maxOutputTokens),
     costTier: typeof raw.costTier === "string" ? raw.costTier : "paid",
   };
+}
+
+function normalizeThinking(raw: unknown): boolean | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "boolean") return raw;
+  throw new StudioValidationError(`thinking must be true, false or null (got ${JSON.stringify(raw)})`);
+}
+
+function normalizeMaxOutputTokens(raw: unknown): number | undefined {
+  if (raw === null || raw === undefined || raw === "") return undefined;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isInteger(n) || n < 256 || n > 1_000_000) {
+    throw new StudioValidationError(`maxOutputTokens must be a whole number between 256 and 1000000 (got ${JSON.stringify(raw)})`);
+  }
+  return n;
 }
 
 function normalizeReasoningEffort(raw: unknown): ReasoningEffort | null {
   if (raw === null || raw === undefined || raw === "") return null;
   const value = String(raw).trim().toLowerCase();
-  if (value === "low" || value === "medium" || value === "high" || value === "xhigh") return value;
-  throw new StudioValidationError(`reasoningEffort must be one of low, medium, high, xhigh (got ${JSON.stringify(raw)})`);
+  if ((REASONING_EFFORTS as readonly string[]).includes(value)) return value as ReasoningEffort;
+  throw new StudioValidationError(
+    `reasoningEffort must be one of ${REASONING_EFFORTS.join(", ")} (got ${JSON.stringify(raw)})`,
+  );
 }
 
 function validateProviderId(id: unknown): string {
@@ -1219,10 +1253,25 @@ export function restoreProviderRecord(
   return toProviderView(restored, doc.revision, resolvedOut);
 }
 
-export function upsertProvider(
+export function validateProviderUpsertInput(
   input: ProviderUpsertInput,
   outDir?: OutDirOrOpts,
-): ProviderView {
+): {
+  resolvedOut: string;
+  id: string;
+  presetKey: string | undefined;
+  preset: ProviderPreset | undefined;
+  doc: ProvidersFileDoc;
+  existingIdx: number;
+  existing: ProviderStored | undefined;
+  kind: ProviderCategory | string;
+  protocol: ProviderProtocol;
+  allowPrivateNetwork: boolean;
+  baseUrl: string;
+  authMode: ProviderAuthMode;
+  secretRef: string;
+  models: ProviderModelConfig[];
+} {
   if (!input || typeof input !== "object") {
     throw new StudioValidationError("Provider payload must be an object");
   }
@@ -1240,6 +1289,9 @@ export function upsertProvider(
 
   const existingIdx = doc.providers.findIndex((p) => p.id === id);
   const existing = existingIdx >= 0 ? doc.providers[existingIdx] : undefined;
+  if (input.createOnly && existing) {
+    throw new StudioProviderConflictError(id);
+  }
 
   const kind = input.kind ?? existing?.kind ?? preset?.kind ?? "cloud-api";
   const protocol: ProviderProtocol = input.protocol
@@ -1281,6 +1333,45 @@ export function upsertProvider(
   const models: ProviderModelConfig[] = input.models !== undefined
     ? input.models.map((m) => normalizeModelEntry(m))
     : existing?.models ?? (preset ? structuredClone(preset.defaultModels) : []);
+
+  return {
+    resolvedOut,
+    id,
+    presetKey,
+    preset,
+    doc,
+    existingIdx,
+    existing,
+    kind,
+    protocol,
+    allowPrivateNetwork,
+    baseUrl,
+    authMode,
+    secretRef,
+    models,
+  };
+}
+
+export function upsertProvider(
+  input: ProviderUpsertInput,
+  outDir?: OutDirOrOpts,
+): ProviderView {
+  const {
+    resolvedOut,
+    id,
+    presetKey,
+    preset,
+    doc,
+    existingIdx,
+    existing,
+    kind,
+    protocol,
+    allowPrivateNetwork,
+    baseUrl,
+    authMode,
+    secretRef,
+    models,
+  } = validateProviderUpsertInput(input, outDir);
 
   const rawSecret = input.apiKey
     ?? input.secret
@@ -1453,6 +1544,7 @@ export interface ExchangePkceParams {
   redirect_uri?: string;
   providerId?: string;
   secretRef?: string;
+  persistSecret?: boolean;
   outDir?: string;
   fetchFn?: typeof fetch;
 }
@@ -1562,7 +1654,7 @@ export async function exchangePkceToken(params: ExchangePkceParams): Promise<Exc
   const expiresAt = Math.floor(Date.now() / 1000) + expiresIn;
   const ref = params.secretRef ?? (params.providerId ? `provider:${params.providerId}` : undefined);
   let secretMeta: { hasSecret: boolean; hint: string; updatedAt: number } | undefined;
-  if (ref) {
+  if (ref && params.persistSecret !== false) {
     secretMeta = putSecret(
       ref,
       JSON.stringify({
@@ -2027,6 +2119,8 @@ export interface ProviderProbeOptions {
   timeoutMs?: number;
   /** Persist discovered models into `providers.json` (default true for stored providers). */
   persist?: boolean;
+  /** Ignore any previously stored secret on disk when probing (e.g. createOnly or revokeSecret). */
+  ignoreStoredSecret?: boolean;
 }
 
 function normalizeProbeOpts(opts?: string | ProviderProbeOptions): ProviderProbeOptions {
@@ -2201,8 +2295,9 @@ async function resolveProviderProbeTarget(
       throw new StudioValidationError(`Unknown provider '${idOrInput}'`);
     }
   } else if (idOrInput && typeof idOrInput === "object") {
-    const existing = idOrInput.id ? doc.providers.find((p) => p.id === idOrInput.id.trim()) : undefined;
-    const presetKey = idOrInput.preset || (idOrInput.id && idOrInput.id in PROVIDER_PRESETS ? idOrInput.id : undefined);
+    const trimmedInputId = typeof idOrInput.id === "string" ? idOrInput.id.trim() : "";
+    const existing = trimmedInputId ? doc.providers.find((p) => p.id === trimmedInputId) : undefined;
+    const presetKey = idOrInput.preset || (trimmedInputId && trimmedInputId in PROVIDER_PRESETS ? trimmedInputId : undefined);
     const preset = presetKey ? PROVIDER_PRESETS[presetKey] : undefined;
     const kind = idOrInput.kind ?? existing?.kind ?? preset?.kind ?? "cloud-api";
     const protocol = idOrInput.protocol ?? existing?.protocol ?? preset?.protocol ?? "openai-compatible";
@@ -2210,8 +2305,12 @@ async function resolveProviderProbeTarget(
       ?? existing?.allowPrivateNetwork
       ?? preset?.allowPrivateNetwork
       ?? (kind === "local");
+    const rawBaseUrl = idOrInput.baseUrl
+      ?? existing?.baseUrl
+      ?? preset?.baseUrl
+      ?? (protocol === "vertex-openai" ? PROVIDER_PRESETS["vertex-ai"]!.baseUrl : "");
     const baseUrl = validateProviderUrl(
-      idOrInput.baseUrl ?? existing?.baseUrl ?? preset?.baseUrl ?? "",
+      rawBaseUrl,
       { allowPrivateNetwork },
     );
     inlineSecret = idOrInput.apiKey
@@ -2229,7 +2328,7 @@ async function resolveProviderProbeTarget(
           })
         : undefined);
     stored = {
-      id: idOrInput.id || "probe",
+      id: trimmedInputId || "probe",
       label: idOrInput.label ?? existing?.label ?? preset?.label ?? "probe",
       preset: presetKey,
       kind,
@@ -2240,13 +2339,15 @@ async function resolveProviderProbeTarget(
       headers: idOrInput.headers ?? existing?.headers,
       auth: {
         mode: idOrInput.auth?.mode ?? existing?.auth?.mode ?? preset?.authMode ?? "bearer",
-        secretRef: idOrInput.auth?.secretRef ?? existing?.auth?.secretRef ?? `provider:${idOrInput.id || "probe"}`,
+        secretRef: idOrInput.auth?.secretRef ?? existing?.auth?.secretRef ?? `provider:${trimmedInputId || "probe"}`,
         clientId: idOrInput.auth?.clientId ?? existing?.auth?.clientId ?? preset?.clientId,
         tokenUrl: idOrInput.auth?.tokenUrl ?? existing?.auth?.tokenUrl ?? preset?.tokenUrl,
         projectId: idOrInput.auth?.projectId ?? existing?.auth?.projectId,
         location: idOrInput.auth?.location ?? existing?.auth?.location ?? "global",
       },
-      models: existing?.models ?? preset?.defaultModels ?? [],
+      models: idOrInput.models !== undefined
+        ? idOrInput.models.map((m) => normalizeModelEntry(m))
+        : existing?.models ?? (preset ? structuredClone(preset.defaultModels) : []),
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
@@ -2256,7 +2357,9 @@ async function resolveProviderProbeTarget(
 
   validateProviderUrl(stored.baseUrl, { allowPrivateNetwork: stored.allowPrivateNetwork });
 
-  const rawSecret = inlineSecret ?? getSecret(stored.auth.secretRef || `provider:${stored.id}`, outDir);
+  const rawSecret =
+    inlineSecret
+    ?? (opts.ignoreStoredSecret ? null : getSecret(stored.auth.secretRef || `provider:${stored.id}`, outDir));
   const headers: Record<string, string> = {
     Accept: "application/json",
     ...(stored.headers ?? {}),
@@ -2530,7 +2633,7 @@ function inferDiscoveredCapabilities(
 }
 
 /** Replace the stored provider's model list, keeping operator flags for surviving ids. */
-function persistDiscoveredModels(
+export function persistDiscoveredModels(
   providerId: string,
   models: DiscoveredModel[],
   outDir?: OutDirOrOpts,
@@ -3107,6 +3210,10 @@ export function reconcileStagesWithProviders(outDir?: OutDirOrOpts): void {
         }
         const model = prov.models.find((m) => m.id === modelId && m.enabled !== false);
         if (model) {
+          if (!mapped.includes(raw)) mapped.push(raw);
+          continue;
+        }
+        if (prov.models.length === 0) {
           if (!mapped.includes(raw)) mapped.push(raw);
           continue;
         }
@@ -3710,7 +3817,16 @@ export type OutroHookType = "part2" | "next_chapter" | "new_series" | "custom";
 export interface StudioSettings {
   schemaVersion: number;
   revision: number;
+  autoRetry: { enabled: boolean; maxRetries: number };
   renderQuality: RenderQuality;
+  /**
+   * Lane new intake jobs use when their request omits `renderLane`.
+   * `"inherit"` keeps the global render policy; anything else pins a lane id.
+   * A syntactically valid id is preserved on read even when its node was later
+   * removed or disabled, so the UI can show the stored choice as unavailable.
+   * Writes still reject ids that are not built-in or currently registered.
+   */
+  defaultRenderLane: string;
   defaultOutro: {
     enabled: boolean;
     hookType: OutroHookType;
@@ -3719,16 +3835,89 @@ export interface StudioSettings {
   updatedAt: number | null;
 }
 
+/**
+ * Lane selectors that need no registry entry.
+ *
+ * Deliberately local: `renderPolicy.ts` imports `laneConfig.ts`, which imports
+ * this module, so importing the lane constants here would close a cycle.
+ */
+export const DEFAULT_RENDER_LANE_VALUES = ["inherit", "local", "laptop", "cloud"] as const;
+export const DEFAULT_RENDER_LANE = "inherit";
+
 const OUTRO_HOOK_TYPES: readonly OutroHookType[] = ["part2", "next_chapter", "new_series", "custom"];
 
-function defaultStudioSettings(): StudioSettings {
+/** Built-in settings document; the fallback when no settings file is readable. */
+export function defaultStudioSettings(): StudioSettings {
   return {
     schemaVersion: STUDIO_SCHEMA_VERSION,
     revision: 0,
     renderQuality: "1080p",
+    autoRetry: { enabled: true, maxRetries: 3 },
+    defaultRenderLane: DEFAULT_RENDER_LANE,
     defaultOutro: { enabled: false, hookType: "part2", customNote: "" },
     updatedAt: null,
   };
+}
+
+/**
+ * Canonical lane id for `defaultRenderLane`, or null when the value is unknown.
+ * Accepts the built-in selectors and nodes registered in `outDir`; matching is
+ * case-insensitive and returns the registered spelling.
+ */
+export function resolveDefaultRenderLaneId(value: string, outDir?: OutDirOrOpts): string | null {
+  const wanted = value.trim().toLowerCase();
+  if (!wanted) return null;
+  if ((DEFAULT_RENDER_LANE_VALUES as readonly string[]).includes(wanted)) return wanted;
+  let nodes: RenderNodeConfigView[] = [];
+  try {
+    nodes = listRenderNodesConfig(outDir);
+  } catch {
+    return null;
+  }
+  const node = nodes.find((item) => item.id.toLowerCase() === wanted);
+  return node ? node.id : null;
+}
+
+/** Lane id grammar: the same shape a provider or node id may take. */
+const RENDER_LANE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/**
+ * Persisted-lane reader. A syntactically valid id is preserved even when its
+ * node was deleted or disabled, so the UI can show the stored (unavailable)
+ * choice instead of silently losing it; only absent or malformed values fall
+ * back. Availability is checked where the lane is actually used.
+ */
+function readDefaultRenderLane(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  if (!trimmed) return fallback;
+  if ((DEFAULT_RENDER_LANE_VALUES as readonly string[]).includes(trimmed.toLowerCase())) {
+    return trimmed.toLowerCase();
+  }
+  if (!RENDER_LANE_ID_RE.test(trimmed)) return fallback;
+  return trimmed;
+}
+
+function normalizeDefaultRenderLane(
+  value: unknown,
+  fallback: string,
+  outDir?: OutDirOrOpts,
+): string {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "string") {
+    throw new StudioValidationError(
+      `defaultRenderLane must be a string lane id (got ${JSON.stringify(value)})`,
+    );
+  }
+  if (value.trim() === "") return fallback;
+  const resolved = resolveDefaultRenderLaneId(value, outDir);
+  if (!resolved) {
+    throw new StudioValidationError(
+      `defaultRenderLane must be one of ${DEFAULT_RENDER_LANE_VALUES.join(", ")} ` +
+        `or a registered render node (got ${JSON.stringify(value)})`,
+    );
+  }
+  return resolved;
 }
 
 function normalizeRenderQuality(value: unknown, fallback: RenderQuality): RenderQuality {
@@ -3751,6 +3940,35 @@ function normalizeHookType(value: unknown, fallback: OutroHookType): OutroHookTy
   return found;
 }
 
+function readAutoRetry(raw: unknown): StudioSettings["autoRetry"] {
+  const value = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? raw as Record<string, unknown> : {};
+  return {
+    enabled: typeof value.enabled === "boolean" ? value.enabled : true,
+    maxRetries: typeof value.maxRetries === "number" && Number.isInteger(value.maxRetries)
+      && value.maxRetries >= 1 && value.maxRetries <= 5 ? value.maxRetries : 3,
+  };
+}
+
+function validateAutoRetry(raw: unknown, fallback: StudioSettings["autoRetry"]): StudioSettings["autoRetry"] {
+  if (raw === undefined) return { ...fallback };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new StudioValidationError("autoRetry must be an object");
+  }
+  const value = raw as Record<string, unknown>;
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+    throw new StudioValidationError("autoRetry.enabled must be a boolean");
+  }
+  if (value.maxRetries !== undefined && (typeof value.maxRetries !== "number"
+    || !Number.isInteger(value.maxRetries) || value.maxRetries < 1 || value.maxRetries > 5)) {
+    throw new StudioValidationError("autoRetry.maxRetries must be an integer from 1 to 5");
+  }
+  return {
+    enabled: value.enabled === undefined ? fallback.enabled : value.enabled as boolean,
+    maxRetries: value.maxRetries === undefined ? fallback.maxRetries : value.maxRetries as number,
+  };
+}
+
 export function getStudioSettings(outDir?: OutDirOrOpts): StudioSettings {
   const filePath = configFilePath(SETTINGS_FILENAME, outDir);
   const defaults = defaultStudioSettings();
@@ -3759,7 +3977,9 @@ export function getStudioSettings(outDir?: OutDirOrOpts): StudioSettings {
     if (!st.isSymbolicLink() && st.isFile()) {
       const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as {
         revision?: number;
+        autoRetry?: unknown;
         renderQuality?: unknown;
+        defaultRenderLane?: unknown;
         updatedAt?: number;
         defaultOutro?: { enabled?: unknown; hookType?: unknown; customNote?: unknown };
       };
@@ -3767,7 +3987,12 @@ export function getStudioSettings(outDir?: OutDirOrOpts): StudioSettings {
       return {
         schemaVersion: STUDIO_SCHEMA_VERSION,
         revision: typeof parsed.revision === "number" && Number.isInteger(parsed.revision) ? parsed.revision : 0,
+        autoRetry: readAutoRetry(parsed.autoRetry),
         renderQuality: normalizeRenderQuality(parsed.renderQuality, defaults.renderQuality),
+        // A syntactically valid lane whose node was later removed or disabled is
+        // preserved so the UI can show it as unavailable; only absent/malformed
+        // values fall back.
+        defaultRenderLane: readDefaultRenderLane(parsed.defaultRenderLane, defaults.defaultRenderLane),
         defaultOutro: {
           enabled: outro.enabled === undefined ? defaults.defaultOutro.enabled : Boolean(outro.enabled),
           hookType: normalizeHookType(outro.hookType, defaults.defaultOutro.hookType),
@@ -3784,7 +4009,7 @@ export function getStudioSettings(outDir?: OutDirOrOpts): StudioSettings {
 }
 
 export function putStudioSettings(
-  input: Partial<StudioSettings> & { updatedBy?: string; expectedRevision?: number },
+  input: Omit<Partial<StudioSettings>, "autoRetry"> & { autoRetry?: Partial<StudioSettings["autoRetry"]>; updatedBy?: string; expectedRevision?: number },
   outDir?: OutDirOrOpts,
 ): StudioSettings {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -3807,7 +4032,13 @@ export function putStudioSettings(
   const next: StudioSettings = {
     schemaVersion: STUDIO_SCHEMA_VERSION,
     revision: current.revision + 1,
+    autoRetry: validateAutoRetry(input.autoRetry, current.autoRetry),
     renderQuality: normalizeRenderQuality(input.renderQuality, current.renderQuality),
+    defaultRenderLane: normalizeDefaultRenderLane(
+      input.defaultRenderLane,
+      current.defaultRenderLane,
+      resolvedOut,
+    ),
     defaultOutro: {
       enabled: nextOutro.enabled === undefined ? current.defaultOutro.enabled : Boolean(nextOutro.enabled),
       hookType: normalizeHookType(nextOutro.hookType, current.defaultOutro.hookType),

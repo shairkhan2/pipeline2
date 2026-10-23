@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { motion, useReducedMotion } from "motion/react";
-import { Check, Eye, EyeOff, LoaderCircle } from "lucide-react";
+import { Check, Eye, EyeOff, Info, KeyRound, LoaderCircle, Rocket, Server, UserRound } from "lucide-react";
 
 import {
   api,
@@ -27,8 +27,16 @@ import {
   maxSlotsForKind,
   NODE_ID_RE,
 } from "@/lib/renderLanes";
+import {
+  nextAvailableProviderId,
+  nextAvailableProviderLabel,
+} from "@/lib/providerConnections";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ErrorNotice } from "@/components/ui/notice";
+import { Tooltip, TooltipProvider } from "@/components/ui/tooltip";
+import { describeError, type ErrorInfo } from "@/lib/errors";
+
 import { CopyButton } from "@/components/ui/copy-button";
 import {
   Dropzone,
@@ -51,11 +59,19 @@ import {
   StepperTrigger,
 } from "@/components/ui/stepper";
 
+function setupError(error: unknown, fallback: string): ErrorInfo {
+  return describeError(error, fallback);
+}
+
+function requestInfo(error: string | ErrorInfo): ErrorInfo {
+  return typeof error === "string" ? describeError(error) : error;
+}
+
 const STEPS = [
   { n: 1, title: "Admin account" },
   { n: 2, title: "AI provider" },
   { n: 3, title: "Render lanes" },
-  { n: 4, title: "Launch studio" },
+  { n: 4, title: "Ready" },
 ] as const;
 
 const COMMON = new Set([
@@ -189,6 +205,7 @@ function selectVisionAndWriterRefs(
   providerId: string,
   presets?: Record<string, ProviderPreset>,
   allowFallback = true,
+  presetId?: string,
 ): { visionRef: string; writerRef: string } {
   const valid = (rawModels || []).filter((m) => m && typeof m.id === "string" && m.id.trim());
   const nonTts = valid.filter((m) => !isTtsOnlyModel(m));
@@ -200,7 +217,8 @@ function selectVisionAndWriterRefs(
   const writerObj =
     pool.find((m) => m.capabilities?.writer !== false) ??
     pool[0];
-  const fallbackModelId = allowFallback ? defaultDeviceModelFor(providerId, presets) : "";
+  const fallbackLookupId = presetId && presets?.[presetId] ? presetId : presetId || providerId;
+  const fallbackModelId = allowFallback ? defaultDeviceModelFor(fallbackLookupId, presets) : "";
   const cleanVisionId = visionObj ? stripProviderPrefixUi(visionObj.id, providerId) : fallbackModelId;
   const cleanWriterId = writerObj ? stripProviderPrefixUi(writerObj.id, providerId) : fallbackModelId;
   return {
@@ -385,28 +403,28 @@ function SetupConnectedAccountBanner({
         : "Verified");
   const detectedProjects = (projects && projects.length > 0 ? projects : provider.auth.projects) || [];
   return (
-    <div className="mt-3 flex flex-col gap-2 rounded-xl border border-[#5eead4]/40 bg-[#5eead4]/10 px-3.5 py-2.5 text-xs">
+    <div className="mt-3 flex flex-col gap-2 rounded-2xl bg-info-soft px-3.5 py-2.5 text-xs">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="inline-flex items-center gap-1 rounded-full bg-[#5eead4]/20 px-2 py-0.5 font-mono text-[11px] font-semibold text-[#5eead4]">
+          <span className="inline-flex items-center gap-1 rounded-full bg-info-soft px-2 py-0.5 font-mono text-[12px] font-semibold text-info">
             <Check className="size-3" aria-hidden /> Connected
           </span>
-          <strong className="break-all font-medium text-[#f2efe9]">{primaryIdentity}</strong>
+          <strong className="break-all font-medium text-foreground">{primaryIdentity}</strong>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="rounded-md border border-[#5eead4]/30 bg-[#101113]/60 px-2 py-0.5 font-mono text-[11px] text-[#5eead4]">
+          <span className="rounded-md border border-info/40 bg-background/60 px-2 py-0.5 font-mono text-[12px] text-info">
             {planOrProjectPill}
           </span>
           {provider.auth.accountPlan && provider.auth.projectId ? (
-            <span className="rounded-md border border-[#5eead4]/30 bg-[#101113]/60 px-2 py-0.5 font-mono text-[11px] text-[#5eead4]">
+            <span className="rounded-md border border-info/40 bg-background/60 px-2 py-0.5 font-mono text-[12px] text-info">
               Project: {provider.auth.projectId}
             </span>
           ) : null}
         </div>
       </div>
       {detectedProjects.length > 1 && onSelectProject ? (
-        <div className="flex flex-wrap items-center gap-2 border-t border-[#5eead4]/20 pt-2">
-          <label htmlFor={`setup-gcp-proj-${provider.id}`} className="font-mono text-[11px] text-[#a2a19f]">
+        <div className="flex flex-wrap items-center gap-2 border-t border-info/30 pt-2">
+          <label htmlFor={`setup-gcp-proj-${provider.id}`} className="text-xs text-muted-foreground">
             GCP Project
           </label>
           <select
@@ -434,6 +452,7 @@ export function SetupPage() {
   const [gate, setGate] = useState<"loading" | "open" | "closed">("loading");
   const [state, setState] = useState<SetupState | null>(null);
   const mountedStepRef = useRef(false);
+  const presetPickerRef = useRef<HTMLDetailsElement | null>(null);
 
   const [token, setToken] = useState("");
   const [showToken, setShowToken] = useState(false);
@@ -441,10 +460,12 @@ export function SetupPage() {
   const [password, setPassword] = useState("");
   const [tokenState, setTokenState] = useState<"idle" | "error" | "verified">("idle");
   const [shake, setShake] = useState(false);
-  const [tokenError, setTokenError] = useState("");
+  const [tokenError, setTokenError] = useState<string | ErrorInfo>("");
   const [verifying, setVerifying] = useState(false);
 
   const [picked, setPicked] = useState<string>("openrouter");
+  const [activeProviderId, setActiveProviderId] = useState<string | null>(null);
+  const testSeqRef = useRef(0);
   const [apiKey, setApiKey] = useState("");
   const [customUrl, setCustomUrl] = useState("https://");
   const [loginUrl, setLoginUrl] = useState("");
@@ -466,8 +487,8 @@ export function SetupPage() {
   const [vertexOauthToken, setVertexOauthToken] = useState("");
   const [testState, setTestState] = useState<TestState>("untested");
   const [elapsed, setElapsed] = useState(0);
-  const [testDetail, setTestDetail] = useState("");
-  const [routingError, setRoutingError] = useState("");
+  const [testDetail, setTestDetail] = useState<string | ErrorInfo>("");
+  const [routingError, setRoutingError] = useState<string | ErrorInfo>("");
   const [routingSaved, setRoutingSaved] = useState(false);
   const [backendPresets, setBackendPresets] = useState<Record<string, ProviderPreset>>({});
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -477,7 +498,7 @@ export function SetupPage() {
 
   const [nodes, setNodes] = useState<RenderNode[]>([]);
   const [laneNote, setLaneNote] = useState("");
-  const [laneError, setLaneError] = useState("");
+  const [laneError, setLaneError] = useState<string | ErrorInfo>("");
   const [probing, setProbing] = useState(false);
   const [quickLaneKind, setQuickLaneKind] = useState<Exclude<RenderNodeKind, "local"> | null>(null);
   const [nodeId, setNodeId] = useState("");
@@ -492,10 +513,26 @@ export function SetupPage() {
   const [savingNode, setSavingNode] = useState(false);
 
   const [launching, setLaunching] = useState(false);
-  const [launchError, setLaunchError] = useState("");
+  const [launchError, setLaunchError] = useState<string | ErrorInfo>("");
 
   const quickPresets = useMemo(() => buildQuickPresets(backendPresets), [backendPresets]);
   const preset = quickPresets.find((item) => item.id === picked) ?? quickPresets[0]!;
+  const matchingProviders = useMemo(
+    () => providers.filter((p) => (p.preset || p.id) === preset.preset || p.id === preset.preset),
+    [providers, preset.preset],
+  );
+  const activeProvider = useMemo(
+    () => (activeProviderId ? providers.find((p) => p.id === activeProviderId) ?? null : null),
+    [providers, activeProviderId],
+  );
+  const isMultiInstanceMode = preset.mode === "custom" || preset.mode === "key";
+  const draftProviderId = useMemo(
+    () =>
+      isMultiInstanceMode
+        ? activeProviderId || nextAvailableProviderId(preset.preset, providers)
+        : activeProviderId || preset.preset,
+    [isMultiInstanceMode, activeProviderId, preset.preset, providers],
+  );
 
   useEffect(() => {
     let stop = false;
@@ -605,15 +642,15 @@ export function SetupPage() {
       setReached((n) => Math.max(n, 2));
       setStep(2);
     } catch (error) {
-      const message = isApiError(error) ? error.message : "Could not verify the setup token.";
-      if (isApiError(error) && (error.status === 403 || /token/i.test(message))) failToken(message);
+      const message = setupError(error, "Could not verify the setup token.");
+      if (isApiError(error) && (error.status === 403 || /token/i.test(message.detail))) failToken(message);
       else setTokenError(message);
     } finally {
       setVerifying(false);
     }
   }
 
-  function failToken(message: string) {
+  function failToken(message: string | ErrorInfo) {
     setTokenState("error");
     setTokenError(message);
     if (!reduce) {
@@ -623,9 +660,14 @@ export function SetupPage() {
   }
 
   function selectPreset(id: string) {
+    testSeqRef.current += 1;
     setPicked(id);
+    setActiveProviderId(null);
     setTestState("untested");
     setTestDetail("");
+    setLatency(null);
+    setVisionModel("");
+    setWriterModel("");
     setRoutingError("");
     setRoutingSaved(false);
     setApiKey("");
@@ -641,6 +683,20 @@ export function SetupPage() {
     setVertexOauthToken("");
     setVertexProjectId("");
     setVertexProjects([]);
+  }
+
+  function selectConnectionInstance(prov: ProviderView | null) {
+    testSeqRef.current += 1;
+    setActiveProviderId(prov ? prov.id : null);
+    if (preset.mode === "custom") setCustomUrl(prov?.baseUrl || "https://");
+    setApiKey("");
+    setTestState("untested");
+    setTestDetail("");
+    setLatency(null);
+    setVisionModel("");
+    setWriterModel("");
+    setRoutingError("");
+    setRoutingSaved(false);
   }
 
   function onPresetKeyDown(event: KeyboardEvent<HTMLDivElement>) {
@@ -721,7 +777,7 @@ export function SetupPage() {
           if (!cancelled) {
             setDevicePolling(false);
             setTestState("fail");
-            setTestDetail(isApiError(error) ? error.message : `${deviceProviderTitleFor(targetProviderId)} device authorization failed.`);
+            setTestDetail(setupError(error, `${deviceProviderTitleFor(targetProviderId)} device authorization failed.`));
           }
         })
         .finally(() => {
@@ -762,7 +818,7 @@ export function SetupPage() {
     } catch (error) {
       popup?.close();
       setTestState("fail");
-      setTestDetail(isApiError(error) ? error.message : error instanceof Error ? error.message : "Could not start OAuth login.");
+      setTestDetail(setupError(error, "Could not start OAuth login."));
     }
   }
 
@@ -805,7 +861,7 @@ export function SetupPage() {
       setTestDetail(routed ? "Subscription connected · Starter routing saved" : "Subscription connected");
     } catch (error) {
       setTestState("fail");
-      setTestDetail(isApiError(error) ? error.message : error instanceof Error ? error.message : "OAuth exchange failed.");
+      setTestDetail(setupError(error, "OAuth exchange failed."));
     }
   }
 
@@ -851,7 +907,7 @@ export function SetupPage() {
     } catch (error) {
       popup?.close();
       setTestState("fail");
-      setTestDetail(isApiError(error) ? error.message : error instanceof Error ? error.message : "Could not start Google OAuth login.");
+      setTestDetail(setupError(error, "Could not start Google OAuth login."));
     }
   }
 
@@ -928,7 +984,7 @@ export function SetupPage() {
       );
     } catch (error) {
       setTestState("fail");
-      setTestDetail(isApiError(error) ? error.message : error instanceof Error ? error.message : "Vertex OAuth exchange failed.");
+      setTestDetail(setupError(error, "Vertex OAuth exchange failed."));
     }
   }
 
@@ -1009,31 +1065,48 @@ export function SetupPage() {
       }
     } catch (error) {
       setTestState("fail");
-      setTestDetail(isApiError(error) ? error.message : error instanceof Error ? error.message : "Device verification failed.");
+      setTestDetail(setupError(error, "Device verification failed."));
     } finally {
       pollInFlightRef.current = false;
     }
   }
 
   async function testProvider() {
-    const id = preset.preset;
-    const hasStoredSecret = providers.some((p) => p.id === id && p.auth.hasSecret);
+    const isEditingExisting = Boolean(
+      activeProviderId && providers.some((p) => p.id === activeProviderId),
+    );
+    const targetId = isMultiInstanceMode
+      ? isEditingExisting
+        ? activeProviderId!
+        : nextAvailableProviderId(preset.preset, providers)
+      : activeProviderId || preset.preset;
+    const hasStoredSecret = isMultiInstanceMode
+      ? Boolean(isEditingExisting && providers.some((p) => p.id === targetId && p.auth.hasSecret))
+      : providers.some((p) => p.id === targetId && p.auth.hasSecret);
     if ((preset.mode === "key" || preset.mode === "custom") && !hasStoredSecret && !apiKey.trim()) {
       setTestState("fail");
       setTestDetail("Enter an API key to verify and add this provider.");
       return;
     }
+    const seq = ++testSeqRef.current;
     setTestState("testing");
     setElapsed(0);
     setTestDetail("");
+    setLatency(null);
     setRoutingError("");
+    setRoutingSaved(false);
     setVisionModel("");
     setWriterModel("");
     try {
+      const resolvedLabel = isEditingExisting
+        ? activeProvider?.label || preset.label
+        : isMultiInstanceMode
+          ? nextAvailableProviderLabel(preset.label, targetId, preset.preset, providers)
+          : preset.label;
       const body: Parameters<typeof api.studio.createProvider>[0] = {
-        id,
+        id: targetId,
         preset: preset.preset,
-        label: preset.label,
+        label: resolvedLabel,
         allowPrivateNetwork: preset.mode === "local",
       };
       if (SUBSCRIPTION_PROVIDER_IDS.has(preset.preset)) {
@@ -1053,7 +1126,7 @@ export function SetupPage() {
             await exchangeVertexOAuth();
             return;
           }
-          const existingVertex = providers.some((p) => p.id === id && p.auth.hasSecret);
+          const existingVertex = providers.some((p) => p.id === targetId && p.auth.hasSecret);
           if (!existingVertex) {
             throw new Error("Sign in with Google OAuth and paste your authorization code or token first.");
           }
@@ -1066,7 +1139,7 @@ export function SetupPage() {
             location: vertexLocation || "global",
           };
         } else {
-          const existingVertex = providers.some((p) => p.id === id && p.auth.hasSecret);
+          const existingVertex = providers.some((p) => p.id === targetId && p.auth.hasSecret);
           if (!vertexSa && !existingVertex) {
             throw new Error("Drop a Vertex service account .json key first.");
           }
@@ -1084,22 +1157,36 @@ export function SetupPage() {
       if (preset.mode === "key" || preset.mode === "custom") {
         body.verifyBeforeSave = true;
       }
-      const created = await api.studio.createProvider(body);
+      const saved =
+        isMultiInstanceMode && isEditingExisting
+          ? await api.studio.updateProvider(targetId, body)
+          : await api.studio.createProvider({
+              ...body,
+              ...(isMultiInstanceMode ? { createOnly: true } : {}),
+            });
+      if (testSeqRef.current !== seq) return;
+      const savedId = saved.provider?.id || targetId;
+      setActiveProviderId(savedId);
+      if (Array.isArray(saved.providers)) {
+        setProviders(saved.providers);
+      }
       setApiKey("");
       setVertexSa(null);
-      const probe = await api.studio.testProvider(id);
-      const discovered = await api.studio.discoverModels(id, true).catch(() => null);
+      const probe = await api.studio.testProvider(savedId);
+      const discovered = await api.studio.discoverModels(savedId, true).catch(() => null);
+      if (testSeqRef.current !== seq) return;
       const models =
         discovered?.models?.length
           ? discovered.models
           : probe.models?.length
             ? probe.models
-            : created.provider?.models || [];
+            : saved.provider?.models || [];
       const { visionRef: nextVision, writerRef: nextWriter } = selectVisionAndWriterRefs(
         models,
-        id,
+        savedId,
         backendPresets,
         preset.mode === "vertex",
+        preset.preset,
       );
       setVisionModel(nextVision);
       setWriterModel(nextWriter);
@@ -1111,14 +1198,17 @@ export function SetupPage() {
           : probe.error || "Connection failed",
       );
       const fresh = await api.studio.providers();
+      if (testSeqRef.current !== seq) return;
       setProviders(fresh.providers);
       if (fresh.presets) setBackendPresets(fresh.presets);
       if (probe.ok || nextVision || nextWriter) {
         await acceptRouting(nextVision, nextWriter, true);
+        if (testSeqRef.current !== seq) return;
       }
     } catch (error) {
+      if (testSeqRef.current !== seq) return;
       setTestState("fail");
-      setTestDetail(isApiError(error) ? error.message : error instanceof Error ? error.message : "Connection failed");
+      setTestDetail(setupError(error, "Connection failed"));
     }
   }
 
@@ -1126,12 +1216,13 @@ export function SetupPage() {
     let resolvedVision = overrideVision ?? visionModel;
     let resolvedWriter = overrideWriter ?? writerModel;
     if (!resolvedVision && !resolvedWriter && providers.length > 0) {
-      const firstProvider = providers[0]!;
+      const targetProvider = activeProvider || providers[0]!;
       const pickedRefs = selectVisionAndWriterRefs(
-        firstProvider.models,
-        firstProvider.id,
+        targetProvider.models,
+        targetProvider.id,
         backendPresets,
         true,
+        targetProvider.preset,
       );
       resolvedVision = pickedRefs.visionRef;
       resolvedWriter = pickedRefs.writerRef;
@@ -1196,7 +1287,7 @@ export function SetupPage() {
       if (!silent) setTestDetail("Starter routing saved.");
       return true;
     } catch (error) {
-      const msg = isApiError(error) ? error.message : error instanceof Error ? error.message : "Could not save starter routing.";
+      const msg = setupError(error, "Could not save starter routing.");
       setRoutingError(msg);
       setRoutingSaved(false);
       return false;
@@ -1225,7 +1316,7 @@ export function SetupPage() {
       await api.setup.complete();
       window.location.assign("/new-series.html");
     } catch (error) {
-      setLaunchError(isApiError(error) ? error.message : "Could not complete setup.");
+      setLaunchError(setupError(error, "Could not complete setup."));
       setLaunching(false);
     }
   }
@@ -1245,7 +1336,7 @@ export function SetupPage() {
       setNodes(created.nodes);
       setLaneNote("Local lane is on.");
     } catch (error) {
-      setLaneError(isApiError(error) ? error.message : "Could not add the local lane.");
+      setLaneError(setupError(error, "Could not add the local lane."));
     }
   }
 
@@ -1257,7 +1348,7 @@ export function SetupPage() {
       const probe = await api.studio.testNode("local");
       setLaneNote(probe.ok ? `Local probe ok · ${probe.reason}` : probe.reason);
     } catch (error) {
-      setLaneError(isApiError(error) ? error.message : "Probe failed");
+      setLaneError(setupError(error, "Probe failed"));
     } finally {
       setProbing(false);
     }
@@ -1322,7 +1413,7 @@ export function SetupPage() {
       setQuickLaneKind(null);
       setLaneNote(`Added render node ${trimmedId}.`);
     } catch (error) {
-      setLaneError(isApiError(error) ? error.message : "Could not save render node.");
+      setLaneError(setupError(error, "Could not save render node."));
     } finally {
       setSavingNode(false);
     }
@@ -1342,7 +1433,7 @@ export function SetupPage() {
       await api.setup.complete();
       window.location.assign("/studio.html");
     } catch (error) {
-      setLaunchError(isApiError(error) ? error.message : "Could not close setup.");
+      setLaunchError(setupError(error, "Could not close setup."));
       setLaunching(false);
     }
   }
@@ -1361,36 +1452,32 @@ export function SetupPage() {
 
   if (gate !== "open") {
     return (
-      <main className="grid min-h-dvh place-items-center bg-[#101113] text-[#a2a19f]">
-        <p className="font-serif text-2xl text-[#f2efe9]">{gate === "closed" ? "Setup is closed." : "Checking the booth…"}</p>
+      <main className="grid min-h-dvh place-items-center bg-background text-muted-foreground">
+        <p className="text-2xl font-semibold tracking-[-0.015em] text-foreground">{gate === "closed" ? "Setup is closed." : "Checking the booth…"}</p>
       </main>
     );
   }
 
   return (
-    <main className="min-h-dvh bg-[#101113] text-[#f2efe9]" style={{ fontFamily: '"DM Sans", system-ui, sans-serif' }}>
+    <TooltipProvider><main className="min-h-dvh bg-background font-sans text-foreground [&_[role=alert]_button]:min-h-11">
       <style>{SETUP_CSS}</style>
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 py-8 sm:px-6">
         <header className="flex items-end justify-between gap-4">
           <div className="flex items-center gap-3">
-            <span className="grid size-10 place-items-center rounded-xl bg-[#f18b6e] text-[#201713]" aria-hidden>
+            <span className="grid size-10 place-items-center rounded-xl bg-primary text-primary-foreground" aria-hidden>
               <svg viewBox="0 0 24 24" className="size-4 fill-current"><path d="M8 5.5v13l11-6.5-11-6.5z" /></svg>
             </span>
             <div>
-              <p className="text-[10px] tracking-[0.18em] text-[#a2a19f] uppercase">Setup</p>
-              <h1 className="font-serif text-3xl leading-none tracking-tight">Screening Room Studio</h1>
+              <h1 className="text-3xl font-semibold leading-tight tracking-tight">Screening Room</h1>
             </div>
           </div>
-          <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#f2efe9]">
-            Step {step} of 4
-          </Badge>
         </header>
 
         <Stepper value={step} onValueChange={go} aria-label="First-run setup steps">
           {STEPS.map((item, index) => (
             <StepperItem key={item.n} step={item.n} disabled={item.n > reached}>
               <StepperTrigger className="min-h-11">
-                <StepperIndicator>{step > item.n ? undefined : String(item.n).padStart(2, "0")}</StepperIndicator>
+                <StepperIndicator>{step > item.n ? undefined : item.n === 1 ? <UserRound className="size-4" aria-hidden /> : item.n === 2 ? <KeyRound className="size-4" aria-hidden /> : item.n === 3 ? <Server className="size-4" aria-hidden /> : <Rocket className="size-4" aria-hidden />}</StepperIndicator>
                 <StepperTitle>{item.title}</StepperTitle>
               </StepperTrigger>
               {index < STEPS.length - 1 ? <StepperSeparator /> : null}
@@ -1403,19 +1490,16 @@ export function SetupPage() {
           initial={reduce ? false : { opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.28 }}
-          className="rounded-2xl border border-[#2b2c30] bg-[#17181a] p-5 sm:p-6"
+          className="rounded-[22px] bg-card p-5 sm:p-6"
           aria-labelledby={`setup-head-${step}`}
         >
           {step === 1 ? (
             <div className="flex flex-col gap-5">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <h2 id="setup-head-1" tabIndex={-1} className="font-serif text-2xl outline-none">
-                  1. Admin account
+                <h2 id="setup-head-1" tabIndex={-1} className="text-2xl font-semibold tracking-[-0.015em] outline-none">
+                  Admin account
                 </h2>
-                <div id="tokenHint" className="flex flex-wrap items-center gap-1.5 text-xs">
-                  <code className="rounded-md border border-[#2b2c30] bg-[#101113] px-2 py-0.5 font-mono text-[#5eead4]">docker logs manhwa-backend</code>
-                  <code className="rounded-md border border-[#2b2c30] bg-[#101113] px-2 py-0.5 font-mono text-[#5eead4]">MANHWA_SETUP_TOKEN</code>
-                </div>
+                <Tooltip label="Find MANHWA_SETUP_TOKEN in docker logs manhwa-backend." side="top"><button id="tokenHint" type="button" className="grid size-11 place-items-center text-muted-foreground" aria-label="Setup token help"><Info className="size-[18px]" strokeWidth={1.75} aria-hidden /></button></Tooltip>
               </div>
 
               <div className={`token-box ${shake ? "is-shake" : ""} ${tokenState === "error" ? "is-error" : ""} ${tokenState === "verified" ? "is-verified" : ""}`} data-state={tokenState}>
@@ -1468,21 +1552,21 @@ export function SetupPage() {
                       minLength={10}
                       placeholder="10+ characters"
                     />
-                    <PasswordInputStrength />
+                    <PasswordInputStrength className="[&_span]:text-xs [&_span]:normal-case" />
                   </PasswordInput>
-                  <ul className="mt-1 grid grid-cols-2 gap-1 text-[11px] text-[#a2a19f]">
+                  <ul className="mt-1 grid grid-cols-2 gap-1 text-[12px] text-muted-foreground">
                     {rules.map((rule) => (
-                      <li key={rule.id} className={rule.ok ? "text-[#aed1a8]" : ""}>
+                      <li key={rule.id} className={rule.ok ? "text-success" : ""}>
                         {rule.ok ? "✓" : "○"} {rule.label}
                       </li>
                     ))}
                   </ul>
                 </div>
               </div>
-              {tokenError ? <p className="text-sm text-[#f0a096]" role="alert">{tokenError}</p> : null}
+              {tokenError ? <ErrorNotice info={requestInfo(tokenError)} /> : null}
               <div className="flex justify-end gap-2">
                 <Button type="button" className="min-h-11" disabled={verifying} onClick={() => void verifyToken()}>
-                  {verifying ? "Verifying…" : tokenState === "verified" ? "Continue" : "Verify & Continue"}
+                  {verifying ? "Verifying…" : tokenState === "verified" ? "Continue" : "Verify & continue"}
                 </Button>
               </div>
             </div>
@@ -1492,18 +1576,20 @@ export function SetupPage() {
             <div className="flex flex-col gap-5">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <h2 id="setup-head-2" tabIndex={-1} className="font-serif text-2xl outline-none">
-                    2. AI provider
+                  <h2 id="setup-head-2" tabIndex={-1} className="text-2xl font-semibold tracking-[-0.015em] outline-none">
+                    AI provider
                   </h2>
-                  <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#a2a19f]">Vision + Writer</Badge>
+                  <Badge variant="secondary" className="text-muted-foreground">Vision &amp; writing</Badge>
                 </div>
                 <span className={`test-pill is-${testState}`} data-state={testState}>
                   {testState === "testing" ? <LoaderCircle className="size-3 animate-spin" /> : null}
-                  {testState === "testing" ? `Testing · ${elapsed.toFixed(1)}s` : testState === "ok" ? testDetail : testState === "fail" ? "Failed" : "Not tested"}
+                  {testState === "testing" ? `Testing · ${elapsed.toFixed(1)}s` : testState === "ok" ? typeof testDetail === "string" ? testDetail : "Connected" : testState === "fail" ? "Failed" : "Not tested"}
                 </span>
               </div>
+              <details ref={presetPickerRef} className="rounded-2xl bg-muted">
+                <summary className="flex min-h-14 cursor-pointer items-center justify-between gap-3 px-4 text-sm"><span>Provider</span><span className="truncate text-muted-foreground">{preset.id === "subscription-bridge" ? "Subscription bridge" : preset.label}</span></summary>
               <div
-                className="grid grid-cols-2 gap-2 sm:grid-cols-5"
+                className="sr-group overflow-hidden"
                 role="radiogroup"
                 aria-label="Choose provider preset"
                 onKeyDown={onPresetKeyDown}
@@ -1511,7 +1597,9 @@ export function SetupPage() {
                 {quickPresets.map((item) => {
                   const on = item.id === picked;
                   const live = providers.some(
-                    (provider) => provider.id === item.preset && (provider.auth.hasSecret || item.mode === "local"),
+                    (provider) =>
+                      ((provider.preset || provider.id) === item.preset || provider.id === item.preset) &&
+                      (provider.auth.hasSecret || item.mode === "local"),
                   );
                   return (
                     <button
@@ -1519,23 +1607,57 @@ export function SetupPage() {
                       type="button"
                       role="radio"
                       aria-checked={on}
+                      disabled={testState === "testing"}
                       tabIndex={on ? 0 : -1}
-                      className={`preset-tile ${on ? "is-on" : ""}`}
-                      onClick={() => selectPreset(item.id)}
+                      className={`sr-row min-h-12 w-full text-left ${on ? "bg-raised" : ""}`}
+                      onClick={() => { selectPreset(item.id); presetPickerRef.current?.removeAttribute("open"); presetPickerRef.current?.querySelector<HTMLElement>("summary")?.focus(); }}
                     >
-                      <span className="font-medium">{item.label}</span>
-                      <span className="text-[11px] text-[#a2a19f]">{live ? "Connected" : item.hint}</span>
+                      <KeyRound className="size-[18px] shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                      <span className="min-w-0 flex-1 truncate text-sm font-medium" title={item.label}>{item.id === "subscription-bridge" ? "Subscription bridge" : item.label}</span>
+                      {live ? <span className="text-xs text-muted-foreground">Connected</span> : null}
+                      {on ? <Check className="size-[18px] shrink-0" strokeWidth={1.75} aria-hidden /> : null}
                     </button>
                   );
                 })}
               </div>
-              <div className="rounded-xl border border-[#2b2c30] bg-[#101113] p-4">
+              </details>
+              <div className="rounded-xl bg-background p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <strong className="font-medium text-sm text-[#f2efe9]">{preset.label}</strong>
-                  <Badge variant="outline" className="border-[#3c3e44] font-mono text-[11px] text-[#a2a19f]">{preset.hint}</Badge>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <strong className="sr-only">{preset.label}</strong>
+                  </div>
                 </div>
+                {isMultiInstanceMode && matchingProviders.length > 0 ? (
+                  <div className="mt-3 flex flex-wrap items-center gap-1.5" role="group" aria-label="Saved connections">
+                    {matchingProviders.map((prov) => (
+                      <button
+                        key={prov.id}
+                        type="button"
+                        disabled={testState === "testing"}
+                        aria-pressed={activeProviderId === prov.id}
+                        className={`preset-tile min-h-11 px-3 py-1 text-sm ${activeProviderId === prov.id ? "is-on" : ""}`}
+                        onClick={() => selectConnectionInstance(prov)}
+                      >
+                        {prov.label} ({prov.id})
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      disabled={testState === "testing"}
+                      aria-pressed={activeProviderId === null}
+                      className={`preset-tile min-h-11 px-3 py-1 text-sm ${activeProviderId === null ? "is-on" : ""}`}
+                      onClick={() => selectConnectionInstance(null)}
+                    >
+                      + New connection ({nextAvailableProviderId(preset.preset, providers)})
+                    </button>
+                  </div>
+                ) : null}
                 {(() => {
-                  const connectedProv = providers.find((p) => p.id === preset.preset && p.auth.hasSecret);
+                  const connectedProv = isMultiInstanceMode
+                    ? activeProvider && activeProvider.auth.hasSecret
+                      ? activeProvider
+                      : null
+                    : providers.find((p) => p.id === preset.preset && p.auth.hasSecret);
                   if (!connectedProv) return null;
                   return (
                     <SetupConnectedAccountBanner
@@ -1586,9 +1708,8 @@ export function SetupPage() {
                 {preset.mode === "oauth" ? (
                   <div className="mt-3 flex flex-col gap-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#5eead4]">Step 1</Badge>
                       <Button type="button" variant="outline" className="min-h-11 w-full sm:w-auto" onClick={() => void startOAuthPkce()}>
-                        Open Claude Sign-In
+                        Sign in
                       </Button>
                       {loginUrl ? (
                         <>
@@ -1596,7 +1717,7 @@ export function SetupPage() {
                             href={loginUrl}
                             target="_blank"
                             rel="noreferrer"
-                            className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto"
+                            className="btn inline-flex min-h-11 w-full items-center justify-center rounded-xl bg-card px-3 text-xs text-info hover:border-primary sm:w-auto"
                           >
                             Open sign-in link
                           </a>
@@ -1604,9 +1725,8 @@ export function SetupPage() {
                         </>
                       ) : null}
                     </div>
-                    {loginUrl ? <p className="break-all font-mono text-xs text-[#5eead4]">{loginUrl}</p> : null}
+                    {loginUrl ? <details className="text-xs text-muted-foreground"><summary className="min-h-11 cursor-pointer py-3">Details</summary><code className="break-all">{loginUrl}</code></details> : null}
                     <div className="flex flex-wrap items-center gap-2">
-                      <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#a2a19f]">Step 2</Badge>
                       <input
                         className="field min-h-11 flex-1 font-mono"
                         aria-label="Claude authorization code or setup token"
@@ -1633,7 +1753,6 @@ export function SetupPage() {
                 {preset.mode === "device" ? (
                   <div className="mt-3 flex flex-col gap-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#5eead4]">Step 1</Badge>
                       <Button type="button" variant="outline" className="min-h-11 w-full sm:w-auto" onClick={() => void startDeviceLogin()}>
                         {deviceButtonLabelFor(preset.preset)}
                       </Button>
@@ -1642,20 +1761,19 @@ export function SetupPage() {
                           href={deviceVerifyUri}
                           target="_blank"
                           rel="noreferrer"
-                          className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 break-all text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto"
+                          className="btn inline-flex min-h-11 w-full items-center justify-center rounded-xl bg-card px-3 break-all text-xs text-info hover:border-primary sm:w-auto"
                         >
-                          Open {deviceVerifyUri}
+                          Open sign-in
                         </a>
                       ) : null}
                     </div>
                     {deviceUserCode ? (
-                      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 py-2">
-                        <span className="font-mono text-2xl tracking-[0.2em] text-[#f2efe9]">{deviceUserCode}</span>
+                      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-card px-3 py-2">
+                        <span className="font-mono text-2xl tracking-[0.2em] text-foreground">{deviceUserCode}</span>
                         <CopyButton value={deviceUserCode} label="Copy code" />
                       </div>
                     ) : null}
                     <div className="flex flex-wrap items-center gap-2">
-                      <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#a2a19f]">Step 2</Badge>
                       <Button
                         type="button"
                         className="min-h-11 w-full sm:w-auto"
@@ -1665,17 +1783,16 @@ export function SetupPage() {
                         Connect
                       </Button>
                       {devicePolling ? (
-                        <span className="font-mono text-xs text-[#5eead4]">
+                        <span className="text-xs text-info">
                           Polling · {deviceWaited.toFixed(0)}s
                         </span>
                       ) : null}
                     </div>
                     {preset.preset === "codex-oauth" ? (
-                      <details className="mt-1 text-xs text-[#a2a19f]">
+                      <details className="mt-1 text-xs text-muted-foreground">
                         <summary className="cursor-pointer select-none">Browser redirect (PKCE)</summary>
                         <div className="mt-2 flex flex-col gap-2">
                           <div className="flex flex-wrap items-center gap-2">
-                            <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#5eead4]">Step 1</Badge>
                             <Button type="button" variant="outline" size="sm" className="min-h-11 w-full sm:w-auto" onClick={() => void startOAuthPkce()}>
                               Open Redirect
                             </Button>
@@ -1685,7 +1802,7 @@ export function SetupPage() {
                                   href={loginUrl}
                                   target="_blank"
                                   rel="noreferrer"
-                                  className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto"
+                                  className="btn inline-flex min-h-11 w-full items-center justify-center rounded-xl bg-card px-3 text-xs text-info hover:border-primary sm:w-auto"
                                 >
                                   Open sign-in link
                                 </a>
@@ -1693,9 +1810,8 @@ export function SetupPage() {
                               </>
                             ) : null}
                           </div>
-                          {loginUrl ? <p className="break-all font-mono text-xs text-[#5eead4]">{loginUrl}</p> : null}
+                          {loginUrl ? <details className="text-xs text-muted-foreground"><summary className="min-h-11 cursor-pointer py-3">Details</summary><code className="break-all">{loginUrl}</code></details> : null}
                           <div className="flex flex-wrap items-center gap-2">
-                            <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#a2a19f]">Step 2</Badge>
                             <input
                               className="field min-h-11 flex-1 font-mono"
                               aria-label="Callback URL or code"
@@ -1777,20 +1893,17 @@ export function SetupPage() {
                           <DropzoneContent />
                         </Dropzone>
                         {vertexSa ? (
-                          <p className="font-mono text-xs text-[#aed1a8]">
+                          <p className="font-mono text-xs text-success">
                             {vertexSa.clientEmail} · {vertexSa.projectId}
                           </p>
                         ) : null}
                         {saError ? (
-                          <p className="text-xs text-[#f0a096]" role="alert">
-                            {saError}
-                          </p>
+                          <ErrorNotice error={saError} />
                         ) : null}
                       </>
                     ) : (
                       <div className="flex flex-col gap-2">
                         <div className="flex flex-wrap items-center gap-2">
-                          <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#5eead4]">Step 1</Badge>
                           <Button type="button" variant="outline" className="min-h-11 w-full sm:w-auto" onClick={() => void startVertexOAuth()}>
                             Sign in with Google
                           </Button>
@@ -1800,7 +1913,7 @@ export function SetupPage() {
                                 href={loginUrl}
                                 target="_blank"
                                 rel="noreferrer"
-                                className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto"
+                                className="btn inline-flex min-h-11 w-full items-center justify-center rounded-xl bg-card px-3 text-xs text-info hover:border-primary sm:w-auto"
                               >
                                 Open sign-in link
                               </a>
@@ -1808,9 +1921,8 @@ export function SetupPage() {
                             </>
                           ) : null}
                         </div>
-                        {loginUrl ? <p className="break-all font-mono text-xs text-[#5eead4]">{loginUrl}</p> : null}
+                        {loginUrl ? <details className="text-xs text-muted-foreground"><summary className="min-h-11 cursor-pointer py-3">Details</summary><code className="break-all">{loginUrl}</code></details> : null}
                         <div className="flex flex-wrap items-center gap-2">
-                          <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#a2a19f]">Step 2</Badge>
                           <input
                             className="field min-h-11 flex-1 font-mono"
                             aria-label="Google verification code"
@@ -1829,12 +1941,12 @@ export function SetupPage() {
                             Connect
                           </Button>
                         </div>
-                        <details className="mt-1 text-xs text-[#a2a19f]">
+                        <details className="mt-1 text-xs text-muted-foreground">
                           <summary className="cursor-pointer select-none">
                             Advanced settings (Location / Custom Client ID)
                           </summary>
                           <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                            <label className="flex flex-col gap-1 text-xs text-[#a2a19f]">
+                            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
                               Vertex Location
                               <select
                                 className="field min-h-11 font-mono"
@@ -1848,7 +1960,7 @@ export function SetupPage() {
                                 ))}
                               </select>
                             </label>
-                            <label className="flex flex-col gap-1 text-xs text-[#a2a19f]">
+                            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
                               Project ID (optional)
                               <input
                                 className="field min-h-11 font-mono"
@@ -1858,7 +1970,7 @@ export function SetupPage() {
                               />
                             </label>
                             {vertexProjects.length > 1 ? (
-                              <label className="flex flex-col gap-1 text-xs text-[#a2a19f] sm:col-span-2">
+                              <label className="flex flex-col gap-1 text-xs text-muted-foreground sm:col-span-2">
                                 Switch detected GCP Project
                                 <select
                                   className="field min-h-11 font-mono"
@@ -1887,7 +1999,7 @@ export function SetupPage() {
                                 </select>
                               </label>
                             ) : null}
-                            <label className="flex flex-col gap-1 text-xs text-[#a2a19f] sm:col-span-2">
+                            <label className="flex flex-col gap-1 text-xs text-muted-foreground sm:col-span-2">
                               Google OAuth Client ID
                               <input
                                 className="field min-h-11 font-mono"
@@ -1903,45 +2015,45 @@ export function SetupPage() {
                   </div>
                 ) : null}
                 {preset.mode === "local" ? (
-                  <p className="mt-3 font-mono text-xs text-[#a2a19f]">
-                    {preset.baseUrl}
-                  </p>
+                  <details className="mt-3 text-xs text-muted-foreground"><summary className="min-h-11 cursor-pointer py-3">Endpoint</summary><code className="break-all">{preset.baseUrl}</code></details>
                 ) : null}
                 {preset.mode !== "oauth" && preset.mode !== "device" ? (
                   <div className="mt-3 flex flex-wrap gap-2">
                     <Button type="button" className="min-h-11 w-full sm:w-auto" disabled={testState === "testing"} onClick={() => void testProvider()}>
-                      Test &amp; Connect
+                      Test connection
                     </Button>
                   </div>
                 ) : null}
-                {testState === "fail" ? <p className="mt-2 text-sm text-[#f0a096]" role="alert">{testDetail}</p> : null}
+                {testState === "fail" ? <ErrorNotice className="mt-2" info={requestInfo(testDetail)} /> : null}
               </div>
               {visionModel || writerModel ? (
-                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#3d523b] bg-[#1e281f] px-4 py-3">
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-success-soft px-4 py-3">
                   <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <span className="rounded-md border border-[#3d523b] bg-[#101113]/60 px-2 py-1 font-mono text-[#aed1a8]">
-                      Vision: {visionModel ? stripProviderPrefixUi(visionModel.replace(/^[^:]+:/, ""), preset.preset) : "—"}
+                    <span
+                      className="rounded-md border border-success/40 bg-background/60 px-2 py-1 font-mono text-success"
+                      title={visionModel || undefined}
+                    >
+                      Vision: {visionModel ? stripProviderPrefixUi(visionModel.replace(/^[^:]+:/, ""), activeProviderId || preset.preset) : "—"}
                     </span>
-                    <span className="rounded-md border border-[#3d523b] bg-[#101113]/60 px-2 py-1 font-mono text-[#aed1a8]">
-                      Writer: {writerModel ? stripProviderPrefixUi(writerModel.replace(/^[^:]+:/, ""), preset.preset) : "—"}
+                    <span
+                      className="rounded-md border border-success/40 bg-background/60 px-2 py-1 font-mono text-success"
+                      title={writerModel || undefined}
+                    >
+                      Writer: {writerModel ? stripProviderPrefixUi(writerModel.replace(/^[^:]+:/, ""), activeProviderId || preset.preset) : "—"}
                     </span>
-                    {latency != null ? <span className="font-mono text-[#aed1a8]">{formatLatency(latency)}</span> : null}
+                    {latency != null ? <span className="text-success">{formatLatency(latency)}</span> : null}
                   </div>
                   <Button type="button" variant="outline" size="sm" className="min-h-11 sm:w-auto md:min-h-8" onClick={() => void acceptRouting()}>
                     {routingSaved ? "Routing saved ✓" : "Save routing"}
                   </Button>
                   {routingError ? (
-                    <p className="w-full text-sm text-[#f0a096]" role="alert">
-                      {routingError}
-                    </p>
+                    <ErrorNotice className="w-full" info={requestInfo(routingError)} />
                   ) : null}
                 </div>
               ) : routingError ? (
-                <p className="text-sm text-[#f0a096]" role="alert">
-                  {routingError}
-                </p>
+                <ErrorNotice info={requestInfo(routingError)} />
               ) : null}
-              {launchError ? <p className="text-sm text-[#f0a096]" role="alert">{launchError}</p> : null}
+              {launchError ? <ErrorNotice info={requestInfo(launchError)} /> : null}
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <Button type="button" variant="ghost" className="min-h-11 w-full sm:w-auto" onClick={() => go(1)}>Back</Button>
                 <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
@@ -1960,7 +2072,7 @@ export function SetupPage() {
                     disabled={(providers.length === 0 && testState !== "ok") || launching}
                     onClick={() => void finishAndCreateSeries()}
                   >
-                    {launching ? "Finishing…" : "Finish & Create Series →"}
+                    {launching ? "Finishing…" : "Finish & create series"}
                   </Button>
                 </div>
               </div>
@@ -1970,18 +2082,18 @@ export function SetupPage() {
           {step === 3 ? (
             <div className="flex flex-col gap-5">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <h2 id="setup-head-3" tabIndex={-1} className="font-serif text-2xl outline-none">
-                  3. Render lanes
+                <h2 id="setup-head-3" tabIndex={-1} className="text-2xl font-semibold tracking-[-0.015em] outline-none">
+                  Render lanes
                 </h2>
-                <Badge variant="outline" className="border-[#3d523b] font-mono text-[#aed1a8]">Local worker active</Badge>
+                <Badge variant="secondary" className="bg-success-soft text-success">Local worker active</Badge>
               </div>
               <ul className="flex flex-col gap-2">
                 {nodes.map((node) => (
-                  <li key={node.id} className="flex items-center justify-between rounded-xl border border-[#2b2c30] bg-[#101113] px-3 py-3">
+                  <li key={node.id} className="flex items-center justify-between rounded-xl bg-background px-3 py-3">
                     <span>
-                      <strong>{node.label}</strong> <code className="font-mono text-xs text-[#a2a19f]">{node.id}</code>
+                      <strong>{node.label}</strong> <code className="font-mono text-xs text-muted-foreground">{node.id}</code>
                     </span>
-                    <span className="font-mono text-xs text-[#5eead4]">{node.kind}</span>
+                    <span className="text-xs text-info">{node.kind}</span>
                   </li>
                 ))}
               </ul>
@@ -2006,12 +2118,12 @@ export function SetupPage() {
                 </Button>
               </div>
               {quickLaneKind ? (
-                <div className="flex flex-col gap-3 rounded-xl border border-[#2b2c30] bg-[#101113] p-4">
+                <div className="flex flex-col gap-3 rounded-xl bg-background p-4">
                   <div className="flex items-center justify-between">
-                    <strong className="font-serif text-lg">
+                    <strong className="text-lg font-semibold">
                       {quickLaneKind === "docker-sbx" ? "Cloud Sandbox" : "Remote SSH"}
                     </strong>
-                    <span className="font-mono text-xs text-[#5eead4]">{quickLaneKind}</span>
+                    <span className="text-xs text-info">{quickLaneKind}</span>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
                     <label className="flex flex-col gap-1 text-sm">
@@ -2116,9 +2228,9 @@ export function SetupPage() {
                   </div>
                 </div>
               ) : null}
-              {laneError ? <p className="text-sm text-[#f0a096]" role="alert">{laneError}</p> : null}
-              {laneNote ? <p className="text-sm text-[#a2a19f]" role="status">{laneNote}</p> : null}
-              {launchError || routingError ? <p className="text-sm text-[#f0a096]" role="alert">{launchError || routingError}</p> : null}
+              {laneError ? <ErrorNotice info={requestInfo(laneError)} /> : null}
+              {laneNote ? <p className="text-sm text-muted-foreground" role="status">{laneNote}</p> : null}
+              {launchError || routingError ? <ErrorNotice info={requestInfo(launchError || routingError)} /> : null}
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <Button type="button" variant="ghost" className="min-h-11" onClick={() => go(2)}>Back</Button>
                 <div className="flex flex-wrap items-center gap-2">
@@ -2135,29 +2247,30 @@ export function SetupPage() {
 
           {step === 4 ? (
             <div className="flex flex-col gap-5">
-              <h2 id="setup-head-4" tabIndex={-1} className="font-serif text-2xl outline-none">
-                4. Launch studio
+              <h2 id="setup-head-4" tabIndex={-1} className="text-2xl font-semibold tracking-[-0.015em] outline-none">
+                Ready
               </h2>
               <div className="flex flex-wrap items-center gap-2 text-sm">
-                <span className="inline-flex items-center gap-1.5 rounded-lg border border-[#3d523b] bg-[#1e281f] px-3 py-1.5 font-mono text-xs text-[#aed1a8]">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-success-soft px-3 py-1.5 text-xs text-success">
                   <Check className="size-3.5" /> Admin {tokenState === "verified" || state?.hasAdmin ? "ready" : "missing"}
                 </span>
-                <span className="inline-flex items-center gap-1.5 rounded-lg border border-[#3d523b] bg-[#1e281f] px-3 py-1.5 font-mono text-xs text-[#aed1a8]">
-                  <Check className="size-3.5" /> {providers.length || state?.providerCount || 0} Providers
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-success-soft px-3 py-1.5 text-xs text-success">
+                  <Check className="size-3.5" /> {providers.length || state?.providerCount || 0} providers
                 </span>
-                <span className="inline-flex items-center gap-1.5 rounded-lg border border-[#3d523b] bg-[#1e281f] px-3 py-1.5 font-mono text-xs text-[#aed1a8]">
-                  <Check className="size-3.5" /> {nodes.length || state?.nodeCount || 1} Render lanes
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-success-soft px-3 py-1.5 text-xs text-success">
+                  <Check className="size-3.5" /> {nodes.length || state?.nodeCount || 0} render lanes
                 </span>
               </div>
-              {launchError || routingError ? <p className="text-sm text-[#f0a096]" role="alert">{launchError || routingError}</p> : null}
+              {!(nodes.length || state?.nodeCount) ? <p className="text-sm text-muted-foreground">No render lanes</p> : null}
+              {launchError || routingError ? <ErrorNotice info={requestInfo(launchError || routingError)} /> : null}
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <Button type="button" variant="ghost" className="min-h-11" onClick={() => go(3)}>Back</Button>
                 <div className="flex flex-wrap items-center gap-2">
                   <Button type="button" variant="outline" className="min-h-11" disabled={launching} onClick={() => void launch()}>
-                    {launching ? "Launching…" : "Open Studio"}
+                    {launching ? "Opening…" : "Open settings"}
                   </Button>
                   <Button type="button" className="min-h-11" disabled={launching} onClick={() => void finishAndCreateSeries()}>
-                    {launching ? "Finishing…" : "Finish & Create Series →"}
+                    {launching ? "Finishing…" : "Finish & create series"}
                   </Button>
                 </div>
               </div>
@@ -2165,7 +2278,7 @@ export function SetupPage() {
           ) : null}
         </motion.section>
       </div>
-    </main>
+    </main></TooltipProvider>
   );
 }
 
@@ -2175,38 +2288,18 @@ function formatLatency(ms: number): string {
 }
 
 const SETUP_CSS = `
-.field, .token-input {
+.token-input {
   min-height: 44px;
   width: 100%;
   border-radius: 10px;
-  border: 1px solid #2b2c30;
-  background: #101113;
+  border: 1px solid var(--border);
+  background: var(--background);
   padding: 0 12px;
   font-size: 16px;
-  color: #f2efe9;
+  color: var(--foreground);
   outline: none;
 }
-textarea.field {
-  height: auto;
-  min-height: 96px;
-  padding: 8px 12px;
-}
-.field:focus, .token-input:focus { border-color: #f18b6e; }
-[data-slot="password-input-field"] {
-  min-height: 44px;
-  height: auto;
-  border-radius: 10px;
-  border-color: #2b2c30;
-  background: #101113;
-}
-[data-slot="password-input-field"] input {
-  min-height: 44px;
-  font-size: 16px;
-}
-[data-slot="password-input-field"] button {
-  min-height: 44px;
-  min-width: 44px;
-}
+.token-input:focus { outline: 2px solid var(--primary); outline-offset: -2px; }
 .token-box {
   position: relative;
   display: grid;
@@ -2214,13 +2307,13 @@ textarea.field {
   gap: 8px;
   align-items: center;
   overflow: hidden;
-  border-radius: 12px;
-  border: 1px solid #2b2c30;
-  background: #101113;
+  border-radius: 18px;
+  border: 1px solid transparent;
+  background: var(--muted);
   padding: 8px;
 }
-.token-box.is-error { border-color: #69453e; }
-.token-box.is-verified { border-color: #3d523b; }
+.token-box.is-error { border-color: color-mix(in srgb, var(--destructive) 45%, transparent); }
+.token-box.is-verified { border-color: color-mix(in srgb, var(--success) 45%, transparent); }
 .token-box.is-shake { animation: field-shake 300ms ease; }
 .token-input { border: 0; background: transparent; }
 .token-show, .token-pill {
@@ -2229,17 +2322,17 @@ textarea.field {
   justify-content: center;
   min-height: 44px;
   border-radius: 999px;
-  border: 1px solid #2b2c30;
-  background: #17181a;
+  border: 1px solid var(--border);
+  background: var(--card);
   padding: 0 12px;
-  color: #f2efe9;
+  color: var(--foreground);
   font-size: 12px;
 }
 .token-show { min-width: 44px; }
 .token-sheen {
   position: absolute;
   inset: 0;
-  background: linear-gradient(100deg, transparent 20%, rgba(174, 209, 168, 0.35) 50%, transparent 80%);
+  background: linear-gradient(100deg, transparent 20%, color-mix(in srgb, var(--success) 30%, transparent) 50%, transparent 80%);
   animation: token-shimmer 700ms ease;
   pointer-events: none;
 }
@@ -2250,31 +2343,31 @@ textarea.field {
   align-items: flex-start;
   justify-content: center;
   gap: 2px;
-  border-radius: 12px;
-  border: 1px solid #2b2c30;
-  background: #101113;
+  border-radius: 18px;
+  border: 1px solid transparent;
+  background: var(--muted);
   padding: 10px 12px;
   text-align: left;
-  color: #f2efe9;
+  color: var(--foreground);
 }
-.preset-tile.is-on { border-color: #f18b6e; background: rgba(241, 139, 110, 0.14); }
+.preset-tile.is-on { background: var(--primary-soft); color: var(--primary-text); }
 .test-pill {
   display: inline-flex;
   min-height: 28px;
   align-items: center;
   gap: 6px;
   border-radius: 999px;
-  border: 1px solid #2b2c30;
+  border: 0;
+  background: var(--muted);
   padding: 0 10px;
-  font-family: "JetBrains Mono", ui-monospace, monospace;
-  font-size: 11px;
-  color: #a2a19f;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--muted-foreground);
   white-space: nowrap;
 }
-.test-pill.is-ok { border-color: #3d523b; color: #aed1a8; }
-.test-pill.is-fail { border-color: #69453e; color: #f0a096; }
-.test-pill.is-testing { border-color: #3c3e44; color: #5eead4; }
-.font-serif { font-family: Fraunces, Georgia, serif; }
+.test-pill.is-ok { background: var(--success-soft); color: var(--success); }
+.test-pill.is-fail { background: var(--destructive-soft); color: var(--destructive); }
+.test-pill.is-testing { background: var(--info-soft); color: var(--info); }
 .sr-only {
   position: absolute;
   width: 1px;
@@ -2297,7 +2390,7 @@ textarea.field {
   to { transform: translateX(120%); }
 }
 @media (min-width: 700px) and (pointer: fine) {
-  .field, .token-input, [data-slot="password-input-field"] input { font-size: 14px; }
+  .token-input { font-size: 14px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .token-box.is-shake, .token-sheen { animation: none; }

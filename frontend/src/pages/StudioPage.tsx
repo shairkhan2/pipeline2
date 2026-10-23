@@ -1,18 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   Activity,
+  ArrowRight,
   AudioLines,
   Box,
-  Brain,
-  Braces,
   Check,
   Cloud,
-  Eye,
   FileText,
   HardDrive,
-  Image as ImageIcon,
+  Info,
   Monitor,
-  PenTool,
   Plus,
   Radio,
   RotateCcw,
@@ -22,9 +19,10 @@ import {
 
 import {
   api,
-  isApiError,
+  type Session,
   isConflict,
   type AuditEntry,
+  type IntakeCatalog,
   type PipelineWorker,
   type PipelineStatus,
   type PromptStageId,
@@ -44,27 +42,46 @@ import {
   type TrashItem,
   type VertexDetectedProject,
 } from "@/lib/api";
-import { AppShell, navigateClient } from "@/components/layout/AppShell";
-import { StorageTrashDrawer, fmtStorageBytes } from "@/components/shared/StorageTrashDrawer";
+import { errorLine } from "@/lib/errors";
+import { navigateClient } from "@/components/layout/AppShell";
+import { StorageTrashDrawer, StorageTrashPanel, fmtStorageBytes } from "@/components/shared/StorageTrashDrawer";
+import { AppearanceSection, AccountSection, ShortcutsSection } from "@/components/layout/SettingsDialog";
+import { MeterPage } from "@/pages/MeterPage";
 import {
   BOX_RE,
   clampSlotsForKind,
+  conciseNodeLabel,
+  DEFAULT_LANE_ID,
   DEFAULT_SANDBOX_IDLE_PAUSE_S,
   DEFAULT_SANDBOX_MAX_HOURS,
   DEFAULT_SANDBOX_TEMPLATE,
   DEFAULT_SSH_PORT,
   DEFAULT_SSH_REMOTE_DIR,
   DEFAULT_SSH_USER,
-  formatRenderNodeSubtitle,
   getRenderKindMeta,
   HOST_RE,
+  LANE_ID_RE,
   maxSlotsForKind,
   NODE_ID_RE,
 } from "@/lib/renderLanes";
+import {
+  buildTtsProviders,
+  isPaidTtsProvider,
+  normalizeHttpUrl,
+  readPreferredVoice,
+  writePreferredVoice,
+  type TtsProviderGroup,
+} from "@/lib/tts";
+import {
+  formatProviderConnectionLabel,
+  hasProviderIdCollision,
+  nextAvailableProviderId,
+  nextAvailableProviderLabel,
+} from "@/lib/providerConnections";
 import { StudioTabs } from "@/components/layout/StudioTabs";
-import "./studio.css";
-import { Badge } from "@/components/ui/badge";
+import { DefaultOutroSettings } from '@/components/library/DefaultOutroSettings';
 import { Button } from "@/components/ui/button";
+import { Notice, NoticeButton } from "@/components/ui/notice";
 import { CopyButton } from "@/components/ui/copy-button";
 import {
   Dialog,
@@ -74,7 +91,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Drawer, DrawerClose, DrawerContent, DrawerDescription, DrawerHeader, DrawerTitle } from "@/components/ui/drawer";
 import { Dropzone, DropzoneContent, DropzoneEmptyState } from "@/components/ui/dropzone";
 import { ModelSelector, type ModelOption } from "@/components/ui/model-selector";
 import {
@@ -91,11 +107,13 @@ import { Terminal, TerminalBody, TerminalHeader, TerminalLine } from "@/componen
 import { cn } from "@/lib/utils";
 
 type FilterId = "all" | "cloud-api" | "subscription" | "cloud-iam" | "local" | "tts";
-type UiStage = StageId | "tts";
+type UiStage = StageId;
+type NoticeTone = "info" | "danger" | "success" | "warning";
+type OnNotice = (message: string, tone?: NoticeTone) => void;
 type CapName = "vision" | "writer" | "reasoning" | "tts" | "image" | "json" | "streaming";
 type VertexAuthMode = "vertex-service-account" | "vertex-oauth";
 
-const REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+const REASONING_EFFORTS: ReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 const SUBSCRIPTION_PROVIDER_IDS = new Set([
   "codex-oauth",
   "claude-oauth",
@@ -197,7 +215,7 @@ function splitStageModelRef(
       return {
         modelId: stripProviderPrefixUi(restModelId, matched.id) || restModelId,
         providerId: matched.id,
-        providerLabel: matched.label || matched.id,
+        providerLabel: formatProviderConnectionLabel(matched, providers),
       };
     }
     if (
@@ -228,38 +246,18 @@ interface StageDraft {
   inheritFrom: "reader" | null;
 }
 
-interface VoiceChoice {
-  id: string;
-  providerId: string;
-  providerLabel: string;
-  voiceId: string;
-  voiceLabel: string;
-  engine: string;
-  costNotice: string;
-}
-
 interface ServiceAccountPreview {
   projectId: string;
   clientEmail: string;
   json: string;
 }
 
-const FILTERS: Array<{ id: FilterId; label: string }> = [
-  { id: "all", label: "All" },
-  { id: "cloud-api", label: "Cloud API" },
-  { id: "subscription", label: "Subscription" },
-  { id: "cloud-iam", label: "Vertex IAM" },
-  { id: "local", label: "Local" },
-  { id: "tts", label: "TTS" },
-];
-
-const STAGE_META: Array<{ id: UiStage; title: string; purpose: string; gate: "vision" | "text" | "tts" }> = [
+const STAGE_META: Array<{ id: UiStage; title: string; purpose: string; gate: "vision" | "text" }> = [
   { id: "reader", title: "Reader", purpose: "Panel vision extraction", gate: "vision" },
   { id: "matcher", title: "Matcher", purpose: "Contact-sheet and semantic matching", gate: "vision" },
   { id: "writer", title: "Writer", purpose: "Recap and story script", gate: "text" },
   { id: "scout", title: "Scout", purpose: "Promo, watermark, and credit detection", gate: "vision" },
   { id: "fact_check", title: "Fact Check", purpose: "Deterministic rules plus optional LLM verify", gate: "text" },
-  { id: "tts", title: "TTS", purpose: "Voice narration engine. Chain is held for this session.", gate: "tts" },
 ];
 
 const LOCAL_PRESETS = [
@@ -318,9 +316,7 @@ function fmtAudioTime(seconds: number): string {
 }
 
 function errText(error: unknown): string {
-  if (isApiError(error)) return error.message;
-  if (error instanceof Error) return error.message;
-  return "Request failed";
+  return errorLine(error);
 }
 
 function formatLatency(ms: number): string {
@@ -378,7 +374,7 @@ function emptyDraft(stage: UiStage): StageDraft {
   return {
     chain: [],
     concurrency: 1,
-    temperature: stage === "writer" ? 0.6 : stage === "tts" ? 1 : 0.2,
+    temperature: stage === "writer" ? 0.6 : 0.2,
     llmVerify: false,
     inheritFrom: stage === "matcher" || stage === "scout" ? "reader" : null,
   };
@@ -404,14 +400,16 @@ async function readServiceAccount(file: File): Promise<ServiceAccountPreview | {
   return { projectId: record.project_id, clientEmail: record.client_email, json: JSON.stringify(parsed) };
 }
 
-export function StudioPage() {
-  useEffect(() => {
-    document.body.classList.add("studio-theme");
-    return () => document.body.classList.remove("studio-theme");
-  }, []);
+export function StudioSettingsSections() {
+  const [sessionState, setSessionState] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const [notice, setNoticeMessage] = useState("");
+  const [noticeTone, setNoticeTone] = useState<NoticeTone>("info");
+  const setNotice = useCallback((message: string, tone: NoticeTone = "info") => {
+    setNoticeMessage(message);
+    setNoticeTone(tone);
+  }, []);
   const [privileged, setPrivileged] = useState(true);
   const [presets, setPresets] = useState<Record<string, ProviderPreset>>({});
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -419,29 +417,49 @@ export function StudioPage() {
   const [nodes, setNodes] = useState<RenderNode[]>([]);
   const [workers, setWorkers] = useState<PipelineWorker[]>([]);
   const [systemSnap, setSystemSnap] = useState<PipelineStatus["system"] | null>(null);
-  const [voices, setVoices] = useState<VoiceChoice[]>([]);
+  const [intakeCatalog, setIntakeCatalog] = useState<IntakeCatalog | null>(null);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
-  const [auditOpen, setAuditOpen] = useState(false);
   const [promptsState, setPromptsState] = useState<StudioPromptsState | null>(null);
   const [settingsState, setSettingsState] = useState<StudioSettingsState | null>(null);
 
+  const ttsProviders = useMemo(
+    () => buildTtsProviders(intakeCatalog, providers),
+    [intakeCatalog, providers],
+  );
+
   const refreshAudit = useCallback(() => {
+    if (!privileged) return;
     void api.studio
       .audit()
       .then((res) => setAuditEntries(res.entries || []))
       .catch(() => {});
+  }, [privileged]);
+
+  const refreshIntakeCatalog = useCallback(async () => {
+    const intake = await api.intake.catalog().catch(() => null);
+    if (intake) setIntakeCatalog(intake);
+  }, []);
+
+  const refreshWorkers = useCallback(async () => {
+    const status = await api.status().catch(() => null);
+    if (status) {
+      setWorkers(status.workers || []);
+      setSystemSnap(status.system || null);
+    }
   }, []);
 
   async function reload() {
-    const [session, catalog, intake, auditRes, promptsRes, settingsRes] = await Promise.all([
-      api.session().catch(() => null),
+    const session = await api.session();
+    setPrivileged(session.privileged);
+    setSessionState(session);
+    const [catalog, intake, auditRes, promptsRes, settingsRes] = await Promise.all([
       api.studio.catalog(),
       api.intake.catalog().catch(() => null),
-      api.studio.audit().catch(() => null),
+      session.privileged ? api.studio.audit().catch(() => null) : Promise.resolve(null),
       api.studio.getPrompts().catch(() => null),
       api.studio.getSettings().catch(() => null),
     ]);
-    if (session) setPrivileged(session.privileged);
+    if (session) { setPrivileged(session.privileged); setSessionState(session); }
     setPresets(catalog.presets || {});
     setProviders(catalog.providers || []);
     setStages(catalog.stages);
@@ -449,33 +467,7 @@ export function StudioPage() {
     if (auditRes) setAuditEntries(auditRes.entries || []);
     if (promptsRes || catalog.prompts) setPromptsState(promptsRes || catalog.prompts || null);
     if (settingsRes || catalog.settings) setSettingsState(settingsRes || catalog.settings || null);
-    if (intake) {
-      const next: VoiceChoice[] = [];
-      for (const raw of intake.providers || []) {
-        const providerId = typeof raw.id === "string" ? raw.id : "";
-        const providerLabel = typeof raw.label === "string" ? raw.label : providerId;
-        const engine = typeof raw.engine === "string" ? raw.engine : providerId;
-        const costNotice = typeof raw.costNotice === "string" ? raw.costNotice : "";
-        const list = Array.isArray(raw.voices) ? raw.voices : [];
-        for (const voice of list) {
-          if (!voice || typeof voice !== "object") continue;
-          const voiceId = typeof (voice as { id?: unknown }).id === "string" ? (voice as { id: string }).id : "";
-          if (!providerId || !voiceId) continue;
-          const voiceLabel =
-            typeof (voice as { label?: unknown }).label === "string" ? (voice as { label: string }).label : voiceId;
-          next.push({
-            id: `${providerId}:${voiceId}`,
-            providerId,
-            providerLabel,
-            voiceId,
-            voiceLabel,
-            engine,
-            costNotice,
-          });
-        }
-      }
-      setVoices(next);
-    }
+    if (intake) setIntakeCatalog(intake);
   }
 
   useEffect(() => {
@@ -491,65 +483,54 @@ export function StudioPage() {
       if (document.hidden) return;
       api.status().then((status) => { if (!stop) { setWorkers(status.workers || []); setSystemSnap(status.system || null); } }).catch(() => {});
     };
+    const onReturn = () => {
+      if (!document.hidden && !stop) {
+        void refreshIntakeCatalog();
+        void refreshWorkers();
+      }
+    };
     loadWorkers();
     const timer = window.setInterval(loadWorkers, 5000);
+    document.addEventListener("visibilitychange", onReturn);
+    window.addEventListener("focus", onReturn);
     return () => {
       stop = true;
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onReturn);
+      window.removeEventListener("focus", onReturn);
     };
-  }, []);
+  }, [refreshIntakeCatalog, refreshWorkers]);
 
   return (
-    <AppShell
-      active="studio"
-      eyebrow="Workspace"
-      title="Studio"
-      actions={
-        <Badge variant="outline" className="border-[#3c3e44] font-mono text-[#a2a19f]">
-          {privileged ? "Admin" : "Read-only"}
-        </Badge>
-      }
-    >
-      <header className="studio-heading">
-        <div className="flex flex-wrap items-center gap-3">
-          <h1>Studio</h1>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="cap">
-              <Server size={14} aria-hidden />
-              {providers.filter((p) => p.auth.hasSecret || p.auth.mode === "none").length}/{providers.length} Providers
-            </span>
-            <span className="cap">
-              <Box size={14} aria-hidden />
-              {nodes.filter((n) => n.enabled).length} Nodes
-            </span>
-            <span className="cap">
-              <AudioLines size={14} aria-hidden />
-              {voices.length} Voices
-            </span>
-          </div>
-        </div>
-        <a href="/status.html" className="studio-pipeline-link"><Activity size={16} aria-hidden /> Pipeline</a>
-      </header>
-      {error ? <div className="studio-message" role="alert"><span>{error}</span><Button variant="outline" onClick={() => {
-        setError(""); setLoading(true);
-        void reload().catch((err) => setError(errText(err))).finally(() => setLoading(false));
-      }}>Retry loading</Button></div> : null}
-      {notice ? <div className="studio-message" role="status"><span>{notice}</span><button type="button" aria-label="Dismiss notification" onClick={() => setNotice("")}>×</button></div> : null}
+    <div className="settings-sections-root">
+      {error ? (
+        <Notice
+          tone="danger"
+          title="Settings didn’t load"
+          className="mb-4"
+          actions={<NoticeButton onClick={() => {
+            setError(""); setLoading(true);
+            void reload().catch((err) => setError(errText(err))).finally(() => setLoading(false));
+          }}>Retry loading</NoticeButton>}
+        >
+          {error}
+        </Notice>
+      ) : null}
+      {notice ? <Notice tone={noticeTone} className="mb-4" onDismiss={() => setNotice("")}>{notice}</Notice> : null}
       {!privileged ? (
-        <p className="mb-4 rounded-xl border border-[#605139] bg-[#2a241b] px-3 py-2 text-sm text-[#d6b57b]">
-          Temporary viewing accounts can look, not change studio settings.
-        </p>
+        <Notice tone="info" className="mb-4">Read only</Notice>
       ) : null}
       {loading ? (
-        <div className="studio-loading" role="status"><RotateCcw size={20} aria-hidden /><span>Loading Studio settings…</span></div>
+        <div className="studio-loading" role="status"><RotateCcw size={20} aria-hidden /><span>Loading settings…</span></div>
       ) : (
         <>
           <StudioTabs
             tabs={[
+              { id: "appearance", label: "Appearance", content: <AppearanceSection /> },
+              { id: "account", label: "Account", content: <AccountSection session={sessionState} /> },
               {
                 id: "providers",
                 label: "Providers",
-                icon: <Server />,
                 content: (
                   <ProvidersTab
                     stages={stages}
@@ -558,6 +539,7 @@ export function StudioPage() {
                     privileged={privileged}
                     onChange={(next) => {
                       setProviders(next);
+                      void refreshIntakeCatalog();
                       refreshAudit();
                     }}
                     onStagesSaved={(next) => {
@@ -571,15 +553,14 @@ export function StudioPage() {
               {
                 id: "routing",
                 label: "Stage routing",
-                icon: <Activity />,
                 content: (
                   <RoutingTab
                     providers={providers}
-                    voices={voices}
                     stages={stages}
                     privileged={privileged}
                     onProvidersChange={(next) => {
                       setProviders(next);
+                      void refreshIntakeCatalog();
                       refreshAudit();
                     }}
                     onSaved={(next) => {
@@ -599,7 +580,6 @@ export function StudioPage() {
               {
                 id: "nodes",
                 label: "Render nodes",
-                icon: <Box />,
                 content: (
                   <NodesTab
                     system={systemSnap}
@@ -609,12 +589,15 @@ export function StudioPage() {
                     settings={settingsState}
                     onSettingsSaved={(next) => {
                       setSettingsState(next);
+                      void refreshIntakeCatalog();
                       refreshAudit();
                     }}
                     onChange={(next) => {
                       setNodes(next);
+                      void refreshIntakeCatalog();
                       refreshAudit();
                     }}
+                    onRefreshWorkers={refreshWorkers}
                     onNotice={setNotice}
                   />
                 ),
@@ -622,13 +605,17 @@ export function StudioPage() {
               {
                 id: "voice",
                 label: "Voice",
-                icon: <AudioLines />,
-                content: <VoiceTab voices={voices} privileged={privileged} />,
+                content: (
+                  <VoiceTab
+                    providers={ttsProviders}
+                    privileged={privileged}
+                    onRefreshCatalog={refreshIntakeCatalog}
+                  />
+                ),
               },
               {
                 id: "prompts",
                 label: "Prompts",
-                icon: <FileText />,
                 content: (
                   <PromptsTab
                     promptsState={promptsState}
@@ -641,40 +628,15 @@ export function StudioPage() {
                   />
                 ),
               },
+              { id: "outro", label: "Default outro", content: <DefaultOutroSettings settings={settingsState} privileged={privileged} onSaved={setSettingsState} /> },
+              { id: "usage", label: "Usage", content: <MeterPage embedded privileged={privileged} /> },
+              { id: "storage", label: "Storage and trash", content: <StorageTrashPanel privileged={privileged} /> },
+              { id: "shortcuts", label: "Shortcuts", content: <ShortcutsSection /> },
             ]}
           />
-          <details
-            className="studio-audit"
-            open={auditOpen}
-            onToggle={(event) => {
-              const next = event.currentTarget.open;
-              setAuditOpen(next);
-              if (next) refreshAudit();
-            }}
-          >
-            <summary className="cursor-pointer font-serif text-lg text-[#f2efe9]">
-              Change history <span className="studio-count">{auditEntries.length}</span>
-            </summary>
-            <div className="mt-3">
-              <Terminal>
-                <TerminalHeader>studio-audit.log</TerminalHeader>
-                <TerminalBody>
-                  {auditEntries.length === 0 ? (
-                    <TerminalLine className="text-[#a2a19f]">No audit entries recorded yet.</TerminalLine>
-                  ) : (
-                    auditEntries.map((entry, index) => (
-                      <TerminalLine key={`${entry.at}-${entry.revision}-${index}`}>
-                        {`${new Date(entry.at).toISOString()}  [${entry.user}]  ${entry.action}  ${entry.target}  (rev ${entry.revision})`}
-                      </TerminalLine>
-                    ))
-                  )}
-                </TerminalBody>
-              </Terminal>
-            </div>
-          </details>
         </>
       )}
-    </AppShell>
+    </div>
   );
 }
 
@@ -702,9 +664,9 @@ function ConnectedAccountBanner({
   if (!provider.auth.hasSecret) {
     if (!showDisconnected) return null;
     return (
-      <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#2b2c30] bg-[#101113] px-3 py-2 text-xs text-[#a2a19f]">
+      <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-background px-3 py-2 text-xs text-muted-foreground">
         <span>Not connected</span>
-        <span className="font-mono text-[11px]">
+        <span className="font-mono text-[12px]">
           {provider.models.filter((model) => model.enabled !== false).length} models
         </span>
       </div>
@@ -725,28 +687,28 @@ function ConnectedAccountBanner({
         : "Verified");
   const detectedProjects = (projects && projects.length > 0 ? projects : provider.auth.projects) || [];
   return (
-    <div className="mt-2.5 flex flex-col gap-2 rounded-xl border border-[#5eead4]/40 bg-[#5eead4]/10 px-3 py-2.5 text-xs">
+    <div className="mt-2.5 flex flex-col gap-2 rounded-2xl bg-info-soft px-3 py-2.5 text-xs">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="inline-flex items-center gap-1 rounded-full bg-[#5eead4]/20 px-2 py-0.5 font-mono text-[11px] font-semibold text-[#5eead4]">
+          <span className="inline-flex items-center gap-1 rounded-full bg-info-soft px-2 py-0.5 font-mono text-[12px] font-semibold text-info">
             <Check className="size-3" aria-hidden /> Connected
           </span>
-          <strong className="break-all font-medium text-[#f2efe9]">{primaryIdentity}</strong>
+          <strong className="break-all font-medium text-foreground">{primaryIdentity}</strong>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="rounded-md border border-[#5eead4]/30 bg-[#101113]/60 px-2 py-0.5 font-mono text-[11px] text-[#5eead4]">
+          <span className="rounded-md border border-info/40 bg-background/60 px-2 py-0.5 font-mono text-[12px] text-info">
             {planOrProjectPill}
           </span>
           {provider.auth.accountPlan && provider.auth.projectId ? (
-            <span className="rounded-md border border-[#5eead4]/30 bg-[#101113]/60 px-2 py-0.5 font-mono text-[11px] text-[#5eead4]">
+            <span className="rounded-md border border-info/40 bg-background/60 px-2 py-0.5 font-mono text-[12px] text-info">
               Project: {provider.auth.projectId}
             </span>
           ) : null}
         </div>
       </div>
       {detectedProjects.length > 1 && onSelectProject ? (
-        <div className="flex flex-wrap items-center gap-2 border-t border-[#5eead4]/20 pt-2">
-          <label htmlFor={`connected-gcp-proj-${provider.id}`} className="font-mono text-[11px] text-[#a2a19f]">
+        <div className="flex flex-wrap items-center gap-2 border-t border-info/30 pt-2">
+          <label htmlFor={`connected-gcp-proj-${provider.id}`} className="font-mono text-[12px] text-muted-foreground">
             GCP Project
           </label>
           <select
@@ -768,7 +730,7 @@ function ConnectedAccountBanner({
   );
 }
 
-function ProvidersTab({
+export function ProvidersTab({
   stages,
   presets,
   providers,
@@ -783,11 +745,10 @@ function ProvidersTab({
   privileged: boolean;
   onChange: (providers: ProviderView[]) => void;
   onStagesSaved?: (stages: StagesState) => void;
-  onNotice: (message: string) => void;
+  onNotice: OnNotice;
 }) {
-  const [filter, setFilter] = useState<FilterId>("all");
-  const [open, setOpen] = useState(false);
-  const [editing, setEditing] = useState<ProviderView | null>(null);
+  const [selectedId, setSelectedId] = useState<string>("__new__");
+  const [editingConnection, setEditingConnection] = useState(false);
   const [probing, setProbing] = useState("");
   const [syncingAll, setSyncingAll] = useState(false);
   const [expandedModels, setExpandedModels] = useState<Record<string, boolean>>({});
@@ -795,13 +756,17 @@ function ProvidersTab({
   const [newModelEffort, setNewModelEffort] = useState<Record<string, ReasoningEffort>>({});
   const [newModelCaps, setNewModelCaps] = useState<Record<string, Record<CapName, boolean>>>({});
 
-  const shown = providers.filter((provider) => {
-    if (filter === "all") return true;
-    if (filter === "tts") {
-      return provider.kind === "tts" || provider.models.some((model) => model.capabilities?.tts);
+  const selectedProvider = useMemo(
+    () => (selectedId === "__new__" ? null : providers.find((p) => p.id === selectedId) ?? null),
+    [providers, selectedId],
+  );
+
+  useEffect(() => {
+    if (selectedId !== "__new__" && !providers.some((p) => p.id === selectedId)) {
+      setSelectedId(providers[0]?.id ?? "__new__");
+      setEditingConnection(false);
     }
-    return kindOf(provider) === filter;
-  });
+  }, [providers, selectedId]);
 
   async function test(id: string) {
     setProbing(id);
@@ -809,9 +774,9 @@ function ProvidersTab({
       const result = await api.studio.testProvider(id);
       const fresh = await api.studio.providers();
       onChange(fresh.providers);
-      onNotice(result.ok ? `${id} answered in ${formatLatency(result.latencyMs)}` : result.error || "Probe failed");
+      onNotice(result.ok ? `${id} answered in ${formatLatency(result.latencyMs)}` : result.error || "Probe failed", result.ok ? "info" : "danger");
     } catch (error) {
-      onNotice(errText(error));
+      onNotice(errText(error), "danger");
     } finally {
       setProbing("");
     }
@@ -825,7 +790,7 @@ function ProvidersTab({
       onChange(fresh.providers);
       onNotice(`Synced ${result.models.length} models from /models for ${id}`);
     } catch (error) {
-      onNotice(errText(error));
+      onNotice(errText(error), "danger");
     } finally {
       setProbing("");
     }
@@ -855,7 +820,7 @@ function ProvidersTab({
       onChange(fresh.providers);
       onNotice(`Synced ${totalModels} models from /models across ${syncedProviders}/${enabledProviders.length} providers.`);
     } catch (error) {
-      onNotice(errText(error));
+      onNotice(errText(error), "danger");
     } finally {
       setSyncingAll(false);
     }
@@ -874,6 +839,29 @@ function ProvidersTab({
     const result = await api.studio.updateProvider(provider.id, { models });
     onChange(result.providers);
     onNotice(`Updated reasoning effort (${effort}) for ${modelId}`);
+  }
+
+  async function updateModelTuning(
+    provider: ProviderView,
+    modelId: string,
+    patch: { thinking?: boolean | null; maxOutputTokens?: number | null },
+  ) {
+    const models = provider.models.map((model) => {
+      if (model.id !== modelId) return model;
+      const next: ProviderModel = { ...model };
+      if ("thinking" in patch) next.thinking = patch.thinking ?? null;
+      if ("maxOutputTokens" in patch) {
+        if (patch.maxOutputTokens == null) delete next.maxOutputTokens;
+        else next.maxOutputTokens = patch.maxOutputTokens;
+      }
+      return next;
+    });
+    const result = await api.studio.updateProvider(provider.id, { models });
+    onChange(result.providers);
+    const what = "thinking" in patch
+      ? `thinking ${patch.thinking === false ? "off" : "on"}`
+      : `max output ${patch.maxOutputTokens ?? "uncapped"}`;
+    onNotice(`Updated ${what} for ${modelId}`);
   }
 
   async function addProviderModel(
@@ -939,7 +927,7 @@ function ProvidersTab({
       onStagesSaved?.(savedStages);
       onNotice(`Active model set to ${cleanModelId}`);
     } catch (error) {
-      onNotice(errText(error));
+      onNotice(errText(error), "danger");
     }
   }
 
@@ -984,350 +972,528 @@ function ProvidersTab({
     );
   }
 
+  const isSetupView = selectedId === "__new__" || editingConnection || !selectedProvider;
+
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap gap-1" role="toolbar" aria-label="Filter providers">
-          {FILTERS.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className={cn("chip", filter === item.id && "is-on")}
-              aria-pressed={filter === item.id}
-              onClick={() => setFilter(item.id)}
-            >
-              {item.label}
-            </button>
-          ))}
-        </div>
-        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
-          <Button
+    <div className="studio-split">
+      <aside className="studio-split-left" aria-label="Connections">
+        <div className="studio-split-left-head">
+          <span>Connections <span className="font-normal text-caption tabular-nums">{providers.length}</span></span>
+          <button
             type="button"
-            variant="outline"
-            className="min-h-11 flex-1 sm:flex-initial"
+            className="inline-flex items-center gap-1 text-[12px] font-medium tracking-normal normal-case text-muted-foreground hover:text-foreground"
             disabled={!privileged || syncingAll || providers.length === 0}
+            title="Sync models across all providers"
             onClick={() => void syncAllModels()}
           >
-            <RotateCcw className={cn("size-3.5", syncingAll && "animate-spin")} />
-            {syncingAll ? "Syncing…" : "Sync"}
-          </Button>
-          <Button
+            <RotateCcw className={cn("size-3", syncingAll && "animate-spin")} aria-hidden />
+            <span>{syncingAll ? "Syncing…" : "Sync"}</span>
+          </button>
+        </div>
+
+        <div className="studio-conn-list" role="group" aria-label="Connections">
+          {providers.map((provider) => {
+            const isSelected = selectedId === provider.id;
+            const isConnected = Boolean(
+              provider.lastTest?.ok || provider.auth.hasSecret || provider.auth.mode === "none",
+            );
+            return (
+              <button
+                key={provider.id}
+                type="button"
+                aria-pressed={isSelected}
+                className={cn("studio-conn-row", isSelected && "is-active")}
+                onClick={() => {
+                  setSelectedId(provider.id);
+                  setEditingConnection(false);
+                }}
+              >
+                <span className="studio-conn-mark" aria-hidden>
+                  {monogram(provider.label)}
+                </span>
+                <span className="studio-conn-body">
+                  <span className="studio-conn-title" title={`${provider.label} (${provider.id})`}>
+                    {provider.label.replace(/\s*\(.*?\)\s*/g, "").trim() || provider.id}
+                  </span>
+                  <span className="studio-conn-sub">
+                    {provider.models.length} {provider.models.length === 1 ? "model" : "models"} · {provider.id}
+                  </span>
+                </span>
+                <span className="studio-conn-status">
+                  <span className={cn("studio-status-dot", isConnected && "is-online")} aria-hidden />
+                  <span>{isConnected ? "Connected" : "Offline"}</span>
+                  <span className="studio-conn-chevron" aria-hidden>
+                    ›
+                  </span>
+                </span>
+              </button>
+            );
+          })}
+
+          <button
             type="button"
-            className="min-h-11 flex-1 sm:flex-initial"
+            aria-pressed={selectedId === "__new__"}
             disabled={!privileged}
+            className={cn("studio-conn-row", selectedId === "__new__" && "is-active")}
             onClick={() => {
-              setEditing(null);
-              setOpen(true);
+              setSelectedId("__new__");
+              setEditingConnection(false);
             }}
           >
-            + Add
-          </Button>
+            <span className="studio-conn-mark" aria-hidden>
+              +
+            </span>
+            <span className="studio-conn-body">
+              <span className="studio-conn-title">New connection</span>
+            </span>
+            <span className="studio-conn-status">
+              <span className="studio-conn-chevron" aria-hidden>
+                ›
+              </span>
+            </span>
+          </button>
         </div>
-      </div>
-      <div className="studio-provider-list">
-        {shown.map((provider) => {
-          const meter = latencyFill(provider.lastTest?.latencyMs ?? null, provider.lastTest ? provider.lastTest.ok : null);
-          const isExpanded = Boolean(expandedModels[provider.id]);
-          const visibleModels = isExpanded ? provider.models : provider.models.slice(0, 4);
-          const isSub =
-            kindOf(provider) === "subscription" ||
-            presets[provider.preset || provider.id]?.category === "subscription" ||
-            SUBSCRIPTION_PROVIDER_IDS.has(provider.id) ||
-            SUBSCRIPTION_PROVIDER_IDS.has(provider.preset || "");
-          const subSuggestions = buildSubscriptionSuggestions(provider, presets, isSub);
-          const draftCaps = draftCapsFor(provider.id);
-          const draftEffort = newModelEffort[provider.id] || "medium";
-          return (
-            <article
-              key={provider.id}
-              className="desk-card studio-provider"
-            >
-              <div className="studio-provider-identity flex flex-wrap items-start gap-3 sm:flex-nowrap">
-                <span className="mono-mark" aria-hidden>{monogram(provider.label)}</span>
-                <div className="min-w-0 flex-1">
-                  <h3 className="font-serif text-xl leading-none">
-                    {provider.label}
-                  </h3>
-                  <p className="mt-1 break-all font-mono text-xs text-[#a2a19f]">{formatProviderEndpoint(provider)}</p>
-                </div>
-                <div className={cn("probe", `is-${meter.tone}`)} title={provider.lastTest ? `HTTP ${provider.lastTest.status}` : "Not tested"}>
-                  <span className={cn("bars", probing === provider.id && "is-live")} aria-hidden>
-                    {[0, 1, 2, 3, 4].map((bar) => (
-                      <i key={bar} className={bar < meter.bars ? "on" : ""} />
-                    ))}
-                  </span>
-                  <span className="font-mono text-xs">
-                    {probing === provider.id ? "Checking…" : provider.lastTest ? `${provider.lastTest.ok ? "Connected" : "Failed"} · ${formatLatency(provider.lastTest.latencyMs)}` : "Not tested"}
-                  </span>
-                </div>
-              </div>
-              <div className="studio-provider-meta">
-                <ConnectedAccountBanner
-                  provider={provider}
-                  projects={provider.auth.projects}
-                  privileged={privileged}
-                  showDisconnected
-                  onSelectProject={(nextProject) => {
-                    void api.studio
-                      .updateProvider(provider.id, {
-                        auth: {
-                          mode: provider.auth.mode || "vertex-oauth",
-                          clientId: provider.auth.clientId || DEFAULT_GOOGLE_OAUTH_CLIENT_ID,
-                          projectId: nextProject || undefined,
-                          location: provider.auth.location || "global",
-                        },
-                      })
-                      .then((res) => {
-                        const preserved = provider.auth.projects;
-                        const nextProviders = preserved?.length
-                          ? res.providers.map((p) =>
-                              p.id === provider.id && !p.auth.projects?.length
-                                ? { ...p, auth: { ...p.auth, projects: preserved } }
-                                : p,
-                            )
-                          : res.providers;
-                        onChange(nextProviders);
-                        onNotice(`Switched Vertex project to ${nextProject}`);
-                      })
-                      .catch((err) => onNotice(errText(err)));
-                  }}
-                />
-              </div>
-              <details className="studio-provider-details">
-                <summary>Models &amp; access <span>{provider.models.length} {provider.models.length === 1 ? "model" : "models"}</span></summary>
-                <ul className="studio-model-list mt-3 flex flex-col gap-2" aria-label={`Models in ${provider.label}`}>
-                  {visibleModels.map((model) => {
-                    const cleanModelId = stripProviderPrefixUi(model.id, provider.id);
-                    const laneId = `${provider.id}:${cleanModelId}`;
-                    const wantsVision = Boolean(model.capabilities?.vision);
-                    const wantsWriter = Boolean(model.capabilities?.writer);
-                    const isReaderActive = stages?.reader?.primary === laneId || stages?.reader?.chain?.[0] === laneId;
-                    const isWriterActive = stages?.writer?.primary === laneId || stages?.writer?.chain?.[0] === laneId;
-                    const isFullyActive = (wantsVision || wantsWriter) && (!wantsVision || isReaderActive) && (!wantsWriter || isWriterActive);
-                    const isPartiallyActive = !isFullyActive && ((wantsVision && isReaderActive) || (wantsWriter && isWriterActive));
-                    const capTags = (["vision", "writer", "reasoning", "tts"] as const).filter(
-                      (cap) => model.capabilities?.[cap],
-                    );
-                    return (
-                      <li key={model.id} className="rounded-lg bg-[#101113] px-3 py-2">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                            <strong className="font-mono text-xs font-semibold text-[#f2efe9]">{cleanModelId}</strong>
-                            {model.contextWindow ? (
-                              <span className="rounded bg-[#17181a] px-1.5 py-0.5 font-mono text-[10px] text-[#a2a19f]">
-                                {Math.round(model.contextWindow / 1000)}k
-                              </span>
-                            ) : null}
-                            {capTags.map((cap) => (
-                              <span
-                                key={cap}
-                                className="rounded bg-[#17181a] px-1.5 py-0.5 font-mono text-[10px] text-[#a2a19f]"
-                              >
-                                {cap}
-                              </span>
-                            ))}
-                          </div>
-                          <div className="flex items-center gap-1.5">
-                            {isFullyActive ? <span className="cap is-on">Active</span> : null}
-                            {isPartiallyActive ? <span className="cap is-on">{isReaderActive ? "Vision" : "Writer"}</span> : null}
-                            {!isFullyActive && (wantsVision || wantsWriter) ? (
-                              <Button type="button" size="sm" variant="outline" className="min-h-8 px-2.5 text-xs" disabled={!privileged} onClick={() => void activateModelForStages(provider, cleanModelId)}>Use</Button>
-                            ) : null}
-                            {model.capabilities?.reasoning ? (
-                              <select
-                                className="field min-h-8 w-auto px-2 py-1 font-mono text-xs"
-                                aria-label={`Reasoning effort for ${cleanModelId}`}
-                                value={model.reasoningEffort || "medium"}
-                                disabled={!privileged}
-                                onChange={(event) =>
-                                  void updateReasoningEffort(
-                                    provider,
-                                    model.id,
-                                    event.target.value as ReasoningEffort,
-                                  ).catch((error) => onNotice(errText(error)))
-                                }
-                              >
-                                {REASONING_EFFORTS.map((effort) => (
-                                  <option key={effort} value={effort}>
-                                    {effort}
-                                  </option>
-                                ))}
-                              </select>
-                            ) : null}
-                            {provider.models.length > 1 ? (
-                              <button
-                                type="button"
-                                className="inline-flex min-h-8 min-w-8 items-center justify-center rounded text-xs text-[#a2a19f] hover:text-[#f0a096]"
-                                aria-label={`Remove model ${cleanModelId}`}
-                                disabled={!privileged}
-                                onClick={() =>
-                                  void removeProviderModel(provider, model.id).catch((error) => onNotice(errText(error)))
-                                }
-                              >
-                                ×
-                              </button>
-                            ) : null}
-                          </div>
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-                {provider.models.length > 4 ? (
-                  <button
-                    type="button"
-                    className="mt-2 self-start text-xs text-[#5eead4] hover:underline"
-                    aria-expanded={isExpanded}
-                    onClick={() =>
-                      setExpandedModels((current) => ({ ...current, [provider.id]: !current[provider.id] }))
-                    }
-                  >
-                    {isExpanded ? "Show fewer models" : `Show all ${provider.models.length} models`}
-                  </button>
-                ) : null}
-                <details className="mt-2 text-xs">
-                  <summary className="cursor-pointer select-none py-1 text-[#a2a19f] hover:text-[#f2efe9]">
-                    Add or customize model
-                  </summary>
-                  <div className="mt-2 rounded-xl border border-[#2b2c30] bg-[#101113] p-2.5">
-                    {subSuggestions.length > 0 ? (
-                      <div className="mb-2 flex flex-wrap gap-1">
-                        {subSuggestions.map((tpl) => {
-                          const cleanTplId = stripProviderPrefixUi(tpl.id, provider.id);
-                          const exists = provider.models.some(
-                            (m) => stripProviderPrefixUi(m.id, provider.id) === cleanTplId || m.id === tpl.id,
-                          );
-                          return (
-                            <button
-                              key={tpl.id}
-                              type="button"
-                              className={cn("cap", exists && "is-on")}
-                              disabled={!privileged || exists}
-                              onClick={() =>
-                                void addProviderModel(provider, { ...tpl, id: cleanTplId }).catch((error) =>
-                                  onNotice(errText(error)),
-                                )
-                              }
-                            >
-                              <Plus className="size-3" /> {cleanTplId} ({tpl.reasoningEffort})
-                            </button>
-                          );
-                        })}
-                      </div>
-                    ) : null}
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <input
-                        className="field min-h-11 min-w-[160px] flex-1 font-mono text-xs"
-                        aria-label={`New model ID for ${provider.label}`}
-                        placeholder="Model ID (e.g. gpt-6.1-sol, claude-sonnet-4)"
-                        value={newModelId[provider.id] || ""}
-                        disabled={!privileged}
-                        onChange={(event) =>
-                          setNewModelId((current) => ({ ...current, [provider.id]: event.target.value }))
-                        }
-                      />
-                      <select
-                        className="field min-h-11 w-auto font-mono text-xs"
-                        aria-label={`Reasoning effort for new model in ${provider.label}`}
-                        value={draftEffort}
-                        disabled={!privileged}
-                        onChange={(event) =>
-                          setNewModelEffort((current) => ({
-                            ...current,
-                            [provider.id]: event.target.value as ReasoningEffort,
-                          }))
-                        }
+
+        <button
+          type="button"
+          className="studio-add-link"
+          disabled={!privileged}
+          onClick={() => {
+            setSelectedId("__new__");
+            setEditingConnection(false);
+          }}
+        >
+          <span>+</span>
+          <span>Add connection</span>
+        </button>
+      </aside>
+
+      <div className="studio-split-right">
+        {isSetupView ? (
+          <ProviderSetupPane
+            editing={selectedId === "__new__" ? null : selectedProvider}
+            providers={providers}
+            presets={presets}
+            privileged={privileged}
+            onCancel={() => {
+              if (editingConnection && selectedProvider) {
+                setEditingConnection(false);
+              } else if (providers[0]) {
+                setSelectedId(providers[0].id);
+                setEditingConnection(false);
+              }
+            }}
+            onSaved={(nextProviders, savedProviderId) => {
+              onChange(nextProviders);
+              if (savedProviderId) {
+                setSelectedId(savedProviderId);
+                setEditingConnection(false);
+              }
+            }}
+            onStagesSaved={onStagesSaved}
+            onNotice={onNotice}
+          />
+        ) : (
+          (() => {
+            const provider = selectedProvider;
+            const meter = latencyFill(
+              provider.lastTest?.latencyMs ?? null,
+              provider.lastTest ? provider.lastTest.ok : null,
+            );
+            const isExpanded = Boolean(expandedModels[provider.id]);
+            const visibleModels = isExpanded ? provider.models : provider.models.slice(0, 8);
+            const isSub =
+              kindOf(provider) === "subscription" ||
+              presets[provider.preset || provider.id]?.category === "subscription" ||
+              SUBSCRIPTION_PROVIDER_IDS.has(provider.id) ||
+              SUBSCRIPTION_PROVIDER_IDS.has(provider.preset || "");
+            const subSuggestions = buildSubscriptionSuggestions(provider, presets, isSub);
+            const draftCaps = draftCapsFor(provider.id);
+            const draftEffort = newModelEffort[provider.id] || "medium";
+            const needsInitialAuth = !provider.auth.hasSecret && provider.auth.mode !== "none";
+
+            return (
+              <>
+                <div className="flex flex-col gap-5">
+                  <div className="flex flex-wrap items-start justify-between gap-4 border-b border-border pb-4">
+                    <div className="studio-pane-heading min-w-0">
+                      <h2>{provider.label}</h2>
+                      <p className="font-mono text-xs">
+                        {formatProviderEndpoint(provider)} · <span className="opacity-75">{provider.id}</span>
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div
+                        className={cn("probe mr-2 text-xs", `is-${meter.tone}`)}
+                        title={provider.lastTest ? `HTTP ${provider.lastTest.status}` : "Not tested"}
                       >
-                        {REASONING_EFFORTS.map((effort) => (
-                          <option key={effort} value={effort}>
-                            effort: {effort}
-                          </option>
-                        ))}
-                      </select>
+                        <span className={cn("bars", probing === provider.id && "is-live")} aria-hidden>
+                          {[0, 1, 2, 3, 4].map((bar) => (
+                            <i key={bar} className={bar < meter.bars ? "on" : ""} />
+                          ))}
+                        </span>
+                        <span className="font-mono text-xs">
+                          {probing === provider.id
+                            ? "Checking…"
+                            : provider.lastTest
+                              ? `${provider.lastTest.ok ? "Connected" : "Failed"} · ${formatLatency(provider.lastTest.latencyMs)}`
+                              : provider.auth.hasSecret || provider.auth.mode === "none"
+                                ? "Connected"
+                                : "Offline"}
+                        </span>
+                      </div>
                       <Button
                         type="button"
-                        size="sm"
                         variant="outline"
-                        className="min-h-11 w-full sm:w-auto"
-                        disabled={!privileged || !(newModelId[provider.id] || "").trim()}
-                        onClick={() =>
-                          void addProviderModel(provider, {
-                            id: newModelId[provider.id] || "",
-                            reasoningEffort: draftEffort,
-                            capabilities: draftCaps,
-                          }).catch((error) => onNotice(errText(error)))
-                        }
+                        size="sm"
+                        disabled={!privileged || probing === provider.id}
+                        onClick={() => void test(provider.id)}
                       >
-                        <Plus className="size-3.5" /> Add model
+                        Test
                       </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={!privileged || probing === provider.id}
+                        onClick={() => void discover(provider.id)}
+                      >
+                        <RotateCcw className={cn("size-3.5", probing === provider.id && "animate-spin")} /> Sync
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={!privileged}
+                        onClick={() => setEditingConnection(true)}
+                      >
+                        Configure
+                      </Button>
+                      <InlineConfirm
+                        label="Remove"
+                        subject={provider.label}
+                        description="Remove provider?"
+                        disabled={!privileged}
+                        onConfirm={async () => {
+                          try {
+                            const result = await api.studio.deleteProvider(provider.id);
+                            onChange(result.providers);
+                            setSelectedId(result.providers[0]?.id ?? "__new__");
+                            onNotice(`${provider.label} removed`);
+                          } catch (error) {
+                            onNotice(errText(error), "danger");
+                          }
+                        }}
+                      />
                     </div>
-                    <div className="mt-2 flex flex-wrap gap-1" role="group" aria-label={`New model capabilities for ${provider.label}`}>
-                      {(["vision", "writer", "reasoning", "tts", "image"] as const).map((cap) => (
+                  </div>
+
+                  <ConnectedAccountBanner
+                    provider={provider}
+                    projects={provider.auth.projects}
+                    privileged={privileged}
+                    onSelectProject={(nextProject) => {
+                      void api.studio
+                        .updateProvider(provider.id, {
+                          auth: {
+                            mode: provider.auth.mode || "vertex-oauth",
+                            clientId: provider.auth.clientId || DEFAULT_GOOGLE_OAUTH_CLIENT_ID,
+                            projectId: nextProject || undefined,
+                            location: provider.auth.location || "global",
+                          },
+                        })
+                        .then((res) => {
+                          const preserved = provider.auth.projects;
+                          const nextProviders = preserved?.length
+                            ? res.providers.map((p) =>
+                                p.id === provider.id && !p.auth.projects?.length
+                                  ? { ...p, auth: { ...p.auth, projects: preserved } }
+                                  : p,
+                              )
+                            : res.providers;
+                          onChange(nextProviders);
+                          onNotice(`Switched Vertex project to ${nextProject}`);
+                        })
+                        .catch((err) => onNotice(errText(err), "danger"));
+                    }}
+                  />
+
+                  {needsInitialAuth ? (
+                    <div className="desk-card">
+                      <p className="mb-2 text-[13px] font-semibold text-muted-foreground">
+                        Authenticate connection
+                      </p>
+                      <AuthFlow provider={provider} privileged={privileged} onChange={onChange} onNotice={onNotice} />
+                    </div>
+                  ) : null}
+
+                  <div>
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="text-[13px] font-semibold text-muted-foreground">
+                        Models ({provider.models.length})
+                      </span>
+                      {provider.models.length > 8 ? (
                         <button
-                          key={cap}
                           type="button"
-                          className={cn("cap", draftCaps[cap] && "is-on")}
-                          aria-pressed={Boolean(draftCaps[cap])}
-                          disabled={!privileged}
+                          className="text-xs font-medium text-primary-text hover:underline"
+                          aria-expanded={isExpanded}
                           onClick={() =>
-                            setNewModelCaps((current) => ({
+                            setExpandedModels((current) => ({ ...current, [provider.id]: !current[provider.id] }))
+                          }
+                        >
+                          {isExpanded ? "Show fewer" : `Show all ${provider.models.length}`}
+                        </button>
+                      ) : null}
+                    </div>
+
+                    <ul className="studio-model-table" aria-label={`Models in ${provider.label}`}>
+                      {visibleModels.map((model) => {
+                        const cleanModelId = stripProviderPrefixUi(model.id, provider.id);
+                        const laneId = `${provider.id}:${cleanModelId}`;
+                        const wantsVision = Boolean(model.capabilities?.vision);
+                        const wantsWriter = Boolean(model.capabilities?.writer);
+                        const isReaderActive =
+                          stages?.reader?.primary === laneId || stages?.reader?.chain?.[0] === laneId;
+                        const isWriterActive =
+                          stages?.writer?.primary === laneId || stages?.writer?.chain?.[0] === laneId;
+                        const isFullyActive =
+                          (wantsVision || wantsWriter) &&
+                          (!wantsVision || isReaderActive) &&
+                          (!wantsWriter || isWriterActive);
+                        const isPartiallyActive =
+                          !isFullyActive && ((wantsVision && isReaderActive) || (wantsWriter && isWriterActive));
+                        const capTags = (["vision", "writer", "reasoning", "tts"] as const).filter(
+                          (cap) => model.capabilities?.[cap],
+                        );
+                        return (
+                          <li key={model.id} className="studio-model-row">
+                            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                              <strong className="font-mono text-xs font-semibold text-foreground">{cleanModelId}</strong>
+                              {model.contextWindow ? (
+                                <span className="cap font-mono">{Math.round(model.contextWindow / 1000)}k</span>
+                              ) : null}
+                              {capTags.map((cap) => (
+                                <span key={cap} className="cap font-mono">
+                                  {cap}
+                                </span>
+                              ))}
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              {isFullyActive ? <span className="cap is-on">Active</span> : null}
+                              {isPartiallyActive ? (
+                                <span className="cap is-on">{isReaderActive ? "Vision" : "Writer"}</span>
+                              ) : null}
+                              {!isFullyActive && (wantsVision || wantsWriter) ? (
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
+                                  className="min-h-7 px-2.5 text-xs"
+                                  disabled={!privileged}
+                                  onClick={() => void activateModelForStages(provider, cleanModelId)}
+                                >
+                                  Use
+                                </Button>
+                              ) : null}
+                              {model.capabilities?.reasoning ? (
+                                <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                                  <input
+                                    type="checkbox"
+                                    className="size-3.5"
+                                    aria-label={`Thinking for ${cleanModelId}`}
+                                    checked={model.thinking !== false}
+                                    disabled={!privileged}
+                                    onChange={(event) =>
+                                      void updateModelTuning(provider, model.id, {
+                                        thinking: event.target.checked ? null : false,
+                                      }).catch((error) => onNotice(errText(error), "danger"))
+                                    }
+                                  />
+                                  think
+                                </label>
+                              ) : null}
+                              {model.capabilities?.reasoning ? (
+                                <select
+                                  className="field min-h-7 w-auto px-2 py-0.5 font-mono text-xs"
+                                  aria-label={`Reasoning effort for ${cleanModelId}`}
+                                  value={model.reasoningEffort || "medium"}
+                                  disabled={!privileged || model.thinking === false}
+                                  title={model.thinking === false ? "Thinking is off for this model" : undefined}
+                                  onChange={(event) =>
+                                    void updateReasoningEffort(
+                                      provider,
+                                      model.id,
+                                      event.target.value as ReasoningEffort,
+                                    ).catch((error) => onNotice(errText(error), "danger"))
+                                  }
+                                >
+                                  {REASONING_EFFORTS.map((effort) => (
+                                    <option key={effort} value={effort}>
+                                      {effort}
+                                    </option>
+                                  ))}
+                                </select>
+                              ) : null}
+                              <input
+                                type="number"
+                                inputMode="numeric"
+                                min={256}
+                                step={1024}
+                                className="field min-h-7 w-24 px-2 py-0.5 font-mono text-xs"
+                                aria-label={`Max output tokens for ${cleanModelId}`}
+                                title="Provider output cap (blank = no cap). Requests never exceed it."
+                                placeholder="max out"
+                                defaultValue={model.maxOutputTokens ?? ""}
+                                disabled={!privileged}
+                                onBlur={(event) => {
+                                  const raw = event.target.value.trim();
+                                  const next = raw === "" ? null : Number(raw);
+                                  if ((next ?? undefined) === model.maxOutputTokens) return;
+                                  void updateModelTuning(provider, model.id, { maxOutputTokens: next }).catch(
+                                    (error) => onNotice(errText(error), "danger"),
+                                  );
+                                }}
+                              />
+                              {provider.models.length > 1 ? (
+                                <button
+                                  type="button"
+                                  className="inline-flex min-h-7 min-w-7 items-center justify-center rounded text-xs text-muted-foreground hover:text-destructive"
+                                  aria-label={`Remove model ${cleanModelId}`}
+                                  disabled={!privileged}
+                                  onClick={() =>
+                                    void removeProviderModel(provider, model.id).catch((error) =>
+                                      onNotice(errText(error), "danger"),
+                                    )
+                                  }
+                                >
+                                  ×
+                                </button>
+                              ) : null}
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+
+                    <div className="mt-3 rounded-md border border-border bg-card p-3">
+                      {subSuggestions.length > 0 ? (
+                        <div className="mb-2.5 flex flex-wrap gap-1">
+                          {subSuggestions.map((tpl) => {
+                            const cleanTplId = stripProviderPrefixUi(tpl.id, provider.id);
+                            const exists = provider.models.some(
+                              (m) => stripProviderPrefixUi(m.id, provider.id) === cleanTplId || m.id === tpl.id,
+                            );
+                            return (
+                              <button
+                                key={tpl.id}
+                                type="button"
+                                className={cn("cap", exists && "is-on")}
+                                disabled={!privileged || exists}
+                                onClick={() =>
+                                  void addProviderModel(provider, { ...tpl, id: cleanTplId }).catch((error) =>
+                                    onNotice(errText(error), "danger"),
+                                  )
+                                }
+                              >
+                                <Plus className="size-3" /> {cleanTplId} ({tpl.reasoningEffort})
+                              </button>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          className="field min-w-[180px] flex-1 font-mono text-xs"
+                          aria-label={`New model ID for ${provider.label}`}
+                          placeholder="Add model ID (e.g. anthropic/claude-sonnet-4)"
+                          value={newModelId[provider.id] || ""}
+                          disabled={!privileged}
+                          onChange={(event) =>
+                            setNewModelId((current) => ({ ...current, [provider.id]: event.target.value }))
+                          }
+                        />
+                        <select
+                          className="field w-auto font-mono text-xs"
+                          aria-label={`Reasoning effort for new model in ${provider.label}`}
+                          value={draftEffort}
+                          disabled={!privileged}
+                          onChange={(event) =>
+                            setNewModelEffort((current) => ({
                               ...current,
-                              [provider.id]: { ...draftCaps, [cap]: !draftCaps[cap] },
+                              [provider.id]: event.target.value as ReasoningEffort,
                             }))
                           }
                         >
-                          {cap}
-                        </button>
-                      ))}
+                          {REASONING_EFFORTS.map((effort) => (
+                            <option key={effort} value={effort}>
+                              effort: {effort}
+                            </option>
+                          ))}
+                        </select>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={!privileged || !(newModelId[provider.id] || "").trim()}
+                          onClick={() =>
+                            void addProviderModel(provider, {
+                              id: newModelId[provider.id] || "",
+                              reasoningEffort: draftEffort,
+                              capabilities: draftCaps,
+                            }).catch((error) => onNotice(errText(error), "danger"))
+                          }
+                        >
+                          <Plus className="size-3.5" /> Add model
+                        </Button>
+                      </div>
+                      <div
+                        className="mt-2 flex flex-wrap gap-1"
+                        role="group"
+                        aria-label={`New model capabilities for ${provider.label}`}
+                      >
+                        {(["vision", "writer", "reasoning", "tts", "image"] as const).map((cap) => (
+                          <button
+                            key={cap}
+                            type="button"
+                            className={cn("cap", draftCaps[cap] && "is-on")}
+                            aria-pressed={Boolean(draftCaps[cap])}
+                            disabled={!privileged}
+                            onClick={() =>
+                              setNewModelCaps((current) => ({
+                                ...current,
+                                [provider.id]: { ...draftCaps, [cap]: !draftCaps[cap] },
+                              }))
+                            }
+                          >
+                            {cap}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   </div>
-                </details>
-                <AuthFlow provider={provider} privileged={privileged} onChange={onChange} onNotice={onNotice} />
-              </details>
-              <div className="studio-provider-actions mt-3 flex flex-wrap gap-2">
-                <Button type="button" variant="outline" size="sm" className="min-h-11 flex-1 sm:flex-initial md:min-h-8" disabled={!privileged || probing === provider.id} onClick={() => void test(provider.id)}>
-                  Test
-                </Button>
-                <Button type="button" variant="outline" size="sm" className="min-h-11 flex-1 sm:flex-initial md:min-h-8" disabled={!privileged || probing === provider.id} onClick={() => void discover(provider.id)}>
-                  <RotateCcw className={cn("size-3.5", probing === provider.id && "animate-spin")} /> Sync
-                </Button>
-                <Button type="button" variant="ghost" size="sm" className="min-h-11 md:min-h-8" disabled={!privileged} onClick={() => { setEditing(provider); setOpen(true); }}>
-                  Edit
-                </Button>
-                <InlineConfirm
-                  label="Remove"
-                  subject={provider.label}
-                  description="Remove provider?"
-                  disabled={!privileged}
-                  onConfirm={async () => {
-                    try {
-                      const result = await api.studio.deleteProvider(provider.id);
-                      onChange(result.providers);
-                      onNotice(`${provider.label} removed`);
-                    } catch (error) {
-                      onNotice(errText(error));
-                    }
-                  }}
-                />
-              </div>
-            </article>
-          );
-        })}
+
+                  {!needsInitialAuth ? (
+                    <details className="studio-accordion">
+                      <summary>
+                        <span>Credentials &amp; re-authentication</span>
+                        <span className="studio-accordion-icon" aria-hidden />
+                      </summary>
+                      <div className="studio-accordion-body">
+                        <AuthFlow provider={provider} privileged={privileged} onChange={onChange} onNotice={onNotice} />
+                      </div>
+                    </details>
+                  ) : null}
+                </div>
+
+                <div className="studio-pane-footer">
+                  <span>{provider.label}</span>
+                  <span>{provider.models.length} models configured</span>
+                </div>
+              </>
+            );
+          })()
+        )}
       </div>
-      {shown.length === 0 ? <div className="studio-empty"><Server size={28} aria-hidden /><h3>{providers.length ? "No matching providers" : "No providers"}</h3></div> : null}
-      <ProviderDialog
-        open={open}
-        presets={presets}
-        editing={editing}
-        privileged={privileged}
-        onOpenChange={setOpen}
-        onSaved={(next) => {
-          onChange(next);
-          onNotice("Provider saved. Secret fields were cleared.");
-        }}
-        onStagesSaved={onStagesSaved}
-        onNotice={onNotice}
-      />
     </div>
   );
 }
@@ -1341,7 +1507,7 @@ function AuthFlow({
   provider: ProviderView;
   privileged: boolean;
   onChange: (providers: ProviderView[]) => void;
-  onNotice: (message: string) => void;
+  onNotice: OnNotice;
 }) {
   const mode = provider.auth.mode;
   const isVertex =
@@ -1396,7 +1562,7 @@ function AuthFlow({
         setReauthOpen(false);
         onNotice("Device authorized · Synced /models catalog");
       } catch (error) {
-        onNotice(errText(error));
+        onNotice(errText(error), "danger");
       }
     })();
   }, [provider.id, onChange, onNotice]);
@@ -1436,7 +1602,7 @@ function AuthFlow({
         .catch((error) => {
           if (!cancelled) {
             setPending(false);
-            onNotice(errText(error));
+            onNotice(errText(error), "danger");
           }
         })
         .finally(() => {
@@ -1476,7 +1642,7 @@ function AuthFlow({
                 onChange(fresh.providers);
                 onNotice("Key revoked");
               } catch (error) {
-                onNotice(errText(error));
+                onNotice(errText(error), "danger");
               }
             }}
           />
@@ -1497,7 +1663,7 @@ function AuthFlow({
   if (!isVertex && !isDeviceSub && !isClaudeSub && (mode === "bearer" || mode === "none")) {
     return (
       <div className="mt-3 flex flex-col gap-2">
-        <div className="flex flex-col gap-1 text-xs text-[#a2a19f]">
+        <div className="flex flex-col gap-1 text-xs text-muted-foreground">
           <label htmlFor={`provider-key-${provider.id}`}>
             {provider.auth.hasSecret ? `Replace key · hint ${provider.auth.secretHint || "saved"}` : "API key"}
           </label>
@@ -1534,7 +1700,7 @@ function AuthFlow({
                       : "Key stored. The field was cleared.",
                   );
                 })
-                .catch((error) => onNotice(errText(error)));
+                .catch((error) => onNotice(errText(error), "danger"));
             }}
           >
             Save key
@@ -1563,7 +1729,7 @@ function AuthFlow({
                     setReauthOpen(false);
                     onNotice("Key revoked");
                   } catch (error) {
-                    onNotice(errText(error));
+                    onNotice(errText(error), "danger");
                   }
                 }}
               />
@@ -1576,11 +1742,11 @@ function AuthFlow({
 
   if (!isVertex && isClaudeSub) {
     return (
-      <div className="mt-3 flex flex-col gap-2 rounded-xl border border-[#2b2c30] bg-[#101113] p-3">
+      <div className="mt-3 flex flex-col gap-2 rounded-xl bg-background p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-xs tracking-[0.14em] text-[#a2a19f] uppercase">OAuth PKCE · {provider.label}</p>
+          <p className="text-[13px] font-medium text-muted-foreground">OAuth PKCE · {provider.label}</p>
           {provider.auth.hasSecret ? (
-            <button type="button" className="text-xs text-[#a2a19f] hover:text-[#f2efe9]" onClick={() => setReauthOpen(false)}>
+            <button type="button" className="text-xs text-muted-foreground hover:text-foreground" onClick={() => setReauthOpen(false)}>
               Cancel
             </button>
           ) : null}
@@ -1605,7 +1771,7 @@ function AuthFlow({
                 }
               }).catch((error) => {
                 popup?.close();
-                onNotice(errText(error));
+                onNotice(errText(error), "danger");
               });
             }}
           >
@@ -1617,7 +1783,7 @@ function AuthFlow({
                 href={loginUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto md:min-h-8"
+                className="btn inline-flex min-h-11 w-full items-center justify-center rounded-xl bg-card px-3 text-xs text-info hover:border-primary sm:w-auto md:min-h-8"
               >
                 Open sign-in link
               </a>
@@ -1625,7 +1791,7 @@ function AuthFlow({
             </>
           ) : null}
         </div>
-        {loginUrl ? <p className="break-all font-mono text-[11px] text-[#5eead4]">{loginUrl}</p> : null}
+        {loginUrl ? <p className="break-all font-mono text-[12px] text-info">{loginUrl}</p> : null}
         <div className="flex flex-wrap items-center gap-2">
           <span className="cap">Step 2</span>
           <input
@@ -1657,7 +1823,7 @@ function AuthFlow({
                     ? `Subscription token stored & synced ${disc.models.length} models from /models.`
                     : "Subscription token stored",
                 );
-              }).catch((error) => onNotice(errText(error)));
+              }).catch((error) => onNotice(errText(error), "danger"));
             }}
           >
             Connect
@@ -1671,11 +1837,11 @@ function AuthFlow({
     const subKey = DEVICE_CODE_PROVIDER_IDS.has(effectiveSubKey) ? effectiveSubKey : provider.id;
     const deviceClientId = deviceClientIdFor(subKey);
     return (
-      <div className="mt-3 flex flex-col gap-2 rounded-xl border border-[#2b2c30] bg-[#101113] p-3">
+      <div className="mt-3 flex flex-col gap-2 rounded-xl bg-background p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-xs tracking-[0.14em] text-[#a2a19f] uppercase">Device code · {provider.label}</p>
+          <p className="text-[13px] font-medium text-muted-foreground">Device code · {provider.label}</p>
           {provider.auth.hasSecret ? (
-            <button type="button" className="text-xs text-[#a2a19f] hover:text-[#f2efe9]" onClick={() => setReauthOpen(false)}>
+            <button type="button" className="text-xs text-muted-foreground hover:text-foreground" onClick={() => setReauthOpen(false)}>
               Cancel
             </button>
           ) : null}
@@ -1704,7 +1870,7 @@ function AuthFlow({
                 }
               }).catch((error) => {
                 popup?.close();
-                onNotice(errText(error));
+                onNotice(errText(error), "danger");
               });
             }}
           >
@@ -1715,15 +1881,15 @@ function AuthFlow({
               href={verifyUrl}
               target="_blank"
               rel="noreferrer"
-              className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 break-all text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto md:min-h-8"
+              className="btn inline-flex min-h-11 w-full items-center justify-center rounded-xl bg-card px-3 break-all text-xs text-info hover:border-primary sm:w-auto md:min-h-8"
             >
               Open verification
             </a>
           ) : null}
         </div>
         {userCode ? (
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 py-2">
-            <span className="font-mono text-2xl tracking-[0.2em] text-[#f2efe9]">{userCode}</span>
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-card px-3 py-2">
+            <span className="font-mono text-2xl tracking-[0.2em] text-foreground">{userCode}</span>
             <CopyButton value={userCode} label="Copy code" />
           </div>
         ) : null}
@@ -1763,7 +1929,7 @@ function AuthFlow({
                   }
                   onNotice(result.status === "authorized" ? "Device authorized · Synced /models" : "Still waiting");
                 })
-                .catch((error) => onNotice(errText(error)))
+                .catch((error) => onNotice(errText(error), "danger"))
                 .finally(() => {
                   pollInFlightRef.current = false;
                 });
@@ -1772,13 +1938,13 @@ function AuthFlow({
             Connect
           </Button>
           {pending ? (
-            <span className="font-mono text-xs text-[#5eead4]">
+            <span className="font-mono text-xs text-info">
               Polling · {waited.toFixed(0)}s
             </span>
           ) : null}
         </div>
         {subKey === "codex-oauth" ? (
-          <details className="mt-1 text-xs text-[#a2a19f]">
+          <details className="mt-1 text-xs text-muted-foreground">
             <summary className="cursor-pointer select-none">Browser redirect (PKCE)</summary>
             <div className="mt-2 flex flex-col gap-2">
               <div className="flex flex-wrap items-center gap-2">
@@ -1805,7 +1971,7 @@ function AuthFlow({
                       })
                       .catch((error) => {
                         popup?.close();
-                        onNotice(errText(error));
+                        onNotice(errText(error), "danger");
                       });
                   }}
                 >
@@ -1817,7 +1983,7 @@ function AuthFlow({
                       href={loginUrl}
                       target="_blank"
                       rel="noreferrer"
-                      className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto md:min-h-8"
+                      className="btn inline-flex min-h-11 w-full items-center justify-center rounded-xl bg-card px-3 text-xs text-info hover:border-primary sm:w-auto md:min-h-8"
                     >
                       Open sign-in link
                     </a>
@@ -1859,7 +2025,7 @@ function AuthFlow({
                             : "Subscription token stored",
                         );
                       })
-                      .catch((error) => onNotice(errText(error)));
+                      .catch((error) => onNotice(errText(error), "danger"));
                   }}
                 >
                   Connect
@@ -1873,9 +2039,9 @@ function AuthFlow({
   }
 
   return (
-    <div className="mt-3 flex flex-col gap-2.5 rounded-xl border border-[#2b2c30] bg-[#101113] p-3">
+    <div className="mt-3 flex flex-col gap-2.5 rounded-xl bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="text-xs tracking-[0.14em] text-[#a2a19f] uppercase">GCP Vertex AI Sign-In</p>
+        <p className="text-[13px] font-medium text-muted-foreground">GCP Vertex AI Sign-In</p>
         <div className="flex flex-wrap items-center gap-1" role="tablist" aria-label="Vertex AI sign-in mode">
           <button
             type="button"
@@ -1900,7 +2066,7 @@ function AuthFlow({
           {provider.auth.hasSecret ? (
             <button
               type="button"
-              className="ml-1 text-xs text-[#a2a19f] hover:text-[#f2efe9]"
+              className="ml-1 text-xs text-muted-foreground hover:text-foreground"
               onClick={() => setReauthOpen(false)}
             >
               Cancel
@@ -1939,8 +2105,8 @@ function AuthFlow({
             <DropzoneEmptyState title="Drop .json key" description="Max 64 KB" />
             <DropzoneContent />
           </Dropzone>
-          {sa ? <p className="mt-2 font-mono text-xs text-[#aed1a8]">{sa.clientEmail} · {sa.projectId}</p> : null}
-          {saError ? <p className="mt-2 text-xs text-[#f0a096]" role="alert">{saError}</p> : null}
+          {sa ? <p className="mt-2 font-mono text-xs text-success">{sa.clientEmail} · {sa.projectId}</p> : null}
+          {saError ? <p className="mt-2 text-xs text-destructive" role="alert">{saError}</p> : null}
           <Button
             type="button"
             size="sm"
@@ -1961,7 +2127,7 @@ function AuthFlow({
                   setReauthOpen(false);
                   onNotice("Service account stored. The file was dropped from memory.");
                 })
-                .catch((error) => onNotice(errText(error)));
+                .catch((error) => onNotice(errText(error), "danger"));
             }}
           >
             Save
@@ -2004,7 +2170,7 @@ function AuthFlow({
                   })
                   .catch((error) => {
                     popup?.close();
-                    onNotice(errText(error));
+                    onNotice(errText(error), "danger");
                   });
               }}
             >
@@ -2016,15 +2182,14 @@ function AuthFlow({
                   href={loginUrl}
                   target="_blank"
                   rel="noreferrer"
-                  className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto md:min-h-8"
+                  className="btn inline-flex min-h-11 w-full items-center justify-center rounded-xl bg-card px-3 text-xs text-info hover:border-primary sm:w-auto md:min-h-8"
                 >
                   Open sign-in link
                 </a>
-                <CopyButton value={loginUrl} label="Copy URL" />
+                <CopyButton value={loginUrl} label="Copy link" />
               </>
             ) : null}
           </div>
-          {loginUrl ? <p className="break-all font-mono text-[11px] text-[#5eead4]">{loginUrl}</p> : null}
           <div className="flex flex-wrap items-center gap-2">
             <span className="cap">Step 2</span>
             <input
@@ -2108,7 +2273,7 @@ function AuthFlow({
                     );
                   } catch (error) {
                     setError(errText(error));
-                    onNotice(errText(error));
+                    onNotice(errText(error), "danger");
                   }
                 })();
               }}
@@ -2116,12 +2281,12 @@ function AuthFlow({
               Connect
             </Button>
           </div>
-          <details className="mt-1 text-xs text-[#a2a19f]">
+          <details className="mt-1 text-xs text-muted-foreground">
             <summary className="cursor-pointer select-none">
               Advanced settings (Location / Custom Client ID)
             </summary>
             <div className="mt-2 grid gap-2 sm:grid-cols-2">
-              <label className="text-xs text-[#a2a19f]">
+              <label className="text-xs text-muted-foreground">
                 Location
                 <select
                   className="field mt-1 min-h-11 font-mono"
@@ -2136,7 +2301,7 @@ function AuthFlow({
                   ))}
                 </select>
               </label>
-              <label className="text-xs text-[#a2a19f]">
+              <label className="text-xs text-muted-foreground">
                 GCP Project ID (optional)
                 <input
                   className="field mt-1 min-h-11 font-mono"
@@ -2147,7 +2312,7 @@ function AuthFlow({
                 />
               </label>
               {vertexProjects.length > 1 ? (
-                <label className="text-xs text-[#a2a19f] sm:col-span-2">
+                <label className="text-xs text-muted-foreground sm:col-span-2">
                   Switch detected GCP Project
                   <select
                     className="field mt-1 min-h-11 font-mono"
@@ -2169,7 +2334,7 @@ function AuthFlow({
                           onChange(res.providers);
                           onNotice(`Switched Vertex project to ${nextProject}`);
                         })
-                        .catch((err) => onNotice(errText(err)));
+                        .catch((err) => onNotice(errText(err), "danger"));
                     }}
                   >
                     {vertexProjects.map((proj) => (
@@ -2180,7 +2345,7 @@ function AuthFlow({
                   </select>
                 </label>
               ) : null}
-              <label className="text-xs text-[#a2a19f] sm:col-span-2">
+              <label className="text-xs text-muted-foreground sm:col-span-2">
                 Google OAuth Client ID
                 <input
                   className="field mt-1 min-h-11 font-mono"
@@ -2192,7 +2357,7 @@ function AuthFlow({
               </label>
             </div>
           </details>
-          {error ? <p className="text-xs text-[#f0a096]" role="alert">{error}</p> : null}
+          {error ? <p className="text-xs text-destructive" role="alert">{error}</p> : null}
         </div>
       )}
     </div>
@@ -2349,34 +2514,49 @@ async function autoRouteProviderStages(
   });
 }
 
-function ProviderDialog({
-  open,
+const SETUP_MODE_TABS: Array<{ id: FilterId; label: string }> = [
+  { id: "cloud-api", label: "API key" },
+  { id: "subscription", label: "Subscription" },
+  { id: "cloud-iam", label: "Cloud account" },
+  { id: "local", label: "Local" },
+];
+
+function ProviderSetupPane({
   presets,
+  providers,
   editing,
   privileged,
-  onOpenChange,
+  onCancel,
   onSaved,
   onStagesSaved,
   onNotice,
 }: {
-  open: boolean;
   presets: Record<string, ProviderPreset>;
+  providers: ProviderView[];
   editing: ProviderView | null;
   privileged: boolean;
-  onOpenChange: (open: boolean) => void;
-  onSaved: (providers: ProviderView[]) => void;
+  onCancel: () => void;
+  onSaved: (providers: ProviderView[], savedProviderId?: string) => void;
   onStagesSaved?: (stages: StagesState) => void;
-  onNotice: (message: string) => void;
+  onNotice: OnNotice;
 }) {
+  const providersRef = useRef<ProviderView[]>(providers);
+  providersRef.current = providers;
+  const lastInitKeyRef = useRef<string>("");
   const [mode, setMode] = useState<FilterId>("cloud-api");
   const [presetId, setPresetId] = useState("openrouter");
-  const [id, setId] = useState("openrouter");
+  const [id, setId] = useState(() =>
+    editing ? editing.id : nextAvailableProviderId("openrouter", providers),
+  );
+  const [userEditedId, setUserEditedId] = useState(false);
+  const [userEditedLabel, setUserEditedLabel] = useState(false);
   const [label, setLabel] = useState("OpenRouter");
+  const [protocolLabel, setProtocolLabel] = useState("OpenAI compatible");
   const [baseUrl, setBaseUrl] = useState("https://openrouter.ai/api/v1");
   const [apiKey, setApiKey] = useState("");
   const [allowPrivate, setAllowPrivate] = useState(false);
   const [headersText, setHeadersText] = useState("");
-  const [routeStages, setRouteStages] = useState(true);
+  const [routeStages, setRouteStages] = useState(false);
   const [sa, setSa] = useState<ServiceAccountPreview | null>(null);
   const [saError, setSaError] = useState("");
   const [vertexMode, setVertexMode] = useState<VertexAuthMode>("vertex-oauth");
@@ -2401,10 +2581,11 @@ function ProviderDialog({
   const pollIntervalMsRef = useRef(5000);
 
   useEffect(() => {
-    if (!open) {
-      setDevicePolling(false);
-      return;
-    }
+    const hasPresets = Object.keys(presets).length > 0;
+    const initKey = editing ? `edit:${editing.id}` : `new:${hasPresets ? "ready" : "empty"}`;
+    if (lastInitKeyRef.current === initKey) return;
+    lastInitKeyRef.current = initKey;
+
     setApiKey("");
     setSa(null);
     setSaError("");
@@ -2418,8 +2599,10 @@ function ProviderDialog({
     setDeviceVerifyUri("");
     setDevicePolling(false);
     setDeviceWaited(0);
-    setRouteStages(true);
+    setRouteStages(false);
     setFormError("");
+    setUserEditedId(false);
+    setUserEditedLabel(false);
     setDialogConnectedProvider(editing);
     setHeadersText(editing?.headers ? JSON.stringify(editing.headers, null, 2) : "");
     if (editing) {
@@ -2427,6 +2610,13 @@ function ProviderDialog({
       setMode(nextMode === "all" || nextMode === "tts" ? "cloud-api" : nextMode);
       setId(editing.id);
       setLabel(editing.label);
+      setProtocolLabel(
+        editing.protocol === "anthropic-messages"
+          ? "Anthropic messages"
+          : editing.protocol === "vertex-openai" || editing.kind === "cloud-iam"
+            ? "Vertex AI"
+            : "OpenAI compatible",
+      );
       setBaseUrl(editing.baseUrl);
       setAllowPrivate(editing.allowPrivateNetwork);
       setPresetId(editing.preset || editing.id);
@@ -2443,32 +2633,110 @@ function ProviderDialog({
     setVertexLocation("global");
     setVertexClientId(DEFAULT_GOOGLE_OAUTH_CLIENT_ID);
     applyPreset(presets.openrouter || presets.openai, "openrouter", "cloud-api");
-  }, [open, editing, presets]);
+  }, [editing, presets]);
+
+  useEffect(() => {
+    if (
+      editing ||
+      userEditedId ||
+      apiKey.trim() ||
+      busy ||
+      devicePolling ||
+      subLoginUrl ||
+      vertexLoginUrl
+    ) {
+      return;
+    }
+    if (hasProviderIdCollision(id, providers)) {
+      const nextId = nextAvailableProviderId(presetId, providers);
+      setId(nextId);
+      if (!userEditedLabel) {
+        const resolved = presets[presetId] || FALLBACK_SUBSCRIPTION_PRESETS.find((item) => item.id === presetId);
+        const baseLabel =
+          resolved?.label ||
+          (presetId === "vertex-ai"
+            ? "Google Cloud Vertex AI"
+            : presetId === "ollama"
+              ? "Ollama"
+              : presetId === "openrouter"
+                ? "OpenRouter"
+                : presetId);
+        setLabel(nextAvailableProviderLabel(baseLabel, nextId, presetId, providers));
+      }
+    }
+  }, [
+    providers,
+    editing,
+    userEditedId,
+    userEditedLabel,
+    apiKey,
+    busy,
+    devicePolling,
+    subLoginUrl,
+    vertexLoginUrl,
+    id,
+    presetId,
+    presets,
+  ]);
 
   function applyPreset(preset: ProviderPreset | undefined, fallbackId: string, fallbackMode?: FilterId) {
     const fallbackSub = FALLBACK_SUBSCRIPTION_PRESETS.find((item) => item.id === fallbackId);
     const resolved = preset || fallbackSub;
-    const nextId = resolved?.id || fallbackId;
-    setPresetId(nextId);
-    setId(editing ? editing.id : nextId);
+    const basePresetId = resolved?.id || fallbackId;
+    const nextId = editing
+      ? editing.id
+      : nextAvailableProviderId(basePresetId, providersRef.current);
+    setPresetId(basePresetId);
+    setId(nextId);
+    setUserEditedId(false);
+    setUserEditedLabel(false);
     if (!editing) setDialogConnectedProvider(null);
-    setLabel(
+    const baseLabel =
       resolved?.label ||
-        (nextId === "vertex-ai" ? "Google Cloud Vertex AI" : nextId === "ollama" ? "Ollama" : nextId),
+      (basePresetId === "vertex-ai"
+        ? "Google Cloud Vertex AI"
+        : basePresetId === "ollama"
+          ? "Ollama"
+          : basePresetId === "openrouter"
+            ? "OpenRouter"
+            : basePresetId);
+    setLabel(
+      editing
+        ? editing.label
+        : nextAvailableProviderLabel(baseLabel, nextId, basePresetId, providersRef.current),
+    );
+    setProtocolLabel(
+      resolved?.protocol === "anthropic-messages" || basePresetId === "anthropic" || basePresetId === "claude-oauth"
+        ? "Anthropic messages"
+        : resolved?.protocol === "vertex-openai" || basePresetId === "vertex-ai" || fallbackMode === "cloud-iam"
+          ? "Vertex AI"
+          : "OpenAI compatible",
     );
     setBaseUrl(
       resolved?.baseUrl ||
-        (nextId === "ollama"
+        (basePresetId === "ollama"
           ? "http://127.0.0.1:11434/v1"
-          : nextId === "vertex-ai"
+          : basePresetId === "vertex-ai"
             ? "https://aiplatform.googleapis.com/v1"
             : "https://openrouter.ai/api/v1"),
     );
-    setAllowPrivate(Boolean(resolved?.allowPrivateNetwork || nextId === "subscription-bridge" || nextId === "ollama" || fallbackMode === "local"));
+    setAllowPrivate(
+      Boolean(
+        resolved?.allowPrivateNetwork ||
+          basePresetId === "subscription-bridge" ||
+          basePresetId === "ollama" ||
+          fallbackMode === "local",
+      ),
+    );
     const derivedMode =
       resolved?.category === "local" || resolved?.category === "subscription" || resolved?.category === "cloud-iam"
         ? resolved.category
-        : fallbackMode || (SUBSCRIPTION_PROVIDER_IDS.has(nextId) ? "subscription" : nextId === "vertex-ai" ? "cloud-iam" : "cloud-api");
+        : fallbackMode ||
+          (SUBSCRIPTION_PROVIDER_IDS.has(basePresetId)
+            ? "subscription"
+            : basePresetId === "vertex-ai"
+              ? "cloud-iam"
+              : "cloud-api");
     setMode(derivedMode);
     setSubLoginUrl("");
     setSubVerifier("");
@@ -2480,29 +2748,45 @@ function ProviderDialog({
     setFormError("");
   }
 
+  const resolvedProtocol: ProviderView["protocol"] =
+    protocolLabel === "Anthropic messages"
+      ? "anthropic-messages"
+      : protocolLabel === "Vertex AI"
+        ? "vertex-openai"
+        : "openai-compatible";
+
   async function upsertCurrentProviderRecord(): Promise<{ provider: ProviderView; providers: ProviderView[] }> {
     const body = {
       id,
       label,
       preset: presetId,
       kind: mode,
+      protocol: resolvedProtocol,
       baseUrl,
       allowPrivateNetwork: allowPrivate || presetId === "subscription-bridge",
-      auth: mode === "cloud-iam" || presetId === "vertex-ai"
-        ? {
-            mode: vertexMode,
-            clientId: vertexClientId.trim() || DEFAULT_GOOGLE_OAUTH_CLIENT_ID,
-            projectId: (vertexMode === "vertex-service-account" ? sa?.projectId : vertexProjectId.trim()) || vertexProjectId.trim() || undefined,
-            location: vertexLocation || "global",
-          }
-        : undefined,
+      auth:
+        mode === "cloud-iam" || presetId === "vertex-ai"
+          ? {
+              mode: vertexMode,
+              clientId: vertexClientId.trim() || DEFAULT_GOOGLE_OAUTH_CLIENT_ID,
+              projectId:
+                (vertexMode === "vertex-service-account" ? sa?.projectId : vertexProjectId.trim()) ||
+                vertexProjectId.trim() ||
+                undefined,
+              location: vertexLocation || "global",
+            }
+          : undefined,
       expectedRevision: editing?.revision,
     };
     const res = editing ? await api.studio.updateProvider(editing.id, body) : await api.studio.createProvider(body);
     return { provider: res.provider, providers: res.providers };
   }
 
-  async function finishProviderActivation(savedProvider: ProviderView | null | undefined, allProviders: ProviderView[], message: string) {
+  async function finishProviderActivation(
+    savedProvider: ProviderView | null | undefined,
+    allProviders: ProviderView[],
+    message: string,
+  ) {
     const targetId = savedProvider?.id || id;
     let latestProvider = savedProvider || null;
     let latestProviders = allProviders;
@@ -2528,19 +2812,18 @@ function ProviderDialog({
         /* Keep provider activation successful even if stage routing update fails */
       }
     }
-    onSaved(latestProviders);
     setDialogConnectedProvider(latestProvider);
     const syncNote = syncedCount > 0 ? ` Synced ${syncedCount} models from /models.` : "";
-    onNotice(routeStages ? `${message}${syncNote} Pipeline stages routed to ${label || targetId}.` : `${message}${syncNote}`);
-    const keepOAuthDialogOpen = !editing && (
-      (mode === "subscription" && presetId !== "subscription-bridge") ||
-      (mode === "cloud-iam" && vertexMode === "vertex-oauth")
+    onNotice(
+      routeStages
+        ? `${message}${syncNote} Pipeline stages routed to ${label || targetId}.`
+        : `${message}${syncNote}`,
     );
-    if (!keepOAuthDialogOpen) onOpenChange(false);
+    onSaved(latestProviders, targetId);
   }
 
   useEffect(() => {
-    if (!open || !devicePolling || mode !== "subscription" || !DEVICE_CODE_PROVIDER_IDS.has(presetId)) return;
+    if (!devicePolling || mode !== "subscription" || !DEVICE_CODE_PROVIDER_IDS.has(presetId)) return;
     let cancelled = false;
     let timer = 0;
     const targetProviderId = id || presetId;
@@ -2593,7 +2876,7 @@ function ProviderDialog({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [open, devicePolling, mode, presetId, id, routeStages]);
+  }, [devicePolling, mode, presetId, id, routeStages]);
 
   async function startSubscriptionPkce() {
     setFormError("");
@@ -2632,8 +2915,8 @@ function ProviderDialog({
     if (!subVerifier && !isDirectClaudeToken) {
       setFormError(
         presetId === "claude-oauth"
-          ? "Click '1. Open Claude Sign-In' first so PKCE can exchange this code."
-          : "Click 'Open ChatGPT Browser Redirect' first so PKCE can exchange this code.",
+          ? "Click 'Open Claude Sign-In' first so PKCE can exchange this code."
+          : "Click 'Open Redirect' first so PKCE can exchange this code.",
       );
       return;
     }
@@ -2729,154 +3012,6 @@ function ProviderDialog({
     }
   }
 
-  async function submit() {
-    if (isJustConnectedOAuth) {
-      onOpenChange(false);
-      return;
-    }
-    if (mode === "subscription" && (!editing?.auth.hasSecret || subCodeOrUrl.trim())) {
-      if (DEVICE_CODE_PROVIDER_IDS.has(presetId)) {
-        if (deviceUserCode) await verifySubscriptionDeviceFlow();
-        else await startSubscriptionDeviceFlow();
-        return;
-      }
-      if (presetId === "claude-oauth") {
-        if (subCodeOrUrl.trim()) await completeSubscriptionPkce();
-        else await startSubscriptionPkce();
-        return;
-      }
-    }
-    if (mode === "cloud-iam" && vertexMode === "vertex-oauth" && !vertexOauthToken.trim() && !editing?.auth.hasSecret) {
-      if (!vertexLoginUrl) await startGoogleSignIn();
-      else setFormError("Paste the Google verification code (4/0A...) in Step 2 to connect.");
-      return;
-    }
-    setFormError("");
-    if (mode === "cloud-api" && (!editing || !editing.auth.hasSecret) && !apiKey.trim()) {
-      setFormError("Enter an API key to verify and add this provider.");
-      return;
-    }
-    if (!NODE_ID_RE.test(id)) {
-      setFormError("Id must start with a letter or digit and stay under 64 characters.");
-      return;
-    }
-    if ((mode === "cloud-api" || mode === "cloud-iam") && !baseUrl.startsWith("https://")) {
-      setFormError("Cloud API and Vertex URLs must use https://.");
-      return;
-    }
-    const effectiveAllowPrivate = allowPrivate || presetId === "subscription-bridge" || mode === "local";
-    const httpUrl = baseUrl.startsWith("http://");
-    if (!baseUrl.startsWith("https://") && !httpUrl) {
-      setFormError("URL must start with https://, or http:// with the private-network opt-in.");
-      return;
-    }
-    if (httpUrl && !effectiveAllowPrivate) {
-      setFormError("http:// endpoints need Allow private network. Remote cloud URLs must use https://.");
-      return;
-    }
-    if (mode === "local" && !effectiveAllowPrivate) {
-      setFormError("Local providers need the private-network opt-in.");
-      return;
-    }
-    let headers: Record<string, string> | undefined;
-    if (headersText.trim()) {
-      try {
-        const parsed = JSON.parse(headersText) as unknown;
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Headers must be a JSON object");
-        headers = Object.fromEntries(Object.entries(parsed as Record<string, unknown>).map(([key, value]) => [key, String(value)]));
-      } catch (error) {
-        setFormError(error instanceof Error ? error.message : "Headers JSON is invalid");
-        return;
-      }
-    }
-    const isVertexDialog = mode === "cloud-iam" || presetId === "vertex-ai";
-    const trimmedVertexToken = vertexOauthToken.trim();
-    const isVertexAuthCode =
-      isVertexDialog &&
-      vertexMode === "vertex-oauth" &&
-      Boolean(trimmedVertexToken) &&
-      (trimmedVertexToken.startsWith("http://") ||
-        trimmedVertexToken.startsWith("https://") ||
-        (!trimmedVertexToken.startsWith("ya29.") && !trimmedVertexToken.startsWith("{")));
-    const resolvedClientId = vertexClientId.trim() || DEFAULT_GOOGLE_OAUTH_CLIENT_ID;
-    setBusy(true);
-    try {
-      const body = {
-        id,
-        label,
-        preset: presetId,
-        kind: mode,
-        baseUrl,
-        allowPrivateNetwork: effectiveAllowPrivate,
-        headers,
-        apiKey: apiKey.trim() || undefined,
-        serviceAccountJson: isVertexDialog && vertexMode === "vertex-service-account" ? sa?.json : undefined,
-        oauthToken:
-          isVertexDialog && vertexMode === "vertex-oauth" && trimmedVertexToken && !isVertexAuthCode
-            ? trimmedVertexToken
-            : undefined,
-        auth: isVertexDialog
-          ? {
-              mode: vertexMode,
-              clientId: resolvedClientId,
-              projectId: (vertexMode === "vertex-service-account" ? sa?.projectId : vertexProjectId.trim()) || vertexProjectId.trim() || undefined,
-              location: vertexLocation || "global",
-              accessToken:
-                vertexMode === "vertex-oauth" && trimmedVertexToken && !isVertexAuthCode
-                  ? trimmedVertexToken
-                  : undefined,
-            }
-          : sa
-            ? { projectId: sa.projectId }
-            : undefined,
-        expectedRevision: editing?.revision,
-        ...(mode === "cloud-api" ? { verifyBeforeSave: true } : {}),
-      };
-      const secret = apiKey || vertexOauthToken;
-      let result = editing
-        ? await api.studio.updateProvider(editing.id, body)
-        : await api.studio.createProvider(body);
-      setApiKey("");
-      setVertexOauthToken("");
-      if (isVertexDialog && vertexMode === "vertex-oauth" && trimmedVertexToken) {
-        const exRes = await api.studio.pkceExchange({
-          providerId: id,
-          mode: "vertex-oauth",
-          ...(isVertexAuthCode
-            ? { codeOrUrl: trimmedVertexToken, codeVerifier: vertexVerifier || undefined }
-            : { accessToken: trimmedVertexToken }),
-          ...(resolvedClientId !== DEFAULT_GOOGLE_OAUTH_CLIENT_ID ? { clientId: resolvedClientId } : {}),
-        });
-        setVertexVerifier("");
-        const detectedProjectId = exRes.provider?.auth?.projectId || exRes.projectId || "";
-        const detectedList = exRes.projects || exRes.provider?.auth?.projects || [];
-        if (detectedProjectId && !vertexProjectId.trim()) {
-          setVertexProjectId(detectedProjectId);
-        }
-        if (detectedList.length > 0) {
-          setVertexProjects(detectedList);
-        }
-        const fresh = await api.studio.providers();
-        result = { ...result, providers: fresh.providers };
-      }
-      setSa(null);
-      const savedProvider = result.providers.find((p) => p.id === id) || result.provider;
-      await finishProviderActivation(
-        savedProvider,
-        result.providers,
-        secret
-          ? "Key verified, stored, and cleared from the form."
-          : presetId === "subscription-bridge"
-            ? "Local CLI subscription bridge saved."
-            : "Provider saved.",
-      );
-    } catch (error) {
-      setFormError(errText(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function startGoogleSignIn() {
     setFormError("");
     setBusy(true);
@@ -2884,11 +3019,15 @@ function ProviderDialog({
     try {
       const customClientId = vertexClientId.trim();
       const start = await api.studio.pkceStart({
-        providerId: id || "vertex-ai", mode: "vertex-oauth", preset: "vertex-ai",
+        providerId: id || "vertex-ai",
+        mode: "vertex-oauth",
+        preset: "vertex-ai",
         ...(customClientId && customClientId !== DEFAULT_GOOGLE_OAUTH_CLIENT_ID ? { clientId: customClientId } : {}),
       });
       const resolvedClientId = customClientId || DEFAULT_GOOGLE_OAUTH_CLIENT_ID;
-      const url = start.authorizeUrl || `https://accounts.google.com/o/oauth2/auth?client_id=${encodeURIComponent(resolvedClientId)}&redirect_uri=${encodeURIComponent("https://sdk.cloud.google.com/applicationdefaultauthcode.html")}&scope=${encodeURIComponent("openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform")}&response_type=code&access_type=offline&prompt=consent&token_usage=remote`;
+      const url =
+        start.authorizeUrl ||
+        `https://accounts.google.com/o/oauth2/auth?client_id=${encodeURIComponent(resolvedClientId)}&redirect_uri=${encodeURIComponent("https://sdk.cloud.google.com/applicationdefaultauthcode.html")}&scope=${encodeURIComponent("openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform")}&response_type=code&access_type=offline&prompt=consent&token_usage=remote`;
       setVertexVerifier(start.codeVerifier);
       setVertexLoginUrl(url);
       if (popup && !popup.closed) popup.location.href = url;
@@ -2896,7 +3035,9 @@ function ProviderDialog({
     } catch (error) {
       popup?.close();
       setFormError(errText(error));
-    } finally { setBusy(false); }
+    } finally {
+      setBusy(false);
+    }
   }
 
   const presetList = Object.values(presets);
@@ -2926,104 +3067,324 @@ function ProviderDialog({
   }, [presets, presetList]);
   const localPresetList = useMemo(() => buildLocalPresets(presets), [presets]);
   const activeDialogProvider = dialogConnectedProvider || editing;
-  const isJustConnectedOAuth = !editing && Boolean(dialogConnectedProvider?.auth.hasSecret) && (
-    (mode === "subscription" && presetId !== "subscription-bridge" && !subCodeOrUrl.trim()) ||
-    (mode === "cloud-iam" && vertexMode === "vertex-oauth" && !vertexOauthToken.trim())
-  );
-  const requiresCloudApiKey =
-    mode === "cloud-api" && (!activeDialogProvider || !activeDialogProvider.auth.hasSecret) && !apiKey.trim();
+  const isJustConnectedOAuth =
+    !editing &&
+    Boolean(dialogConnectedProvider?.auth.hasSecret) &&
+    ((mode === "subscription" && presetId !== "subscription-bridge" && !subCodeOrUrl.trim()) ||
+      (mode === "cloud-iam" && vertexMode === "vertex-oauth" && !vertexOauthToken.trim()));
+
+  async function submit() {
+    if (isJustConnectedOAuth && dialogConnectedProvider) {
+      const fresh = await api.studio.providers().catch(() => null);
+      if (fresh?.providers) onSaved(fresh.providers, dialogConnectedProvider.id);
+      else onCancel();
+      return;
+    }
+    if (mode === "subscription" && (!editing?.auth.hasSecret || subCodeOrUrl.trim())) {
+      if (DEVICE_CODE_PROVIDER_IDS.has(presetId)) {
+        if (deviceUserCode) await verifySubscriptionDeviceFlow();
+        else await startSubscriptionDeviceFlow();
+        return;
+      }
+      if (presetId === "claude-oauth") {
+        if (subCodeOrUrl.trim()) await completeSubscriptionPkce();
+        else await startSubscriptionPkce();
+        return;
+      }
+    }
+    if (
+      mode === "cloud-iam" &&
+      vertexMode === "vertex-oauth" &&
+      !vertexOauthToken.trim() &&
+      !editing?.auth.hasSecret
+    ) {
+      if (!vertexLoginUrl) await startGoogleSignIn();
+      else setFormError("Paste the Google verification code (4/0A...) in Step 2 to connect.");
+      return;
+    }
+    setFormError("");
+    if (mode === "cloud-api" && (!editing || !editing.auth.hasSecret) && !apiKey.trim()) {
+      setFormError("Enter an API key to verify and add this provider.");
+      return;
+    }
+    const targetId = (editing ? editing.id : id).trim();
+    if (!NODE_ID_RE.test(targetId)) {
+      setFormError("Id must start with a letter or digit and stay under 64 characters.");
+      return;
+    }
+    if (!editing && hasProviderIdCollision(targetId, providers)) {
+      setFormError(
+        `Provider ID '${targetId}' already exists. Choose a unique Provider ID in Advanced connection settings or configure the existing connection.`,
+      );
+      return;
+    }
+    if ((mode === "cloud-api" || mode === "cloud-iam") && !baseUrl.startsWith("https://")) {
+      setFormError("Cloud API and Vertex URLs must use https://.");
+      return;
+    }
+    const effectiveAllowPrivate = allowPrivate || presetId === "subscription-bridge" || mode === "local";
+    const httpUrl = baseUrl.startsWith("http://");
+    if (!baseUrl.startsWith("https://") && !httpUrl) {
+      setFormError("URL must start with https://, or http:// with the private-network opt-in.");
+      return;
+    }
+    if (httpUrl && !effectiveAllowPrivate) {
+      setFormError("http:// endpoints need Allow private network. Remote cloud URLs must use https://.");
+      return;
+    }
+    if (mode === "local" && !effectiveAllowPrivate) {
+      setFormError("Local providers need the private-network opt-in.");
+      return;
+    }
+    let headers: Record<string, string> | undefined;
+    if (headersText.trim()) {
+      try {
+        const parsed = JSON.parse(headersText) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("Headers must be a JSON object");
+        }
+        headers = Object.fromEntries(
+          Object.entries(parsed as Record<string, unknown>).map(([key, value]) => [key, String(value)]),
+        );
+      } catch (error) {
+        setFormError(error instanceof Error ? error.message : "Headers JSON is invalid");
+        return;
+      }
+    }
+    const isVertexDialog = mode === "cloud-iam" || presetId === "vertex-ai";
+    const trimmedVertexToken = vertexOauthToken.trim();
+    const isVertexAuthCode =
+      isVertexDialog &&
+      vertexMode === "vertex-oauth" &&
+      Boolean(trimmedVertexToken) &&
+      (trimmedVertexToken.startsWith("http://") ||
+        trimmedVertexToken.startsWith("https://") ||
+        (!trimmedVertexToken.startsWith("ya29.") && !trimmedVertexToken.startsWith("{")));
+    const resolvedClientId = vertexClientId.trim() || DEFAULT_GOOGLE_OAUTH_CLIENT_ID;
+    setBusy(true);
+    try {
+      const body = {
+        id: targetId,
+        label: label.trim() || targetId,
+        preset: presetId,
+        kind: mode,
+        protocol: resolvedProtocol,
+        baseUrl,
+        allowPrivateNetwork: effectiveAllowPrivate,
+        headers,
+        apiKey: apiKey.trim() || undefined,
+        serviceAccountJson: isVertexDialog && vertexMode === "vertex-service-account" ? sa?.json : undefined,
+        oauthToken:
+          isVertexDialog && vertexMode === "vertex-oauth" && trimmedVertexToken && !isVertexAuthCode
+            ? trimmedVertexToken
+            : undefined,
+        auth: isVertexDialog
+          ? {
+              mode: vertexMode,
+              clientId: resolvedClientId,
+              projectId:
+                (vertexMode === "vertex-service-account" ? sa?.projectId : vertexProjectId.trim()) ||
+                vertexProjectId.trim() ||
+                undefined,
+              location: vertexLocation || "global",
+              accessToken:
+                vertexMode === "vertex-oauth" && trimmedVertexToken && !isVertexAuthCode
+                  ? trimmedVertexToken
+                  : undefined,
+            }
+          : sa
+            ? { projectId: sa.projectId }
+            : undefined,
+        expectedRevision: editing?.revision,
+        ...(mode === "cloud-api" ? { verifyBeforeSave: true } : {}),
+        ...(!editing ? { createOnly: true } : {}),
+      };
+      const secret = apiKey || vertexOauthToken;
+      let result = editing
+        ? await api.studio.updateProvider(editing.id, body)
+        : await api.studio.createProvider(body);
+      const savedId = result.provider?.id || targetId;
+      setApiKey("");
+      setVertexOauthToken("");
+      if (isVertexDialog && vertexMode === "vertex-oauth" && trimmedVertexToken) {
+        const exRes = await api.studio.pkceExchange({
+          providerId: savedId,
+          mode: "vertex-oauth",
+          ...(isVertexAuthCode
+            ? { codeOrUrl: trimmedVertexToken, codeVerifier: vertexVerifier || undefined }
+            : { accessToken: trimmedVertexToken }),
+          ...(resolvedClientId !== DEFAULT_GOOGLE_OAUTH_CLIENT_ID ? { clientId: resolvedClientId } : {}),
+        });
+        setVertexVerifier("");
+        const detectedProjectId = exRes.provider?.auth?.projectId || exRes.projectId || "";
+        const detectedList = exRes.projects || exRes.provider?.auth?.projects || [];
+        if (detectedProjectId && !vertexProjectId.trim()) {
+          setVertexProjectId(detectedProjectId);
+        }
+        if (detectedList.length > 0) {
+          setVertexProjects(detectedList);
+        }
+        const fresh = await api.studio.providers();
+        result = { ...result, providers: fresh.providers };
+      }
+      setSa(null);
+      const savedProvider = result.providers.find((p) => p.id === savedId) || result.provider;
+      await finishProviderActivation(
+        savedProvider,
+        result.providers,
+        secret
+          ? "Key verified, stored, and cleared from the form."
+          : presetId === "subscription-bridge"
+            ? "Local CLI subscription bridge saved."
+            : "Provider saved.",
+      );
+    } catch (error) {
+      setFormError(errText(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const serviceOptions = useMemo(() => {
+    if (mode === "subscription") return subscriptionPresetOptions;
+    if (mode === "local") {
+      return localPresetList.map((item) => ({
+        id: item.id,
+        label: item.label,
+        baseUrl: item.baseUrl,
+        category: "local" as const,
+      }));
+    }
+    const filtered = presetList.filter((preset) =>
+      mode === "cloud-api" ? preset.category === "cloud-api" : preset.category === "cloud-iam",
+    );
+    if (filtered.length > 0) return filtered;
+    if (mode === "cloud-iam") {
+      return [{ id: "vertex-ai", label: "Google Cloud Vertex AI", baseUrl: "https://aiplatform.googleapis.com/v1" }];
+    }
+    return [
+      { id: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1" },
+      { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1" },
+      { id: "anthropic", label: "Anthropic", baseUrl: "https://api.anthropic.com" },
+    ];
+  }, [mode, subscriptionPresetOptions, localPresetList, presetList]);
+
+  const ctaLabel = busy
+    ? "Verifying…"
+    : isJustConnectedOAuth
+      ? "Done"
+      : mode === "cloud-api"
+        ? "Verify connection"
+        : mode === "subscription" && DEVICE_CODE_PROVIDER_IDS.has(presetId) && !editing?.auth.hasSecret
+          ? deviceUserCode
+            ? "Check authorization"
+            : deviceButtonLabelFor(presetId)
+          : mode === "subscription" && presetId === "claude-oauth" && (!editing?.auth.hasSecret || subCodeOrUrl.trim())
+            ? subCodeOrUrl.trim()
+              ? "Verify connection"
+              : "Open Claude Sign-In"
+            : mode === "cloud-iam" && vertexMode === "vertex-oauth" && (!editing?.auth.hasSecret || vertexOauthToken.trim())
+              ? vertexOauthToken.trim()
+                ? "Verify connection"
+                : "Sign in with Google"
+              : "Verify connection";
 
   return (
-    <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next); }}>
-      <DialogContent className="studio-dialog sm:max-w-2xl">
-        <DialogHeader>
-          <DialogTitle className="font-serif text-2xl">{editing ? `Edit ${editing.label}` : "Add provider"}</DialogTitle>
-          <DialogDescription className="sr-only">Configure provider connection</DialogDescription>
-        </DialogHeader>
-        <div className="flex flex-wrap gap-1" role="group" aria-label="Connection mode">
-          {FILTERS.filter((item) => item.id !== "all" && item.id !== "tts").map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className={cn("chip", mode === item.id && "is-on")}
-              aria-pressed={mode === item.id}
-              onClick={() => {
-                setMode(item.id);
-                setFormError("");
-                if (item.id === "cloud-api") {
-                  const firstCloud =
-                    presets.openrouter ||
-                    presets.openai ||
-                    presetList.find((p) => p.category === "cloud-api");
-                  applyPreset(firstCloud, firstCloud?.id || "openrouter", "cloud-api");
-                } else if (item.id === "subscription") {
-                  const firstSub =
-                    subscriptionPresetOptions[0] ||
-                    presets["codex-oauth"];
-                  applyPreset(firstSub, firstSub?.id || "codex-oauth", "subscription");
-                } else if (item.id === "cloud-iam") {
-                  const firstIam =
-                    presets["vertex-ai"] ||
-                    presetList.find((p) => p.category === "cloud-iam");
-                  applyPreset(firstIam, firstIam?.id || "vertex-ai", "cloud-iam");
-                } else if (item.id === "local") {
-                  const firstLocal =
-                    presets.ollama ||
-                    presetList.find((p) => p.category === "local");
-                  applyPreset(firstLocal, firstLocal?.id || "ollama", "local");
-                }
-              }}
-            >
-              {item.label}
-            </button>
-          ))}
-        </div>
+    <>
+      <div className="studio-pane-header">
+        <h2>{editing ? editing.label : "New connection"}</h2>
+      </div>
 
-        {mode === "local" ? (
-          <div className="flex flex-wrap gap-2">
-            {localPresetList.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                className={cn("chip", presetId === item.id && "is-on")}
-                onClick={() => {
-                  applyPreset(presets[item.id], item.id, "local");
-                  setBaseUrl(item.baseUrl);
-                  setAllowPrivate(true);
-                  setMode("local");
-                }}
-              >
-                {item.label} :{item.port}
-              </button>
+      <div className="studio-subtabs" role="tablist" aria-label="Connection mode">
+        {SETUP_MODE_TABS.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            role="tab"
+            aria-selected={mode === item.id}
+            onClick={() => {
+              setMode(item.id);
+              setFormError("");
+              if (item.id === "cloud-api") {
+                const firstCloud =
+                  presets.openrouter ||
+                  presets.openai ||
+                  presetList.find((p) => p.category === "cloud-api");
+                applyPreset(firstCloud, firstCloud?.id || "openrouter", "cloud-api");
+              } else if (item.id === "subscription") {
+                const firstSub = subscriptionPresetOptions[0] || presets["codex-oauth"];
+                applyPreset(firstSub, firstSub?.id || "codex-oauth", "subscription");
+              } else if (item.id === "cloud-iam") {
+                const firstIam = presets["vertex-ai"] || presetList.find((p) => p.category === "cloud-iam");
+                applyPreset(firstIam, firstIam?.id || "vertex-ai", "cloud-iam");
+              } else if (item.id === "local") {
+                const firstLocal = presets.ollama || presetList.find((p) => p.category === "local");
+                applyPreset(firstLocal, firstLocal?.id || "ollama", "local");
+              }
+            }}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="studio-form">
+        <label className="studio-field-label">
+          <span>Service</span>
+          <select
+            className="field"
+            value={presetId}
+            disabled={!privileged}
+            onChange={(event) => {
+              const nextId = event.target.value;
+              if (mode === "local") {
+                const localItem = localPresetList.find((item) => item.id === nextId);
+                applyPreset(presets[nextId], nextId, "local");
+                if (localItem) setBaseUrl(localItem.baseUrl);
+                setAllowPrivate(true);
+                setMode("local");
+                return;
+              }
+              const found =
+                subscriptionPresetOptions.find((item) => item.id === nextId) || presets[nextId];
+              applyPreset(found, nextId, mode);
+            }}
+          >
+            {serviceOptions.map((preset) => (
+              <option key={preset.id} value={preset.id}>
+                {preset.label}
+              </option>
             ))}
-          </div>
-        ) : (
-          <label className="flex flex-col gap-1 text-sm">
-            Preset
-            <select
-              className="field min-h-11"
-              value={presetId}
+          </select>
+        </label>
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <label className="studio-field-label">
+            <span>Name</span>
+            <input
+              className="field"
+              value={label}
+              disabled={!privileged}
               onChange={(event) => {
-                const nextId = event.target.value;
-                const found =
-                  subscriptionPresetOptions.find((item) => item.id === nextId) ||
-                  presets[nextId];
-                applyPreset(found, nextId, mode);
+                setLabel(event.target.value);
+                setUserEditedLabel(true);
               }}
+            />
+          </label>
+          <label className="studio-field-label">
+            <span>Protocol</span>
+            <select
+              className="field"
+              value={protocolLabel}
+              disabled={!privileged}
+              onChange={(event) => setProtocolLabel(event.target.value)}
             >
-              {(mode === "subscription"
-                ? subscriptionPresetOptions
-                : presetList.filter((preset) =>
-                    mode === "cloud-api" ? preset.category === "cloud-api" : preset.category === "cloud-iam",
-                  )
-              ).map((preset) => (
-                <option key={preset.id} value={preset.id}>
-                  {preset.label}
-                </option>
-              ))}
+              <option value="OpenAI compatible">OpenAI compatible</option>
+              <option value="Anthropic messages">Anthropic messages</option>
+              <option value="Vertex AI">Vertex AI</option>
             </select>
           </label>
-        )}
+        </div>
 
         {activeDialogProvider?.auth?.hasSecret ? (
           <ConnectedAccountBanner
@@ -3036,7 +3397,10 @@ function ProviderDialog({
                 .updateProvider(activeDialogProvider.id, {
                   auth: {
                     mode: activeDialogProvider.auth.mode || "vertex-oauth",
-                    clientId: vertexClientId.trim() || activeDialogProvider.auth.clientId || DEFAULT_GOOGLE_OAUTH_CLIENT_ID,
+                    clientId:
+                      vertexClientId.trim() ||
+                      activeDialogProvider.auth.clientId ||
+                      DEFAULT_GOOGLE_OAUTH_CLIENT_ID,
                     projectId: nextProject || undefined,
                     location: vertexLocation || "global",
                   },
@@ -3051,7 +3415,7 @@ function ProviderDialog({
                           : p,
                       )
                     : res.providers;
-                  onSaved(nextProviders);
+                  onSaved(nextProviders, activeDialogProvider.id);
                   onNotice(`Switched Vertex project to ${nextProject}`);
                 })
                 .catch((err) => setFormError(errText(err)));
@@ -3059,15 +3423,44 @@ function ProviderDialog({
           />
         ) : null}
 
+        {mode === "cloud-api" ? (
+          <div className="studio-field-label">
+            <label htmlFor="setup-provider-api-key">API key</label>
+            <PasswordInput id="setup-provider-api-key" value={apiKey} onValueChange={setApiKey} disabled={!privileged}>
+              <PasswordInputField
+                className="font-mono"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="••••••••••••••••••••••••••••••••••••••••"
+                toggleLabel={{ show: "Show API key", hide: "Hide API key" }}
+              />
+            </PasswordInput>
+            <span className="studio-field-hint">Your key stays hidden after saving.</span>
+          </div>
+        ) : null}
+
+        {mode === "local" ? (
+          <label className="studio-field-label">
+            <span>Endpoint URL</span>
+            <input
+              className="field font-mono"
+              value={baseUrl}
+              disabled={!privileged}
+              spellCheck={false}
+              onChange={(event) => setBaseUrl(event.target.value)}
+            />
+          </label>
+        ) : null}
+
         {mode === "subscription" ? (
-          <div className="flex flex-col gap-3 rounded-xl border border-[#2b2c30] bg-[#101113] p-3.5">
+          <div className="flex flex-col gap-3 rounded-md border border-border bg-card p-3.5">
             {DEVICE_CODE_PROVIDER_IDS.has(presetId) ? (
               <>
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="cap is-on">Step 1</span>
                   <Button
                     type="button"
-                    className="min-h-11 w-full sm:w-auto"
+                    size="sm"
                     disabled={!privileged || busy}
                     onClick={() => void startSubscriptionDeviceFlow()}
                   >
@@ -3078,15 +3471,15 @@ function ProviderDialog({
                       href={deviceVerifyUri}
                       target="_blank"
                       rel="noreferrer"
-                      className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 break-all text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto"
+                      className="chip inline-flex items-center text-xs"
                     >
-                      Open {deviceVerifyUri}
+                      Open verification
                     </a>
                   ) : null}
                 </div>
                 {deviceUserCode ? (
-                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 py-2">
-                    <span className="font-mono text-2xl tracking-[0.2em] text-[#f2efe9]">{deviceUserCode}</span>
+                  <div className="flex flex-wrap items-center justify-between gap-3 rounded border border-border bg-background px-3 py-2">
+                    <span className="font-mono text-xl font-semibold tracking-[0.18em]">{deviceUserCode}</span>
                     <CopyButton value={deviceUserCode} label="Copy code" />
                   </div>
                 ) : null}
@@ -3096,20 +3489,19 @@ function ProviderDialog({
                     type="button"
                     variant="outline"
                     size="sm"
-                    className="min-h-11 w-full sm:w-auto"
                     disabled={!privileged || busy || !deviceUserCode}
                     onClick={() => void verifySubscriptionDeviceFlow()}
                   >
-                    Connect
+                    Verify authorization
                   </Button>
                   {devicePolling ? (
-                    <span className="font-mono text-xs text-[#5eead4]">
+                    <span className="font-mono text-xs text-muted-foreground">
                       Polling · {deviceWaited.toFixed(0)}s
                     </span>
                   ) : null}
                 </div>
                 {presetId === "codex-oauth" ? (
-                  <details className="mt-1 text-xs text-[#a2a19f]">
+                  <details className="mt-1 text-xs text-muted-foreground">
                     <summary className="cursor-pointer select-none">Browser redirect (PKCE)</summary>
                     <div className="mt-2 flex flex-col gap-2">
                       <div className="flex flex-wrap items-center gap-2">
@@ -3118,7 +3510,6 @@ function ProviderDialog({
                           type="button"
                           variant="outline"
                           size="sm"
-                          className="min-h-11 w-full sm:w-auto"
                           disabled={!privileged || busy}
                           onClick={() => void startSubscriptionPkce()}
                         >
@@ -3130,7 +3521,7 @@ function ProviderDialog({
                               href={subLoginUrl}
                               target="_blank"
                               rel="noreferrer"
-                              className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto"
+                              className="chip inline-flex items-center text-xs"
                             >
                               Open sign-in link
                             </a>
@@ -3138,13 +3529,13 @@ function ProviderDialog({
                           </>
                         ) : null}
                       </div>
-                      {subLoginUrl ? <p className="break-all font-mono text-xs text-[#5eead4]">{subLoginUrl}</p> : null}
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="cap">Step 2</span>
                         <input
-                          className="field min-h-11 flex-1 font-mono"
+                          className="field flex-1 font-mono"
                           aria-label="Callback URL or code"
                           value={subCodeOrUrl}
+                          disabled={!privileged}
                           autoComplete="off"
                           spellCheck={false}
                           placeholder="Callback URL or code"
@@ -3154,7 +3545,6 @@ function ProviderDialog({
                           type="button"
                           variant="outline"
                           size="sm"
-                          className="min-h-11 w-full sm:w-auto"
                           disabled={!privileged || busy || !subCodeOrUrl.trim()}
                           onClick={() => void completeSubscriptionPkce()}
                         >
@@ -3171,7 +3561,7 @@ function ProviderDialog({
                   <span className="cap is-on">Step 1</span>
                   <Button
                     type="button"
-                    className="min-h-11 w-full sm:w-auto"
+                    size="sm"
                     disabled={!privileged || busy}
                     onClick={() => void startSubscriptionPkce()}
                   >
@@ -3183,7 +3573,7 @@ function ProviderDialog({
                         href={subLoginUrl}
                         target="_blank"
                         rel="noreferrer"
-                        className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto"
+                        className="chip inline-flex items-center text-xs"
                       >
                         Open sign-in link
                       </a>
@@ -3191,46 +3581,38 @@ function ProviderDialog({
                     </>
                   ) : null}
                 </div>
-                {subLoginUrl ? <p className="break-all font-mono text-xs text-[#5eead4]">{subLoginUrl}</p> : null}
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="cap">Step 2</span>
                   <input
-                    className="field min-h-11 flex-1 font-mono"
+                    className="field flex-1 font-mono"
                     aria-label="Claude authorization code or setup token"
                     value={subCodeOrUrl}
+                    disabled={!privileged}
                     autoComplete="off"
                     spellCheck={false}
                     placeholder="code#state or sk-ant-oat01-..."
                     onChange={(event) => setSubCodeOrUrl(event.target.value)}
                   />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="min-h-11 w-full sm:w-auto"
-                    disabled={!privileged || busy || !subCodeOrUrl.trim()}
-                    onClick={() => void completeSubscriptionPkce()}
-                  >
-                    Connect
-                  </Button>
                 </div>
               </>
             ) : (
               <>
-                <label className="flex flex-col gap-1 text-sm">
-                  Proxy Base URL
+                <label className="studio-field-label">
+                  <span>Proxy Base URL</span>
                   <input
-                    className="field min-h-11 font-mono"
+                    className="field font-mono"
                     value={baseUrl}
+                    disabled={!privileged}
                     spellCheck={false}
                     placeholder="http://127.0.0.1:8317/v1"
                     onChange={(event) => setBaseUrl(event.target.value)}
                   />
                 </label>
-                <div className="flex flex-col gap-1 text-sm">
-                  <label htmlFor="dialog-bridge-token">Bearer Token</label>
-                  <PasswordInput id="dialog-bridge-token" value={apiKey} onValueChange={setApiKey} disabled={!privileged}>
+                <div className="studio-field-label">
+                  <label htmlFor="setup-bridge-token">Bearer token (optional)</label>
+                  <PasswordInput id="setup-bridge-token" value={apiKey} onValueChange={setApiKey} disabled={!privileged}>
                     <PasswordInputField
-                      className="min-h-11 font-mono [&_input]:min-h-11 [&_button]:min-h-11 [&_button]:min-w-11"
+                      className="font-mono"
                       autoComplete="off"
                       spellCheck={false}
                       placeholder="Optional token"
@@ -3243,39 +3625,10 @@ function ProviderDialog({
           </div>
         ) : null}
 
-        {mode === "cloud-api" ? (
-          <div className="flex flex-col gap-1 text-sm">
-            <label htmlFor="dialog-provider-api-key">API key</label>
-            <PasswordInput id="dialog-provider-api-key" value={apiKey} onValueChange={setApiKey} disabled={!privileged}>
-              <PasswordInputField
-                className="min-h-11 font-mono [&_input]:min-h-11 [&_button]:min-h-11 [&_button]:min-w-11"
-                autoComplete="off"
-                spellCheck={false}
-                placeholder="sk-..."
-                toggleLabel={{ show: "Show API key", hide: "Hide API key" }}
-              />
-            </PasswordInput>
-          </div>
-        ) : null}
-
-        {mode === "local" ? (
-          <label className="flex flex-col gap-1 text-sm">
-            Base URL
-            <input className="field min-h-11 font-mono" value={baseUrl} spellCheck={false} onChange={(event) => setBaseUrl(event.target.value)} />
-          </label>
-        ) : null}
-
-        {mode === "local" || (mode !== "subscription" && baseUrl.startsWith("http://")) ? (
-          <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={allowPrivate} onChange={(event) => setAllowPrivate(event.target.checked)} />
-            Allow private network
-          </label>
-        ) : null}
-
         {mode === "cloud-iam" ? (
-          <div className="flex flex-col gap-3 rounded-xl border border-[#2b2c30] bg-[#101113] p-3">
+          <div className="flex flex-col gap-3 rounded-md border border-border bg-card p-3.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="text-xs tracking-[0.12em] text-[#a2a19f] uppercase">Vertex AI</span>
+              <span className="text-[13px] font-medium text-muted-foreground">Vertex AI Credentials</span>
               <div className="flex flex-wrap gap-1" role="tablist" aria-label="Vertex sign-in method">
                 <button
                   type="button"
@@ -3293,7 +3646,7 @@ function ProviderDialog({
                   aria-selected={vertexMode === "vertex-service-account"}
                   onClick={() => setVertexMode("vertex-service-account")}
                 >
-                  Service Account .json
+                  Service Account (.json)
                 </button>
               </div>
             </div>
@@ -3327,17 +3680,16 @@ function ProviderDialog({
                   <DropzoneEmptyState title="Drop .json key" description="Max 64 KB" />
                   <DropzoneContent />
                 </Dropzone>
-                {sa ? <p className="mt-2 font-mono text-xs text-[#aed1a8]">{sa.clientEmail} · {sa.projectId}</p> : null}
-                {saError ? <p className="mt-2 text-xs text-[#f0a096]" role="alert">{saError}</p> : null}
+                {sa ? <p className="mt-2 font-mono text-xs text-success">{sa.clientEmail} · {sa.projectId}</p> : null}
+                {saError ? <p className="mt-2 text-xs text-destructive" role="alert">{saError}</p> : null}
               </div>
             ) : (
-              <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-2.5">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="cap is-on">Step 1</span>
                   <Button
                     type="button"
                     size="sm"
-                    className="min-h-11 w-full sm:w-auto"
                     disabled={!privileged || busy}
                     onClick={() => void startGoogleSignIn()}
                   >
@@ -3349,252 +3701,186 @@ function ProviderDialog({
                         href={vertexLoginUrl}
                         target="_blank"
                         rel="noreferrer"
-                        className="btn inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-xs text-[#5eead4] hover:border-[#f18b6e] sm:w-auto"
+                        className="chip inline-flex items-center text-xs"
                       >
                         Open sign-in link
                       </a>
-                      <CopyButton value={vertexLoginUrl} label="Copy URL" />
+                      <CopyButton value={vertexLoginUrl} label="Copy link" />
                     </>
                   ) : null}
                 </div>
-                {vertexLoginUrl ? <p className="break-all font-mono text-[11px] text-[#5eead4]">{vertexLoginUrl}</p> : null}
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="cap">Step 2</span>
                   <input
-                    className="field min-h-11 flex-1 font-mono"
+                    className="field flex-1 font-mono"
                     aria-label="Google verification code"
                     value={vertexOauthToken}
-                    placeholder="4/0A... code"
+                    disabled={!privileged}
+                    placeholder="Paste 4/0A... verification code"
                     autoComplete="off"
                     spellCheck={false}
                     onChange={(event) => setVertexOauthToken(event.target.value)}
                   />
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="min-h-11 w-full sm:w-auto"
-                    disabled={!privileged || busy || !vertexOauthToken.trim()}
-                    onClick={() => {
-                      const token = vertexOauthToken.trim();
-                      const customClientId = vertexClientId.trim();
-                      const isCodeOrCallback =
-                        Boolean(token) &&
-                        (token.startsWith("http://") ||
-                          token.startsWith("https://") ||
-                          (!token.startsWith("ya29.") && !token.startsWith("{")));
-                      setFormError("");
-                      setBusy(true);
-                      void (async () => {
-                        try {
-                          await upsertCurrentProviderRecord();
-                          const exRes = await api.studio.pkceExchange({
-                            providerId: id || "vertex-ai",
-                            mode: "vertex-oauth",
-                            ...(isCodeOrCallback
-                              ? { codeOrUrl: token, codeVerifier: vertexVerifier || undefined }
-                              : { accessToken: token }),
-                            ...(customClientId && customClientId !== DEFAULT_GOOGLE_OAUTH_CLIENT_ID
-                              ? { clientId: customClientId }
-                              : {}),
-                          });
-                          if (isCodeOrCallback) setVertexVerifier("");
-                          setVertexOauthToken("");
-                          const detectedProjectId = exRes.provider?.auth?.projectId || exRes.projectId || "";
-                          const detectedList = exRes.projects || exRes.provider?.auth?.projects || [];
-                          if (detectedProjectId && !vertexProjectId.trim()) {
-                            setVertexProjectId(detectedProjectId);
-                          }
-                          if (detectedList.length > 0) {
-                            setVertexProjects(detectedList);
-                          }
-                          await api.studio.discoverModels(id || "vertex-ai", true).catch(() => null);
-                          const fresh = await api.studio.providers();
-                          const targetVertId = id || "vertex-ai";
-                          const nextProviders =
-                            detectedList.length > 0
-                              ? fresh.providers.map((p) =>
-                                  p.id === targetVertId ? { ...p, auth: { ...p.auth, projects: detectedList } } : p,
-                                )
-                              : fresh.providers;
-                          const savedProv =
-                            nextProviders.find((p) => p.id === targetVertId) || exRes.provider || null;
-                          setDialogConnectedProvider(savedProv);
-                          if (routeStages && savedProv) {
-                            const nextStages = await autoRouteProviderStages(
-                              savedProv,
-                              targetVertId,
-                              presets,
-                              presetId,
-                            ).catch(() => null);
-                            if (nextStages) onStagesSaved?.(nextStages);
-                          }
-                          onSaved(nextProviders);
-                          onNotice(
-                            detectedProjectId
-                              ? `Google Account connected · Auto-detected project ${detectedProjectId}.`
-                              : "Google Account connected.",
-                          );
-                        } catch (error) {
-                          setFormError(errText(error));
-                        } finally {
-                          setBusy(false);
-                        }
-                      })();
-                    }}
-                  >
-                    Connect
-                  </Button>
                 </div>
-                <details className="mt-1 text-xs text-[#a2a19f]">
-                  <summary className="cursor-pointer select-none">
-                    Advanced settings (Location / Custom Client ID)
-                  </summary>
-                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                    <label className="text-xs text-[#a2a19f]">
-                      Location
-                      <select
-                        className="field mt-1 min-h-11 font-mono"
-                        value={vertexLocation}
-                        onChange={(event) => setVertexLocation(event.target.value)}
-                      >
-                        {VERTEX_LOCATIONS.map((loc) => (
-                          <option key={loc} value={loc}>
-                            {loc}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="text-xs text-[#a2a19f]">
-                      Project ID (optional)
-                      <input
-                        className="field mt-1 min-h-11 font-mono"
-                        value={vertexProjectId}
-                        placeholder="Auto-detected on sign-in"
-                        onChange={(event) => setVertexProjectId(event.target.value)}
-                      />
-                    </label>
-                    {vertexProjects.length > 1 ? (
-                      <label className="text-xs text-[#a2a19f] sm:col-span-2">
-                        Switch detected GCP Project
-                        <select
-                          className="field mt-1 min-h-11 font-mono"
-                          value={vertexProjectId}
-                          onChange={(event) => setVertexProjectId(event.target.value)}
-                        >
-                          {vertexProjects.map((proj) => (
-                            <option key={proj.projectId} value={proj.projectId}>
-                              {proj.name ? `${proj.name} (${proj.projectId})` : proj.projectId}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    ) : null}
-                    <label className="text-xs text-[#a2a19f] sm:col-span-2">
-                      Google OAuth Client ID
-                      <input
-                        className="field mt-1 min-h-11 font-mono"
-                        value={vertexClientId}
-                        placeholder={DEFAULT_GOOGLE_OAUTH_CLIENT_ID}
-                        onChange={(event) => setVertexClientId(event.target.value)}
-                      />
-                    </label>
-                  </div>
-                </details>
               </div>
             )}
           </div>
         ) : null}
 
-        <label className="flex items-center gap-2 text-sm text-[#f2efe9]">
-          <input
-            type="checkbox"
-            checked={routeStages}
-            onChange={(event) => setRouteStages(event.target.checked)}
-          />
-          Auto-route stages
-        </label>
-
-        {mode !== "subscription" ? (
-          <details
-            className="text-xs text-[#a2a19f]"
-            open={presetId === "custom" || presetId === "custom-openai"}
-          >
-            <summary className="cursor-pointer select-none">Advanced endpoint settings</summary>
-            <div className="mt-2 flex flex-col gap-3 rounded-xl border border-[#2b2c30] bg-[#101113] p-3 text-sm text-[#f2efe9]">
-              <div className="grid gap-3 sm:grid-cols-2">
-                <label className="flex flex-col gap-1 text-sm">
-                  Id
-                  <input
-                    className="field min-h-11 font-mono"
-                    value={id}
-                    disabled={Boolean(editing)}
-                    onChange={(event) => setId(event.target.value)}
-                  />
-                </label>
-                <label className="flex flex-col gap-1 text-sm">
-                  Label
-                  <input
-                    className="field min-h-11"
-                    value={label}
-                    onChange={(event) => setLabel(event.target.value)}
-                  />
-                </label>
-              </div>
-              <label className="flex flex-col gap-1 text-sm">
-                Base URL
+        <details className="studio-accordion">
+          <summary>
+            <span>Advanced connection settings</span>
+            <span className="studio-accordion-icon" aria-hidden />
+          </summary>
+          <div className="studio-accordion-body">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="studio-field-label">
+                <span>Provider ID</span>
                 <input
-                  className="field min-h-11 font-mono"
+                  className="field font-mono"
+                  value={id}
+                  disabled={!privileged || Boolean(editing)}
+                  onChange={(event) => {
+                    setId(event.target.value);
+                    setUserEditedId(true);
+                  }}
+                />
+              </label>
+              <label className="studio-field-label">
+                <span>Base URL</span>
+                <input
+                  className="field font-mono"
                   value={baseUrl}
+                  disabled={!privileged}
                   spellCheck={false}
                   onChange={(event) => setBaseUrl(event.target.value)}
                 />
               </label>
-              <label className="flex flex-col gap-1 text-sm">
-                Custom headers JSON
-                <textarea
-                  className="field mt-1 min-h-20 font-mono"
-                  value={headersText}
-                  onChange={(event) => setHeadersText(event.target.value)}
-                  placeholder='{"HTTP-Referer":"https://example.com"}'
+            </div>
+            {mode === "cloud-iam" ? (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="studio-field-label">
+                  <span>Location</span>
+                  <select
+                    className="field font-mono"
+                    value={vertexLocation}
+                    disabled={!privileged}
+                    onChange={(event) => setVertexLocation(event.target.value)}
+                  >
+                    {VERTEX_LOCATIONS.map((loc) => (
+                      <option key={loc} value={loc}>
+                        {loc}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="studio-field-label">
+                  <span>GCP Project ID</span>
+                  <input
+                    className="field font-mono"
+                    value={vertexProjectId}
+                    disabled={!privileged}
+                    placeholder="Auto-detected on sign-in"
+                    onChange={(event) => setVertexProjectId(event.target.value)}
+                  />
+                </label>
+                <label className="studio-field-label sm:col-span-2">
+                  <span>Google OAuth Client ID</span>
+                  <input
+                    className="field font-mono"
+                    value={vertexClientId}
+                    disabled={!privileged}
+                    placeholder={DEFAULT_GOOGLE_OAUTH_CLIENT_ID}
+                    onChange={(event) => setVertexClientId(event.target.value)}
+                  />
+                </label>
+              </div>
+            ) : null}
+            <label className="studio-field-label">
+              <span>Custom headers JSON</span>
+              <textarea
+                className="field font-mono"
+                value={headersText}
+                disabled={!privileged}
+                onChange={(event) => setHeadersText(event.target.value)}
+                placeholder='{"HTTP-Referer":"https://example.com"}'
+              />
+            </label>
+            <div className="flex flex-wrap items-center gap-4">
+              <label className="inline-flex items-center gap-2 text-xs text-foreground">
+                <input
+                  type="checkbox"
+                  checked={routeStages}
+                  disabled={!privileged}
+                  onChange={(event) => setRouteStages(event.target.checked)}
                 />
+                <span>Auto-route stages on verify</span>
+              </label>
+              <label className="inline-flex items-center gap-2 text-xs text-foreground">
+                <input
+                  type="checkbox"
+                  checked={allowPrivate}
+                  disabled={!privileged}
+                  onChange={(event) => setAllowPrivate(event.target.checked)}
+                />
+                <span>Allow private network</span>
               </label>
             </div>
-          </details>
+          </div>
+        </details>
+
+        {formError ? (
+          <p className="text-xs font-medium text-destructive" role="alert">
+            {formError}
+          </p>
         ) : null}
 
-        {formError ? <p className="text-sm text-[#f0a096]" role="alert">{formError}</p> : null}
-        <DialogFooter className="flex-wrap gap-2">
-          <Button type="button" variant="outline" className="min-h-11 w-full sm:w-auto" onClick={() => onOpenChange(false)}>Cancel</Button>
-          <Button
+        <div className="studio-cta-row">
+          <button
             type="button"
-            className="min-h-11 w-full sm:w-auto"
-            disabled={!privileged || busy || requiresCloudApiKey}
+            className="studio-primary-btn"
+            disabled={!privileged || busy}
             onClick={() => void submit()}
           >
-            {busy
-              ? "Saving…"
-              : isJustConnectedOAuth
-                ? "Done"
-              : mode === "cloud-api"
-                ? "Verify & Save"
-                : mode === "subscription" && DEVICE_CODE_PROVIDER_IDS.has(presetId) && !editing?.auth.hasSecret
-                  ? deviceUserCode ? "Check Authorization" : deviceButtonLabelFor(presetId)
-                : mode === "subscription" && presetId === "claude-oauth" && (!editing?.auth.hasSecret || subCodeOrUrl.trim())
-                  ? subCodeOrUrl.trim() ? "Connect" : "Open Claude Sign-In"
-                : mode === "cloud-iam" && vertexMode === "vertex-oauth" && (!editing?.auth.hasSecret || vertexOauthToken.trim())
-                  ? vertexOauthToken.trim() ? "Connect Google Account" : "Sign in with Google"
-                  : "Save"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+            <span>{ctaLabel}</span>
+            <ArrowRight className="size-4" aria-hidden />
+          </button>
+          <button
+            type="button"
+            className="studio-cancel-btn"
+            onClick={() => {
+              applyPreset(presets.openrouter || presets.openai, "openrouter", "cloud-api");
+              setApiKey("");
+              onCancel();
+            }}
+          >
+            Cancel
+          </button>
+          <span className="studio-cta-note">Models and routing come next.</span>
+        </div>
+
+        <div className="studio-info-bar">
+          <span className="inline-flex items-center gap-2">
+            <Info className="size-4 shrink-0 opacity-75" aria-hidden />
+            <span>
+              {routeStages
+                ? "Stage routing will update after verification."
+                : "No routing changes until you confirm."}
+            </span>
+          </span>
+        </div>
+      </div>
+
+      <div className="studio-pane-footer">
+        <span>New connection</span>
+        <span>{editing ? `${editing.label} · ${editing.id}` : `Unsaved connection · ${id}`}</span>
+      </div>
+    </>
   );
 }
 
-function RoutingTab({
+export function RoutingTab({
   providers,
-  voices,
   stages,
   privileged,
   onProvidersChange,
@@ -3603,33 +3889,32 @@ function RoutingTab({
   onNotice,
 }: {
   providers: ProviderView[];
-  voices: VoiceChoice[];
   stages: StagesState | null;
   privileged: boolean;
   onProvidersChange?: (providers: ProviderView[]) => void;
   onSaved: (stages: StagesState) => void;
   onReload?: () => Promise<StagesState | void> | void;
-  onNotice: (message: string) => void;
+  onNotice: OnNotice;
 }) {
-  const [drafts, setDrafts] = useState<Record<UiStage, StageDraft>>(() => initialDrafts(stages, voices));
+  const [drafts, setDrafts] = useState<Record<UiStage, StageDraft>>(() => initialDrafts(stages));
   const [conflict, setConflict] = useState(false);
   const [saving, setSaving] = useState(false);
   const [syncingModels, setSyncingModels] = useState(false);
 
   useEffect(() => {
-    setDrafts(initialDrafts(stages, voices));
+    setDrafts(initialDrafts(stages));
     setConflict(false);
-  }, [stages, voices]);
+  }, [stages]);
 
   async function reloadServerSettings() {
     try {
       const fresh = (await onReload?.()) || (await api.studio.stages());
       onSaved(fresh);
-      setDrafts(initialDrafts(fresh, voices));
+      setDrafts(initialDrafts(fresh));
       setConflict(false);
       onNotice(`Reloaded server routing · revision ${fresh.revision}.`);
     } catch (error) {
-      onNotice(errText(error));
+      onNotice(errText(error), "danger");
     }
   }
 
@@ -3657,7 +3942,7 @@ function RoutingTab({
       onProvidersChange?.(fresh.providers);
       onNotice(`Synced ${total} models from /models across ${count}/${enabled.length} providers.`);
     } catch (error) {
-      onNotice(errText(error));
+      onNotice(errText(error), "danger");
     } finally {
       setSyncingModels(false);
     }
@@ -3704,7 +3989,7 @@ function RoutingTab({
     setSaving(true);
     try {
       const payload: Record<string, Partial<StageRoute>> = {};
-      for (const stage of ["reader", "matcher", "writer", "scout", "fact_check", "tts"] as const) {
+      for (const stage of ["reader", "matcher", "writer", "scout", "fact_check"] as const) {
         const draft = drafts[stage];
         const inherited = (stage === "matcher" || stage === "scout") && draft.inheritFrom === "reader";
         const chain = inherited ? drafts.reader.chain : draft.chain;
@@ -3725,14 +4010,14 @@ function RoutingTab({
       onNotice(`Routing saved · revision ${saved.revision}. Paid chapter caches stay put.`);
     } catch (error) {
       if (isConflict(error)) setConflict(true);
-      onNotice(errText(error));
+      onNotice(errText(error), "danger");
     } finally {
       setSaving(false);
     }
   }
 
   function resetToDefaults() {
-    setDrafts(initialDrafts(null, voices));
+    setDrafts(initialDrafts(null));
     setConflict(false);
     onNotice("Reset stage routing draft to defaults.");
   }
@@ -3740,7 +4025,7 @@ function RoutingTab({
   return (
     <div className="flex flex-col gap-4">
       {conflict ? (
-        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#69453e] bg-[#2e1f1e] px-3 py-2 text-sm">
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-destructive-soft px-3 py-2 text-sm">
           <span>Revision conflict</span>
           <span className="flex gap-2">
             <Button type="button" size="sm" variant="outline" onClick={() => setConflict(false)}>Keep draft</Button>
@@ -3781,12 +4066,12 @@ function RoutingTab({
             <section key={meta.id} className="desk-card studio-stage" aria-labelledby={`stage-${meta.id}`} onKeyDown={(event) => onKey(event, meta.id)}>
               <header className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
-                  <h3 id={`stage-${meta.id}`} className="font-serif text-xl">
+                  <h3 id={`stage-${meta.id}`} className="text-xl font-semibold tracking-[-0.01em]">
                     {meta.title}
                   </h3>
                   <span className="cap font-mono">{draft.chain.length}</span>
                 </div>
-                <span className="cap is-on">{meta.gate === "vision" ? "Vision" : meta.gate === "tts" ? "TTS" : "Text"}</span>
+                <span className="cap is-on">{meta.gate === "vision" ? "Vision" : "Text"}</span>
               </header>
               {inherited ? (
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
@@ -3798,7 +4083,7 @@ function RoutingTab({
               ) : (
                 <>
                   {meta.id === "matcher" || meta.id === "scout" ? (
-                    <label className="mt-3 flex items-center gap-2 text-xs text-[#a2a19f]">
+                    <label className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
                       <input
                         type="checkbox"
                         checked={draft.inheritFrom === "reader"}
@@ -3870,7 +4155,6 @@ function RoutingTab({
                     <StagePicker
                       stage={meta.id}
                       providers={providers}
-                      voices={voices}
                       disabled={!privileged}
                       onPick={(lane) => {
                         if (draft.chain.includes(lane)) return;
@@ -3888,53 +4172,28 @@ function RoutingTab({
   );
 }
 
-function initialDrafts(stages: StagesState | null, voices: VoiceChoice[]): Record<UiStage, StageDraft> {
-  const ttsRoute =
-    (stages as (StagesState & { tts?: StageRoute }) | null)?.tts ??
-    (stages?.stages as Record<string, StageRoute> | undefined)?.tts;
-  const base = {
+function initialDrafts(stages: StagesState | null): Record<UiStage, StageDraft> {
+  return {
     reader: stages ? draftFrom(stages.reader) : emptyDraft("reader"),
     matcher: stages ? draftFrom(stages.matcher) : emptyDraft("matcher"),
     writer: stages ? draftFrom(stages.writer) : emptyDraft("writer"),
     scout: stages ? draftFrom(stages.scout) : emptyDraft("scout"),
     fact_check: stages ? draftFrom(stages.fact_check) : emptyDraft("fact_check"),
-    tts: ttsRoute && ttsRoute.chain?.length ? draftFrom(ttsRoute) : emptyDraft("tts"),
   };
-  if (base.tts.chain.length === 0) {
-    const ttsIds = [...new Set(voices.map((voice) => voice.providerId))];
-    base.tts.chain = ttsIds;
-  }
-  return base;
 }
 
 function StagePicker({
   stage,
   providers,
-  voices,
   disabled,
   onPick,
 }: {
   stage: UiStage;
   providers: ProviderView[];
-  voices: VoiceChoice[];
   disabled?: boolean;
   onPick: (id: string) => void;
 }) {
   const models = useMemo<ModelOption[]>(() => {
-    if (stage === "tts") {
-      const seen = new Set<string>();
-      return voices.flatMap((voice) => {
-        if (seen.has(voice.providerId)) return [];
-        seen.add(voice.providerId);
-        return [{
-          id: voice.providerId,
-          name: voice.providerLabel,
-          provider: "TTS",
-          description: "audio-tts",
-          capabilities: ["files" as const],
-        }];
-      });
-    }
     const needVision = stage === "reader" || stage === "matcher" || stage === "scout";
     return providers.flatMap((provider) =>
       provider.models.map((model) => {
@@ -3944,7 +4203,7 @@ function StagePicker({
         return {
           id: `${provider.id}:${cleanId}`,
           name: cleanId,
-          provider: provider.label,
+          provider: formatProviderConnectionLabel(provider, providers),
           description: needVision && !vision
             ? "Incompatible (requires vision)"
             : [cleanLabel !== cleanId ? cleanLabel : "", vision ? "Vision" : "Text", model.capabilities?.json ? "JSON" : ""].filter(Boolean).join(" · "),
@@ -3957,7 +4216,7 @@ function StagePicker({
         };
       }),
     );
-  }, [providers, stage, voices]);
+  }, [providers, stage]);
 
   return (
     <ModelSelector
@@ -3973,7 +4232,38 @@ function StagePicker({
   );
 }
 
-function NodesTab({
+function normalizeDefaultLaneId(raw: unknown): string {
+  const val = String(raw ?? "").trim();
+  return LANE_ID_RE.test(val.toLowerCase()) ? val : DEFAULT_LANE_ID;
+}
+
+function readSettingsQuality(settings: StudioSettingsState | null | undefined): RenderQuality {
+  const q = settings?.renderQuality || settings?.settings?.renderQuality;
+  return q === "720p" ? "720p" : "1080p";
+}
+
+function readSettingsDefaultLane(settings: StudioSettingsState | null | undefined): string {
+  const raw = settings?.defaultRenderLane ?? settings?.settings?.defaultRenderLane;
+  return normalizeDefaultLaneId(raw || DEFAULT_LANE_ID);
+}
+
+function resolveSandboxLifecycleState(
+  worker?: PipelineWorker,
+  overrideBoxStatus?: string | null,
+): "running" | "stopped" | "unknown" {
+  const rawBox = String(overrideBoxStatus ?? worker?.boxStatus ?? "").trim().toLowerCase();
+  if (rawBox) {
+    if (["running", "ready", "busy", "active", "started", "online"].includes(rawBox)) return "running";
+    if (["stopped", "paused", "exited", "off", "halted", "down", "created"].includes(rawBox)) return "stopped";
+    return "unknown";
+  }
+  const rawWorkerStatus = String(worker?.status ?? "").trim().toLowerCase();
+  if (rawWorkerStatus === "busy" || rawWorkerStatus === "running") return "running";
+  if (rawWorkerStatus === "paused" || rawWorkerStatus === "stopped") return "stopped";
+  return "unknown";
+}
+
+export function NodesTab({
   system,
   nodes,
   workers,
@@ -3981,6 +4271,7 @@ function NodesTab({
   settings,
   onSettingsSaved,
   onChange,
+  onRefreshWorkers,
   onNotice,
 }: {
   system: PipelineStatus["system"] | null;
@@ -3990,37 +4281,42 @@ function NodesTab({
   settings: StudioSettingsState | null;
   onSettingsSaved: (settings: StudioSettingsState) => void;
   onChange: (nodes: RenderNode[]) => void;
-  onNotice: (message: string) => void;
+  onRefreshWorkers?: () => Promise<void> | void;
+  onNotice: OnNotice;
 }) {
   const [editing, setEditing] = useState<RenderNode | null>(null);
   const [open, setOpen] = useState(false);
-  const [drawerId, setDrawerId] = useState<string | null>(null);
+  const [openDetails, setOpenDetails] = useState<Record<string, boolean>>({});
+  const [boxStatusOverrides, setBoxStatusOverrides] = useState<Record<string, string>>({});
   const [lines, setLines] = useState<string[]>(["sbx console ready"]);
-  const [renderQuality, setRenderQuality] = useState<RenderQuality>(
-    settings?.renderQuality || settings?.settings?.renderQuality || "1080p",
-  );
-  const [savingQuality, setSavingQuality] = useState(false);
+  const [renderQuality, setRenderQuality] = useState<RenderQuality>(() => readSettingsQuality(settings));
+  const [defaultRenderLane, setDefaultRenderLane] = useState<string>(() => readSettingsDefaultLane(settings));
+  const [autoRetry, setAutoRetry] = useState(() => settings?.autoRetry ?? settings?.settings?.autoRetry ?? { enabled: true, maxRetries: 3 });
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [settingsNote, setSettingsNote] = useState<string>("");
+  const savingSettingsRef = useRef(false);
+  const nodeActionLockRef = useRef(false);
   const [storageOpen, setStorageOpen] = useState(false);
   const [storage, setStorage] = useState<StudioStorageReport | null>(null);
   const [trash, setTrash] = useState<TrashItem[]>([]);
   const [nodeOutputs, setNodeOutputs] = useState<Record<string, { ok: boolean; text: string }>>({});
   const [busyNodeKey, setBusyNodeKey] = useState<string>("");
   const [sbxDeviceLink, setSbxDeviceLink] = useState<{
-    nodeId?: string;
+    nodeId: string;
     verificationUrl: string | null;
     userCode: string | null;
-    instructions: string;
     detail: string;
   } | null>(null);
-  const active = nodes.find((node) => node.id === drawerId) || null;
 
   useEffect(() => {
-    const q = settings?.renderQuality || settings?.settings?.renderQuality;
-    if (q === "720p" || q === "1080p") setRenderQuality(q);
+    if (savingSettingsRef.current) return;
+    setRenderQuality(readSettingsQuality(settings));
+    setDefaultRenderLane(readSettingsDefaultLane(settings));
+    setAutoRetry(settings?.autoRetry ?? settings?.settings?.autoRetry ?? { enabled: true, maxRetries: 3 });
   }, [settings]);
 
   useEffect(() => {
-    if (!sbxDeviceLink?.verificationUrl) return;
+    if (!sbxDeviceLink) return;
     const targetNodeId = sbxDeviceLink.nodeId;
     const timer = window.setInterval(() => {
       void api.studio.sbxAuthStatus().then((res) => {
@@ -4030,34 +4326,81 @@ function NodesTab({
           }
           setSbxDeviceLink(null);
           log(`ok  ${res.detail}`);
-          onNotice("Docker account linked · sbx CLI ready");
+          onNotice("Docker account linked");
         }
       }).catch(() => {});
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [sbxDeviceLink?.verificationUrl, sbxDeviceLink?.nodeId, onNotice]);
+  }, [sbxDeviceLink, onNotice]);
 
   const handleStorageStateLoaded = useCallback((rep: StudioStorageReport | null, list: TrashItem[]) => {
     if (rep) setStorage(rep);
     setTrash(list);
   }, []);
 
-  async function saveQuality(nextQuality: RenderQuality) {
-    if (!privileged || savingQuality) return;
-    setRenderQuality(nextQuality);
-    setSavingQuality(true);
+  async function saveRenderDefaults(patch: { renderQuality?: RenderQuality; defaultRenderLane?: string; autoRetry?: { enabled: boolean; maxRetries: number } }) {
+    if (!privileged || savingSettingsRef.current) return;
+    const prevQuality = renderQuality;
+    const prevLane = defaultRenderLane;
+    const prevRetry = autoRetry;
+    const nextQuality = patch.renderQuality ?? renderQuality;
+    const nextLane = patch.defaultRenderLane ?? defaultRenderLane;
+    if (nextQuality === prevQuality && nextLane === prevLane && !patch.autoRetry) return;
+
+    savingSettingsRef.current = true;
+    setSavingSettings(true);
+    if (patch.renderQuality !== undefined) setRenderQuality(patch.renderQuality);
+    if (patch.defaultRenderLane !== undefined) setDefaultRenderLane(patch.defaultRenderLane);
+    if (patch.autoRetry) setAutoRetry(patch.autoRetry);
+    setSettingsNote("Saving…");
+
+    const currentRevision = typeof settings?.revision === "number" ? settings.revision : undefined;
+    const payload: {
+      autoRetry?: { enabled: boolean; maxRetries: number };
+      renderQuality?: RenderQuality;
+      defaultRenderLane?: string;
+      revision?: number;
+      expectedRevision?: number;
+    } = {
+      ...(patch.autoRetry ? { autoRetry: patch.autoRetry } : {}),
+      ...(patch.renderQuality !== undefined ? { renderQuality: patch.renderQuality } : {}),
+      ...(patch.defaultRenderLane !== undefined ? { defaultRenderLane: patch.defaultRenderLane } : {}),
+      ...(currentRevision !== undefined ? { revision: currentRevision, expectedRevision: currentRevision } : {}),
+    };
     try {
-      const saved = await api.studio.putSettings({ renderQuality: nextQuality });
+      const saved = await api.studio.putSettings(payload);
+      const returnedLane = saved?.defaultRenderLane ?? saved?.settings?.defaultRenderLane;
+      if (patch.defaultRenderLane !== undefined && typeof returnedLane !== "string") {
+        setDefaultRenderLane(prevLane);
+        setSettingsNote("Save failed");
+        onNotice("Server did not persist default render lane.", "danger");
+        return;
+      }
       onSettingsSaved(saved);
-      onNotice(
-        nextQuality === "720p"
-          ? "Render quality set to 720p (1280×720)"
-          : "Render quality set to 1080p (1920×1080)",
-      );
+      setAutoRetry(saved.autoRetry ?? saved.settings?.autoRetry ?? patch.autoRetry ?? prevRetry);
+      setRenderQuality(readSettingsQuality(saved));
+      if (typeof returnedLane === "string") {
+        setDefaultRenderLane(readSettingsDefaultLane(saved));
+      }
+      setSettingsNote("Saved");
     } catch (error) {
-      onNotice(errText(error));
+      setRenderQuality(prevQuality);
+      setDefaultRenderLane(prevLane);
+      setAutoRetry(prevRetry);
+      setSettingsNote("Save failed");
+      if (isConflict(error)) {
+        const fresh = await api.studio.getSettings().catch(() => null);
+        if (fresh) {
+          onSettingsSaved(fresh);
+          setRenderQuality(readSettingsQuality(fresh));
+          setDefaultRenderLane(readSettingsDefaultLane(fresh));
+          setAutoRetry(fresh.autoRetry ?? fresh.settings?.autoRetry ?? prevRetry);
+        }
+      }
+      onNotice(errText(error), "danger");
     } finally {
-      setSavingQuality(false);
+      savingSettingsRef.current = false;
+      setSavingSettings(false);
     }
   }
 
@@ -4065,19 +4408,26 @@ function NodesTab({
     setLines((current) => [...current.slice(-80), line]);
   }
 
+  function ensureDetailsOpen(nodeId: string) {
+    setOpenDetails((current) => (current[nodeId] ? current : { ...current, [nodeId]: true }));
+  }
+
   async function run(
     id: string,
     action: "test" | "status" | "start" | "pause" | "stop" | "provision" | "auth-status" | "auth-start",
   ) {
+    if (nodeActionLockRef.current) return;
+    nodeActionLockRef.current = true;
     log(`$ ${action} ${id}`);
     setBusyNodeKey(`${id}:${action}`);
+    ensureDetailsOpen(id);
     try {
       if (action === "test") {
         const probe = await api.studio.testNode(id);
         const text = probe.ok ? `Connected · ${probe.reason}` : probe.reason;
         log(probe.ok ? `ok  ${probe.reason}` : `fail  ${probe.reason}`);
         setNodeOutputs((current) => ({ ...current, [id]: { ok: probe.ok, text } }));
-        onNotice(probe.ok ? "Probe ok" : probe.reason);
+        await onRefreshWorkers?.();
         return;
       }
       if (action === "auth-status" || action === "auth-start") {
@@ -4087,13 +4437,13 @@ function NodesTab({
             setSbxDeviceLink(null);
             log(`ok  ${statusRes.detail}`);
             setNodeOutputs((current) => ({ ...current, [id]: { ok: true, text: statusRes.detail } }));
-            onNotice(statusRes.detail);
+            await onRefreshWorkers?.();
             return;
           }
           log(`info  ${statusRes.detail}`);
           if (statusRes.status === "missing-cli") {
+            setSbxDeviceLink(null);
             setNodeOutputs((current) => ({ ...current, [id]: { ok: false, text: statusRes.detail } }));
-            onNotice(statusRes.detail);
             return;
           }
         }
@@ -4102,76 +4452,127 @@ function NodesTab({
           setSbxDeviceLink(null);
           log(`ok  ${started.detail}`);
           setNodeOutputs((current) => ({ ...current, [id]: { ok: true, text: started.detail } }));
-          onNotice(started.detail);
+          await onRefreshWorkers?.();
           return;
         }
-        const url = typeof started.verificationUrl === "string" ? started.verificationUrl : null;
-        const code = typeof started.userCode === "string" ? started.userCode : null;
-        const instructions = typeof started.instructions === "string" ? started.instructions : "";
-        if (url || code) {
-          setSbxDeviceLink({
-            nodeId: id,
-            verificationUrl: url,
-            userCode: code,
-            instructions,
-            detail: started.detail,
-          });
-          log(`info  One-time code: ${code ?? "—"} · Sign in: ${url ?? "—"}`);
-        }
-        const combined = [
-          started.detail,
-          code ? `Code: ${code}` : "",
-          url ? `Login URL: ${url}` : "",
-          instructions,
-        ].filter(Boolean).join(" · ");
-        if (!url && !code) {
-          log(`info  ${combined}`);
-        }
-        setNodeOutputs((current) => ({ ...current, [id]: { ok: false, text: combined } }));
-        onNotice(combined);
+        const validUrl = normalizeHttpUrl(started.verificationUrl);
+        const code = typeof started.userCode === "string" && started.userCode.trim() ? started.userCode.trim() : null;
+        setSbxDeviceLink({
+          nodeId: id,
+          verificationUrl: validUrl,
+          userCode: code,
+          detail: started.detail || "Complete Docker sign-in in your browser.",
+        });
+        setNodeOutputs((current) => {
+          const next = { ...current };
+          delete next[id];
+          return next;
+        });
+        log(`info  code=${code ?? "—"} url=${validUrl ?? "pending"}`);
         return;
       }
       const result = await api.studio.nodeAction(id, action);
       log(result.ok ? `ok  ${result.detail}` : `fail  ${result.detail}`);
       setNodeOutputs((current) => ({ ...current, [id]: { ok: result.ok, text: result.detail } }));
-      onNotice(result.detail);
+      if (result.ok) {
+        const probeBox = typeof result.probe?.boxStatus === "string" ? result.probe.boxStatus : result.status;
+        if (action === "start") {
+          setBoxStatusOverrides((current) => ({ ...current, [id]: probeBox || "running" }));
+        } else if (action === "stop" || action === "pause") {
+          setBoxStatusOverrides((current) => ({ ...current, [id]: probeBox || "stopped" }));
+        } else if (probeBox) {
+          setBoxStatusOverrides((current) => ({ ...current, [id]: probeBox }));
+        }
+      }
+      await onRefreshWorkers?.();
     } catch (error) {
       const msg = errText(error);
       log(`fail  ${msg}`);
       setNodeOutputs((current) => ({ ...current, [id]: { ok: false, text: msg } }));
-      onNotice(msg);
     } finally {
+      nodeActionLockRef.current = false;
       setBusyNodeKey("");
     }
   }
 
+  const enabledNodes = useMemo(() => nodes.filter((n) => n.enabled !== false), [nodes]);
+  const missingOrDisabledDefaultNode = useMemo(() => {
+    if (!defaultRenderLane || defaultRenderLane === DEFAULT_LANE_ID) return null;
+    if (enabledNodes.some((n) => n.id === defaultRenderLane)) return null;
+    const disabledMatch = nodes.find((n) => n.id === defaultRenderLane);
+    return {
+      id: defaultRenderLane,
+      label: disabledMatch
+        ? `${disabledMatch.label || disabledMatch.id} (disabled)`
+        : `${defaultRenderLane} (unavailable)`,
+    };
+  }, [defaultRenderLane, enabledNodes, nodes]);
+
   return (
     <div className="flex flex-col gap-4">
       <div className="desk-card flex flex-wrap items-center justify-between gap-3 py-3">
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="flex items-center gap-1.5" role="radiogroup" aria-label="Output quality">
-            <span className="text-xs text-[#a2a19f]">Output quality</span>
-            <button
-              type="button"
-              role="radio"
-              aria-checked={renderQuality === "1080p"}
-              className={cn("chip", renderQuality === "1080p" && "is-on")}
-              disabled={!privileged || savingQuality}
-              onClick={() => void saveQuality("1080p")}
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-1.5" role="radiogroup" aria-label="Default quality">
+            <span className="whitespace-nowrap text-xs text-muted-foreground">Default quality</span>
+            {(["1080p", "720p"] as const).map((q) => (
+              <button
+                key={q}
+                type="button"
+                role="radio"
+                aria-checked={renderQuality === q}
+                className={cn("chip min-h-11 md:min-h-8", renderQuality === q && "is-on")}
+                disabled={!privileged || savingSettings}
+                onClick={() => void saveRenderDefaults({ renderQuality: q })}
+              >
+                {q}
+              </button>
+            ))}
+          </div>
+          <label className="flex items-center gap-2 text-xs text-muted-foreground" htmlFor="studioDefaultLane">
+            <span className="whitespace-nowrap">Default lane</span>
+            <select
+              id="studioDefaultLane"
+              aria-label="Default lane"
+              className="field min-h-11 w-auto px-2.5 py-1 text-xs md:min-h-8"
+              value={defaultRenderLane}
+              disabled={!privileged || savingSettings}
+              onChange={(event) => void saveRenderDefaults({ defaultRenderLane: event.target.value })}
             >
-              1080p
-            </button>
-            <button
-              type="button"
-              role="radio"
-              aria-checked={renderQuality === "720p"}
-              className={cn("chip", renderQuality === "720p" && "is-on")}
-              disabled={!privileged || savingQuality}
-              onClick={() => void saveQuality("720p")}
-            >
-              720p
+              <option value={DEFAULT_LANE_ID}>Auto</option>
+              {enabledNodes.map((node) => (
+                <option key={node.id} value={node.id}>
+                  {conciseNodeLabel(node.label, node.kind, node.id)}
+                </option>
+              ))}
+              {missingOrDisabledDefaultNode ? (
+                <option value={missingOrDisabledDefaultNode.id} disabled>
+                  {missingOrDisabledDefaultNode.label}
+                </option>
+              ) : null}
+            </select>
+          </label>
+          <div className="flex min-h-11 items-center gap-3 text-xs text-muted-foreground">
+            <span id="autoRetryLabel">Auto-retry</span>
+            <button type="button" role="switch" aria-labelledby="autoRetryLabel" aria-checked={autoRetry.enabled}
+              disabled={!privileged || savingSettings}
+              className="flex min-h-11 min-w-11 items-center justify-center disabled:opacity-50"
+              onClick={() => void saveRenderDefaults({ autoRetry: { ...autoRetry, enabled: !autoRetry.enabled } })}>
+              <span className={cn("flex h-6 w-10 items-center rounded-full p-0.5 transition-colors", autoRetry.enabled ? "bg-primary" : "bg-border-strong")}>
+                <span className={cn("size-5 rounded-full bg-primary-foreground transition-transform motion-reduce:transition-none", autoRetry.enabled && "translate-x-4")} />
+              </span>
             </button>
           </div>
+          <label className="flex min-h-11 items-center gap-2 text-xs text-muted-foreground" htmlFor="autoRetryAttempts">
+            Attempts
+            <select id="autoRetryAttempts" className="field min-h-11 w-auto px-3 text-xs" value={autoRetry.maxRetries}
+              disabled={!privileged || savingSettings || !autoRetry.enabled}
+              onChange={(event) => void saveRenderDefaults({ autoRetry: { ...autoRetry, maxRetries: Number(event.target.value) } })}>
+              {[1, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </label>
+          <span className="text-[12px] text-muted-foreground" role="status" aria-live="polite">
+            {savingSettings ? "Saving…" : settingsNote || "Saved"}
+          </span>
           <div className="flex items-center gap-2">
             <span className="cap font-mono">
               <HardDrive className="size-3.5" aria-hidden /> Storage {fmtStorageBytes(storage?.totalBytes)}
@@ -4204,180 +4605,311 @@ function NodesTab({
       <div className="grid gap-3 lg:grid-cols-2">
         {nodes.map((node) => {
           const worker = workers.find((item) => item.id === node.id);
+          const kindMeta = getRenderKindMeta(node.kind, node.id);
+          const primaryLabel = conciseNodeLabel(node.label, node.kind, node.id);
+          const showKindBadge = !primaryLabel.trim().toLowerCase().includes(kindMeta.shortLabel.trim().toLowerCase());
           const local = node.kind === "local";
-          const load = local ? system?.cpuPercent != null ? system.cpuPercent / 100 : null : typeof worker?.metrics?.load === "number" ? Math.min(1, worker.metrics.load / (worker.metrics.cpus || 4)) : null;
-          const memPressure = local ? system?.memory?.available != null && system.memory.total ? 1 - system.memory.available / system.memory.total : null : worker?.metrics?.mem_gb != null ? Math.max(0, 1 - Math.min(1, worker.metrics.mem_gb / 16)) : null;
-          const diskPressure = local ? system?.disk?.available != null && system.disk.total ? 1 - system.disk.available / system.disk.total : null : worker?.metrics?.disk_gb != null ? Math.max(0, 1 - Math.min(1, worker.metrics.disk_gb / 100)) : null;
-          const cpuText = local ? system?.cpuPercent != null ? `${Math.round(system.cpuPercent)}%` : "—" : worker?.metrics?.load != null ? String(worker.metrics.load) : "—";
-          const ramText = local ? system?.memory?.available != null ? `${fmtStorageBytes(system.memory.available)} free` : "—" : worker?.metrics?.mem_gb != null ? `${worker.metrics.mem_gb} GB` : "—";
-          const diskText = local ? system?.disk?.available != null ? `${fmtStorageBytes(system.disk.available)} free` : "—" : worker?.metrics?.disk_gb != null ? `${worker.metrics.disk_gb} GB` : node.kind === "docker-sbx" ? `${node.maxHours ?? 5}h TTL` : "—";
+          const load = local
+            ? system?.cpuPercent != null
+              ? system.cpuPercent / 100
+              : null
+            : typeof worker?.metrics?.load === "number" && worker.metrics.cpus
+              ? Math.min(1, worker.metrics.load / worker.metrics.cpus)
+              : null;
+          const memPressure = local
+            ? system?.memory?.available != null && system.memory.total
+              ? 1 - system.memory.available / system.memory.total
+              : null
+            : null;
+          const diskPressure = local
+            ? system?.disk?.available != null && system.disk.total
+              ? 1 - system.disk.available / system.disk.total
+              : null
+            : null;
+          const cpuText = local
+            ? system?.cpuPercent != null
+              ? `${Math.round(system.cpuPercent)}%`
+              : "Unknown"
+            : worker?.metrics?.load != null
+              ? String(worker.metrics.load)
+              : "Unknown";
+          const ramText = local
+            ? system?.memory?.available != null
+              ? `${fmtStorageBytes(system.memory.available)} free`
+              : "Unknown"
+            : worker?.metrics?.mem_gb != null
+              ? `${worker.metrics.mem_gb} GB free`
+              : "Unknown";
+          const diskText = local
+            ? system?.disk?.available != null
+              ? `${fmtStorageBytes(system.disk.available)} free`
+              : "Unknown"
+            : worker?.metrics?.disk_gb != null
+              ? `${worker.metrics.disk_gb} GB free`
+              : "Unknown";
+          const sandboxState =
+            node.kind === "docker-sbx"
+              ? resolveSandboxLifecycleState(worker, boxStatusOverrides[node.id])
+              : "unknown";
+          const detailsExpanded = Boolean(openDetails[node.id]);
+          const nodeSbxLink = sbxDeviceLink?.nodeId === node.id ? sbxDeviceLink : null;
+          const validSbxUrl = normalizeHttpUrl(nodeSbxLink?.verificationUrl);
+          const statusBadgeText =
+            node.kind === "docker-sbx" && (boxStatusOverrides[node.id] || worker?.boxStatus)
+              ? String(boxStatusOverrides[node.id] || worker?.boxStatus)
+              : worker?.status || (node.enabled ? "Ready" : "Off");
+
           return (
-            <article key={node.id} className="desk-card studio-node">
-              <div className="flex items-start gap-3">
+            <article key={node.id} className="desk-card studio-node" data-node-id={node.id}>
+              <div className="flex items-center gap-3">
                 <span className="mono-mark" aria-hidden>
                   {node.kind === "local" ? <Monitor className="size-4" /> : node.kind === "ssh" ? <Radio className="size-4" /> : <Cloud className="size-4" />}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <h3 className="font-serif text-xl">{node.label} <code className="font-mono text-xs text-[#a2a19f]">{node.id}</code></h3>
-                  <p className="text-xs text-[#a2a19f]">
-                    {formatRenderNodeSubtitle(node)}
-                  </p>
+                  <h3 className="text-xl font-semibold tracking-[-0.01em] leading-tight">{primaryLabel}</h3>
                 </div>
-                <span className="cap">{worker?.status || (node.enabled ? "Configured" : "Off")}</span>
+                {showKindBadge ? <span className="cap font-mono text-[12px]">{kindMeta.shortLabel}</span> : null}
+                <span className="cap">{statusBadgeText}</span>
               </div>
-              <dl className="mt-3 grid grid-cols-3 gap-2 rounded-xl border border-[#2b2c30] bg-[#101113] px-3 py-2 text-xs" aria-label={`${node.label} telemetry`}>
+              <dl className="mt-3 grid grid-cols-2 gap-2 rounded-xl bg-background px-3 py-2 text-xs" aria-label={`${primaryLabel} telemetry`}>
                 <div>
-                  <dt className="text-[10px] tracking-wide text-[#a2a19f] uppercase">Slots</dt>
-                  <dd className="mt-0.5 font-mono text-[#f2efe9]">{node.slots}</dd>
+                  <dt className="text-[12.5px] text-muted-foreground">Slots</dt>
+                  <dd className="mt-0.5 font-mono text-foreground">{node.slots}</dd>
                 </div>
                 <div>
-                  <dt className="text-[10px] tracking-wide text-[#a2a19f] uppercase">{node.kind === "docker-sbx" ? "TTL" : "Kind"}</dt>
-                  <dd className="mt-0.5 font-mono text-[#f2efe9]">{node.kind === "docker-sbx" ? `${node.maxHours ?? 5}h` : node.kind}</dd>
-                </div>
-                <div>
-                  <dt className="text-[10px] tracking-wide text-[#a2a19f] uppercase">Status</dt>
-                  <dd className="mt-0.5 font-mono text-[#f2efe9]">{worker?.status || (node.enabled ? "idle" : "off")}</dd>
+                  <dt className="text-[12.5px] text-muted-foreground">{node.kind === "docker-sbx" ? "TTL" : "Cleaner"}</dt>
+                  <dd className="mt-0.5 font-mono text-foreground">{node.kind === "docker-sbx" ? `${node.maxHours ?? 5}h` : node.supportsCleaner ? "On" : "Off"}</dd>
                 </div>
               </dl>
               <div className="mt-3 flex flex-col gap-2">
                 <MeterRow label="CPU load" level={load} text={cpuText} />
-                <MeterRow label="RAM Free" level={memPressure} text={ramText} />
-                <MeterRow
-                  label="Disk Free"
-                  level={diskPressure}
-                  text={diskText}
-                />
+                <MeterRow label="RAM free" level={memPressure} text={ramText} />
+                <MeterRow label="Disk free" level={diskPressure} text={diskText} />
               </div>
-              <div className="mt-3 flex flex-wrap gap-2">
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                {node.id !== "local" && node.kind === "docker-sbx" ? (
+                  sandboxState === "running" ? (
+                    <InlineConfirm
+                      label="Stop sandbox"
+                      subject={primaryLabel}
+                      description="Stop this cloud sandbox?"
+                      disabled={!privileged || Boolean(busyNodeKey)}
+                      onConfirm={() => run(node.id, "stop")}
+                    />
+                  ) : sandboxState === "stopped" ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="min-h-11 md:min-h-8"
+                      disabled={!privileged || Boolean(busyNodeKey)}
+                      onClick={() => void run(node.id, "start")}
+                    >
+                      {busyNodeKey === `${node.id}:start` ? "Starting…" : "Start sandbox"}
+                    </Button>
+                  ) : null
+                ) : null}
                 <Button
                   type="button"
                   size="sm"
                   variant="outline"
                   className="min-h-11 md:min-h-8"
-                  disabled={!privileged || Boolean(busyNodeKey)}
+                  disabled={!privileged}
                   onClick={() => {
-                    setDrawerId(node.id);
-                    void run(node.id, "test");
+                    setEditing(node);
+                    setOpen(true);
                   }}
                 >
-                  {busyNodeKey === `${node.id}:test` ? "Testing…" : "Test"}
-                </Button>
-                {node.id !== "local" && node.kind === "docker-sbx" ? (
-                  <>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="min-h-11 md:min-h-8"
-                      disabled={!privileged || Boolean(busyNodeKey)}
-                      onClick={() => {
-                        setDrawerId(node.id);
-                        void run(node.id, "auth-start");
-                      }}
-                    >
-                      {busyNodeKey === `${node.id}:auth-start` || busyNodeKey === `${node.id}:auth-status` ? "Linking…" : "Link Docker"}
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      className="min-h-11 md:min-h-8"
-                      disabled={!privileged || Boolean(busyNodeKey)}
-                      onClick={() => {
-                        setDrawerId(node.id);
-                        void run(node.id, "provision");
-                      }}
-                    >
-                      {busyNodeKey === `${node.id}:provision` ? "Provisioning…" : "Provision"}
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="min-h-11 md:min-h-8"
-                      disabled={!privileged || Boolean(busyNodeKey)}
-                      onClick={() => {
-                        setDrawerId(node.id);
-                        void run(node.id, "start");
-                      }}
-                    >
-                      Start
-                    </Button>
-                  </>
-                ) : null}
-                {node.id !== "local" && node.kind === "ssh" ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    className="min-h-11 md:min-h-8"
-                    disabled={!privileged || Boolean(busyNodeKey)}
-                    onClick={() => {
-                      setDrawerId(node.id);
-                      void run(node.id, "provision");
-                    }}
-                  >
-                    {busyNodeKey === `${node.id}:provision` ? "Provisioning…" : "Provision"}
-                  </Button>
-                ) : null}
-                {node.kind === "docker-sbx" && node.id !== "local" ? <Button type="button" size="sm" variant="outline" className="min-h-11 md:min-h-8" disabled={!privileged || Boolean(busyNodeKey)} onClick={() => void run(node.id, "stop")}>Stop</Button> : null}
-                <Button type="button" size="sm" variant="ghost" className="min-h-11 md:min-h-8" disabled={!privileged} onClick={() => { setEditing(node); setOpen(true); }}>
                   Edit
                 </Button>
-                {node.id !== "local" ? <InlineConfirm
-                  label="Remove"
-                  subject={node.label}
-                  description="Remove render node?"
-                  disabled={!privileged}
-                  onConfirm={async () => {
-                    try {
-                      const result = await api.studio.deleteNode(node.id);
-                      onChange(result.nodes);
-                      onNotice(`${node.label} removed`);
-                    } catch (error) {
-                      onNotice(errText(error));
-                    }
-                  }}
-                /> : null}
-              </div>
-              {node.kind === "docker-sbx" && sbxDeviceLink && (!sbxDeviceLink.nodeId || sbxDeviceLink.nodeId === node.id) && (sbxDeviceLink.userCode || sbxDeviceLink.verificationUrl) ? (
-                <div className="mt-3 flex flex-col gap-2 rounded-xl border border-[#2b2c30] bg-[#101113] p-3 text-xs">
-                  {sbxDeviceLink.userCode ? (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-[#a2a19f]">One-Time Code:</span>
-                      <code className="rounded border border-[#2b2c30] bg-[#17181a] px-2 py-0.5 font-mono text-sm font-semibold text-[#f2efe9]">
-                        {sbxDeviceLink.userCode}
-                      </code>
-                      <CopyButton value={sbxDeviceLink.userCode} label="Copy code" />
-                    </div>
-                  ) : null}
-                  {sbxDeviceLink.verificationUrl ? (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <a
-                        href={sbxDeviceLink.verificationUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex w-fit items-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-2.5 py-1 font-mono text-xs text-[#5eead4] hover:border-[#f18b6e]"
-                      >
-                        Open Docker Sign-In
-                      </a>
-                      <CopyButton value={sbxDeviceLink.verificationUrl} label="Copy URL" />
-                    </div>
-                  ) : null}
-                  <p className="font-mono text-[11px] text-[#d6b57b]">
-                    Waiting for Docker browser sign-in… (auto-checking every 3s)
-                  </p>
-                </div>
-              ) : null}
-              {nodeOutputs[node.id] ? (
-                <div
-                  className={cn(
-                    "mt-3 rounded-lg border px-3 py-2 font-mono text-xs",
-                    nodeOutputs[node.id]!.ok
-                      ? "border-[#3d523b] bg-[#1e281f] text-[#aed1a8]"
-                      : "border-[#69453e] bg-[#2e1f1e] text-[#f0a096]",
-                  )}
-                  role="status"
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="min-h-11 md:min-h-8"
+                  aria-expanded={detailsExpanded}
+                  onClick={() =>
+                    setOpenDetails((current) => ({ ...current, [node.id]: !current[node.id] }))
+                  }
                 >
-                  {nodeOutputs[node.id]!.text}
+                  Details
+                </Button>
+              </div>
+
+              {detailsExpanded ? (
+                <div className="mt-3 flex flex-col gap-3 rounded-xl bg-background p-3 text-xs">
+                  <dl className="grid grid-cols-2 gap-2 font-mono text-[12px]">
+                    <div>
+                      <dt className="text-muted-foreground">ID</dt>
+                      <dd className="text-foreground">{node.id}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-muted-foreground">Kind</dt>
+                      <dd className="text-foreground">{kindMeta.shortLabel}</dd>
+                    </div>
+                    {node.kind === "docker-sbx" ? (
+                      <div>
+                        <dt className="text-muted-foreground">Box</dt>
+                        <dd className="text-foreground">{node.box || "—"}</dd>
+                      </div>
+                    ) : null}
+                    {node.kind === "ssh" ? (
+                      <div className="col-span-2">
+                        <dt className="text-muted-foreground">Target</dt>
+                        <dd className="text-foreground">
+                          {node.user || "ubuntu"}@{node.host || "—"}:{node.port || 22} · {node.remoteDir || DEFAULT_SSH_REMOTE_DIR}
+                        </dd>
+                      </div>
+                    ) : null}
+                  </dl>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="min-h-11 md:min-h-8"
+                      disabled={!privileged || Boolean(busyNodeKey)}
+                      onClick={() => void run(node.id, "test")}
+                    >
+                      {busyNodeKey === `${node.id}:test` ? "Testing…" : "Test"}
+                    </Button>
+                    {node.kind === "docker-sbx" && node.id !== "local" ? (
+                      <>
+                        {sandboxState === "unknown" ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="min-h-11 md:min-h-8"
+                            disabled={!privileged || Boolean(busyNodeKey)}
+                            onClick={() => void run(node.id, "status")}
+                          >
+                            {busyNodeKey === `${node.id}:status` ? "Checking…" : "Check status"}
+                          </Button>
+                        ) : null}
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="min-h-11 md:min-h-8"
+                          disabled={!privileged || Boolean(busyNodeKey)}
+                          onClick={() => void run(node.id, "auth-status")}
+                        >
+                          {busyNodeKey === `${node.id}:auth-status` ? "Checking…" : "Check auth"}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="min-h-11 md:min-h-8"
+                          disabled={!privileged || Boolean(busyNodeKey)}
+                          onClick={() => void run(node.id, "auth-start")}
+                        >
+                          {busyNodeKey === `${node.id}:auth-start` ? "Linking…" : "Link Docker"}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="min-h-11 md:min-h-8"
+                          disabled={!privileged || Boolean(busyNodeKey)}
+                          onClick={() => void run(node.id, "provision")}
+                        >
+                          {busyNodeKey === `${node.id}:provision` ? "Provisioning…" : "Provision"}
+                        </Button>
+                      </>
+                    ) : null}
+                    {node.kind === "ssh" && node.id !== "local" ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="min-h-11 md:min-h-8"
+                        disabled={!privileged || Boolean(busyNodeKey)}
+                        onClick={() => void run(node.id, "provision")}
+                      >
+                        {busyNodeKey === `${node.id}:provision` ? "Provisioning…" : "Provision"}
+                      </Button>
+                    ) : null}
+                    {node.id !== "local" ? (
+                      <InlineConfirm
+                        label="Remove"
+                        subject={primaryLabel}
+                        description="Remove render node?"
+                        disabled={!privileged || Boolean(busyNodeKey)}
+                        onConfirm={async () => {
+                          try {
+                            const result = await api.studio.deleteNode(node.id);
+                            onChange(result.nodes);
+                            onNotice(`${primaryLabel} removed`);
+                          } catch (error) {
+                            onNotice(errText(error), "danger");
+                          }
+                        }}
+                      />
+                    ) : null}
+                  </div>
+
+                  {node.kind === "docker-sbx" && nodeSbxLink ? (
+                    <div className="flex flex-col gap-2 rounded-xl bg-card p-3">
+                      <p className="text-xs text-foreground">{nodeSbxLink.detail}</p>
+                      {nodeSbxLink.userCode ? (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-muted-foreground">Code:</span>
+                          <code className="rounded border border-border bg-background px-2 py-0.5 font-mono text-sm font-semibold text-foreground">
+                            {nodeSbxLink.userCode}
+                          </code>
+                          <CopyButton value={nodeSbxLink.userCode} label="Copy code" />
+                        </div>
+                      ) : null}
+                      {validSbxUrl ? (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <a
+                            href={validSbxUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex min-h-11 items-center rounded-full bg-muted px-3 font-mono text-[12.5px] text-foreground hover:bg-raised md:min-h-8"
+                          >
+                            Open sign-in
+                          </a>
+                          <CopyButton value={validSbxUrl} label="Copy link" />
+                        </div>
+                      ) : (
+                        <p className="text-xs text-warning" role="status">
+                          Sign-in link pending or unavailable. Click Link Docker to request a browser sign-in link.
+                        </p>
+                      )}
+                    </div>
+                  ) : null}
+
+                  {nodeOutputs[node.id] ? (
+                    <div
+                      className={cn(
+                        "rounded-lg border px-3 py-2 font-mono text-xs",
+                        nodeOutputs[node.id]!.ok
+                          ? "border-success/40 bg-success-soft text-success"
+                          : "border-destructive/40 bg-destructive-soft text-destructive",
+                      )}
+                      role="status"
+                    >
+                      {nodeOutputs[node.id]!.text}
+                    </div>
+                  ) : null}
+
+                  <details className="text-xs text-muted-foreground">
+                    <summary className="cursor-pointer select-none">Console log</summary>
+                    <div className="mt-2">
+                      <Terminal>
+                        <TerminalHeader>node console</TerminalHeader>
+                        <TerminalBody>
+                          {lines.map((line, index) => (
+                            <TerminalLine key={`${index}-${line.slice(0, 12)}`}>{line}</TerminalLine>
+                          ))}
+                        </TerminalBody>
+                      </Terminal>
+                    </div>
+                  </details>
                 </div>
               ) : null}
             </article>
@@ -4395,77 +4927,6 @@ function NodesTab({
         }}
         onNotice={onNotice}
       />
-      <Drawer open={Boolean(active)} onOpenChange={(next) => { if (!next) setDrawerId(null); }} swipeDirection="right">
-        <DrawerContent className="studio-drawer">
-          <DrawerHeader>
-            <div className="flex items-start justify-between gap-2">
-              <div>
-                <DrawerTitle className="font-serif text-2xl">{active?.label || "Node"}</DrawerTitle>
-                <DrawerDescription className="sr-only">Node console</DrawerDescription>
-              </div>
-              <DrawerClose className="chip" aria-label="Close drawer">
-                Close
-              </DrawerClose>
-            </div>
-          </DrawerHeader>
-          <div className="flex flex-col gap-3 overflow-auto p-4">
-            <div className="flex flex-wrap gap-2">
-              <Button type="button" size="sm" variant="outline" disabled={!privileged || !active} onClick={() => active && void run(active.id, "test")}>Test</Button>
-              <Button type="button" size="sm" variant="outline" disabled={!privileged || !active} onClick={() => active && void run(active.id, "status")}>Status</Button>
-              {active?.kind === "docker-sbx" ? (
-                <>
-                  <Button type="button" size="sm" variant="outline" disabled={!privileged} onClick={() => void run(active.id, "auth-status")}>Auth</Button>
-                  <Button type="button" size="sm" variant="outline" disabled={!privileged} onClick={() => void run(active.id, "auth-start")}>Link Docker</Button>
-                  <Button type="button" size="sm" disabled={!privileged} onClick={() => void run(active.id, "provision")}>Provision</Button>
-                  <Button type="button" size="sm" variant="outline" disabled={!privileged} onClick={() => void run(active.id, "start")}>Start</Button>
-                  <InlineConfirm label="Stop" subject={active.label} description="Stop sandbox?" disabled={!privileged || Boolean(busyNodeKey)} onConfirm={() => run(active.id, "stop")} />
-                </>
-              ) : null}
-              {active?.kind === "ssh" ? (
-                <Button type="button" size="sm" disabled={!privileged} onClick={() => void run(active.id, "provision")}>Provision</Button>
-              ) : null}
-            </div>
-            {active?.kind === "docker-sbx" && sbxDeviceLink && (sbxDeviceLink.userCode || sbxDeviceLink.verificationUrl) ? (
-              <div className="flex flex-col gap-2 rounded-xl border border-[#2b2c30] bg-[#101113] p-3 text-xs">
-                <p className="font-mono text-[#d6b57b]">{sbxDeviceLink.detail}</p>
-                {sbxDeviceLink.userCode ? (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-[#a2a19f]">One-Time Code:</span>
-                    <code className="rounded border border-[#2b2c30] bg-[#17181a] px-2 py-0.5 font-mono text-sm font-semibold text-[#f2efe9]">
-                      {sbxDeviceLink.userCode}
-                    </code>
-                    <CopyButton value={sbxDeviceLink.userCode} label="Copy code" />
-                  </div>
-                ) : null}
-                {sbxDeviceLink.verificationUrl ? (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <a
-                      href={sbxDeviceLink.verificationUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex w-fit items-center rounded-lg border border-[#2b2c30] bg-[#17181a] px-2.5 py-1 font-mono text-xs text-[#5eead4] hover:border-[#f18b6e]"
-                    >
-                      Open Docker Sign-In
-                    </a>
-                    <CopyButton value={sbxDeviceLink.verificationUrl} label="Copy URL" />
-                  </div>
-                ) : null}
-                <p className="font-mono text-[11px] text-[#a2a19f]">
-                  Waiting for Docker browser sign-in… (auto-checking every 3s)
-                </p>
-              </div>
-            ) : null}
-            <Terminal>
-              <TerminalHeader>sbx / ssh</TerminalHeader>
-              <TerminalBody>
-                {lines.map((line, index) => (
-                  <TerminalLine key={`${index}-${line.slice(0, 12)}`}>{line}</TerminalLine>
-                ))}
-              </TerminalBody>
-            </Terminal>
-          </div>
-        </DrawerContent>
-      </Drawer>
 
       <StorageTrashDrawer
         open={storageOpen}
@@ -4493,7 +4954,7 @@ function buildPromptDrafts(state: StudioPromptsState | null | undefined): Record
   return out;
 }
 
-function PromptsTab({
+export function PromptsTab({
   promptsState,
   privileged,
   onSaved,
@@ -4502,7 +4963,7 @@ function PromptsTab({
   promptsState: StudioPromptsState | null;
   privileged: boolean;
   onSaved: (state: StudioPromptsState) => void;
-  onNotice: (message: string) => void;
+  onNotice: OnNotice;
 }) {
   const [selectedStage, setSelectedStage] = useState<PromptStageId>("reader");
   const [drafts, setDrafts] = useState<Record<string, string>>(() => buildPromptDrafts(promptsState));
@@ -4556,7 +5017,7 @@ function PromptsTab({
         `Saved stage briefs (${activeMeta.title})${preserveCacheHashes ? " · existing chapter cache hashes preserved" : ""}.`,
       );
     } catch (error) {
-      onNotice(errText(error));
+      onNotice(errText(error), "danger");
     } finally {
       setSaving(false);
     }
@@ -4571,7 +5032,7 @@ function PromptsTab({
       setDrafts(buildPromptDrafts(saved));
       onNotice(`Reset ${activeMeta.title} brief to default.`);
     } catch (error) {
-      onNotice(errText(error));
+      onNotice(errText(error), "danger");
     } finally {
       setSaving(false);
     }
@@ -4581,57 +5042,49 @@ function PromptsTab({
   const activeCustomized = isStageCustomized(selectedStage);
 
   return (
-    <div className="studio-prompts flex w-full min-w-0 flex-col gap-4">
-      <nav
-        className="grid w-full gap-2 sm:grid-cols-2 lg:grid-cols-5"
-        role="group"
-        aria-label="Prompt stage selector"
-      >
-        {PROMPT_STAGES.map((stage) => {
-          const isSelected = selectedStage === stage.id;
-          const stageText = typeof drafts[stage.id] === "string" ? drafts[stage.id]! : "";
-          const lineCount = stageText ? stageText.split("\n").length : 1;
-          const customized = isStageCustomized(stage.id);
-          return (
-            <button
-              key={stage.id}
-              type="button"
-              aria-pressed={isSelected}
-              className={cn(
-                "flex flex-col items-start justify-between gap-2 rounded-xl border p-3 text-left transition-colors",
-                isSelected
-                  ? "border-[#f18b6e] bg-[#f18b6e]/14 text-[#f2efe9]"
-                  : "border-[#2b2c30] bg-[#17181a] text-[#f2efe9] hover:border-[#3c3e44]",
-              )}
-              onClick={() => setSelectedStage(stage.id)}
-            >
-              <div className="flex w-full items-center justify-between gap-2">
-                <span className="font-serif text-base font-medium leading-tight">{stage.title}</span>
-                <span className={cn("cap", customized && "is-on")}>
-                  {customized ? "Custom" : "Default"}
+    <div className="studio-split">
+      <aside className="studio-split-left" aria-label="Prompt stages">
+        <div className="studio-split-left-head">
+          <span>Stages <span className="font-normal text-caption tabular-nums">{PROMPT_STAGES.length}</span></span>
+        </div>
+        <div className="studio-conn-list" role="group" aria-label="Prompt stage selector">
+          {PROMPT_STAGES.map((stage) => {
+            const isSelected = selectedStage === stage.id;
+            const stageText = typeof drafts[stage.id] === "string" ? drafts[stage.id]! : "";
+            const lineCount = stageText ? stageText.split("\n").length : 1;
+            const customized = isStageCustomized(stage.id);
+            return (
+              <button
+                key={stage.id}
+                type="button"
+                aria-pressed={isSelected}
+                className={cn("studio-conn-row", isSelected && "is-active")}
+                onClick={() => setSelectedStage(stage.id)}
+              >
+                <span className="studio-conn-mark" aria-hidden>
+                  {monogram(stage.title)}
                 </span>
-              </div>
-              <div className="flex w-full items-center justify-between gap-2 font-mono text-[11px] text-[#a2a19f]">
-                <span>{stage.id}</span>
-                <span>{lineCount}L</span>
-              </div>
-            </button>
-          );
-        })}
-      </nav>
+                <span className="studio-conn-body">
+                  <span className="studio-conn-title">{stage.title}</span>
+                  <span className="studio-conn-sub">{lineCount} lines</span>
+                </span>
+                <span className="studio-conn-status">
+                  <span className={cn("studio-status-dot", customized && "is-online")} aria-hidden />
+                  <span>{customized ? "Custom" : "Default"}</span>
+                  <span className="studio-conn-chevron" aria-hidden>
+                    ›
+                  </span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </aside>
 
-      <section className="desk-card flex w-full min-w-0 flex-col gap-4" aria-labelledby={`prompt-heading-${selectedStage}`}>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <h3 id={`prompt-heading-${selectedStage}`} className="font-serif text-2xl">
-              {activeMeta.title}
-            </h3>
-            <span className={cn("cap", activeCustomized && "is-on")}>
-              {activeCustomized ? "Custom" : "Default"}
-            </span>
-            <span className="cap font-mono">
-              {activeLineCount}L · {currentPrompt.length}c
-            </span>
+      <section className="studio-split-right" aria-labelledby={`prompt-heading-${selectedStage}`}>
+        <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+          <div className="studio-pane-header !mb-0">
+            <h2 id={`prompt-heading-${selectedStage}`}>{activeMeta.title}</h2>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <label className="chip inline-flex cursor-pointer items-center gap-2 text-xs">
@@ -4647,7 +5100,6 @@ function PromptsTab({
               type="button"
               variant="outline"
               size="sm"
-              className="min-h-11 md:min-h-9"
               onClick={() => setCompareDefault((prev) => !prev)}
             >
               Compare
@@ -4656,37 +5108,37 @@ function PromptsTab({
               type="button"
               variant="outline"
               size="sm"
-              className="min-h-11 md:min-h-9"
               disabled={!privileged || saving}
               onClick={() => void resetStagePrompt()}
             >
               <RotateCcw className="size-3.5" /> Reset
             </Button>
-            <Button
+            <button
               type="button"
-              size="sm"
-              className="min-h-11 md:min-h-9"
+              className="studio-primary-btn"
               disabled={!privileged || saving}
               onClick={() => void saveAllBriefs()}
             >
-              {saving ? "Saving…" : "Save"}
-            </Button>
+              <span>{saving ? "Saving…" : "Save prompt"}</span>
+              <ArrowRight className="size-4" aria-hidden />
+            </button>
           </div>
         </div>
 
         <div className={cn("grid w-full gap-4", compareDefault ? "lg:grid-cols-2" : "grid-cols-1")}>
           <div className="flex w-full min-w-0 flex-col gap-2">
             {compareDefault ? (
-              <div className="flex items-center justify-between text-xs text-[#a2a19f]">
-                <span className="font-mono uppercase tracking-wider text-[#f2efe9]">Active</span>
-                <span className="font-mono">{activeLineCount}L · {currentPrompt.length}c</span>
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">Active</span>
+                <span className="font-mono">
+                  {activeLineCount}L · {currentPrompt.length}c
+                </span>
               </div>
             ) : null}
             <textarea
               aria-label={`${activeMeta.title} prompt template`}
-              rows={22}
-              style={{ minHeight: "440px", height: "auto" }}
-              className="min-h-[420px] w-full resize-y rounded-xl border border-[#2b2c30] bg-[#101113] p-4 font-mono text-sm leading-relaxed text-[#f2efe9] focus:border-[#f18b6e] focus:outline-none"
+              rows={20}
+              className="field min-h-[380px] w-full resize-y p-4 font-mono text-xs leading-relaxed"
               value={currentPrompt}
               disabled={!privileged}
               spellCheck={false}
@@ -4701,8 +5153,8 @@ function PromptsTab({
 
           {compareDefault ? (
             <div className="flex w-full min-w-0 flex-col gap-2">
-              <div className="flex items-center justify-between text-xs text-[#a2a19f]">
-                <span className="font-mono uppercase tracking-wider">Default</span>
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span className="font-medium">Default</span>
                 <span className="font-mono">
                   {defaultPromptForStage ? defaultPromptForStage.split("\n").length : 1}L · {defaultPromptForStage.length}c
                 </span>
@@ -4710,14 +5162,18 @@ function PromptsTab({
               <textarea
                 aria-label={`${activeMeta.title} default prompt reference`}
                 readOnly
-                rows={22}
-                style={{ minHeight: "440px", height: "auto" }}
-                className="min-h-[420px] w-full resize-y rounded-xl border border-[#2b2c30] bg-[#101113]/70 p-4 font-mono text-sm leading-relaxed text-[#a2a19f] focus:outline-none"
+                rows={20}
+                className="field min-h-[380px] w-full resize-y bg-card p-4 font-mono text-xs leading-relaxed text-muted-foreground"
                 value={defaultPromptForStage || currentPrompt}
                 spellCheck={false}
               />
             </div>
           ) : null}
+        </div>
+
+        <div className="studio-pane-footer">
+          <span>PROMPT TEMPLATE</span>
+          <span>{activeCustomized ? "Customized" : "Default template"}</span>
         </div>
       </section>
     </div>
@@ -4727,10 +5183,10 @@ function PromptsTab({
 function MeterRow({ label, level, text }: { label: string; level: number | null; text: string }) {
   const clamped = level !== null && Number.isFinite(level) ? Math.max(0, Math.min(1, level)) : 0;
   const pct = Math.round(clamped * 100);
-  const fillClass = pct >= 85 ? "bg-[#f0a096]" : pct >= 65 ? "bg-[#d6b57b]" : "bg-[#5eead4]";
+  const fillClass = pct >= 85 ? "bg-destructive" : pct >= 65 ? "bg-warning" : "bg-success";
   return (
-    <div className="grid grid-cols-[72px_minmax(0,1fr)_64px] items-center gap-2">
-      <span className="font-mono text-[10px] tracking-wide text-[#a2a19f] uppercase">{label}</span>
+    <div className="grid grid-cols-[72px_minmax(0,1fr)_88px] items-center gap-2">
+      <span className="font-mono text-[12.5px] text-muted-foreground">{label}</span>
       <div
         role={level === null ? undefined : "meter"}
         aria-label={label}
@@ -4738,11 +5194,11 @@ function MeterRow({ label, level, text }: { label: string; level: number | null;
         aria-valuemax={level === null ? undefined : 100}
         aria-valuenow={level === null ? undefined : pct}
         aria-valuetext={level === null ? undefined : text}
-        className="h-2 overflow-hidden rounded-full border border-[#2b2c30] bg-[#101113]"
+        className="h-2 overflow-hidden rounded-full border border-border bg-background"
       >
         <div className={cn("h-full rounded-full transition-[width] duration-200", fillClass)} style={{ width: `${pct}%` }} />
       </div>
-      <span className="text-right font-mono text-[11px] text-[#f2efe9]">{text}</span>
+      <span className="whitespace-nowrap text-right font-mono text-[12px] text-foreground">{text}</span>
     </div>
   );
 }
@@ -4762,7 +5218,7 @@ function NodeDialog({
   privileged: boolean;
   onOpenChange: (open: boolean) => void;
   onSaved: (nodes: RenderNode[]) => void;
-  onNotice: (message: string) => void;
+  onNotice: OnNotice;
 }) {
   const [kind, setKind] = useState<RenderNodeKind>("ssh");
   const [id, setId] = useState("ssh-1");
@@ -4926,10 +5382,9 @@ function NodeDialog({
           setBox(started.sandboxes[0].name);
         }
       }
-      const verificationUrl =
-        typeof started.verificationUrl === "string" ? started.verificationUrl : null;
+      const verificationUrl = normalizeHttpUrl(started.verificationUrl);
       const userCode =
-        typeof started.userCode === "string" ? started.userCode : null;
+        typeof started.userCode === "string" && started.userCode.trim() ? started.userCode.trim() : null;
       const instructions =
         typeof started.instructions === "string"
           ? started.instructions
@@ -4979,19 +5434,18 @@ function NodeDialog({
           checked: true,
           ok: false,
           detail: statusRes.detail,
-          instructions: "Install the Docker sbx CLI on this server, then run `sbx login`.",
+          instructions: "Install the Docker sbx CLI on this server.",
         });
         return;
       }
       const started = await api.studio.sbxAuthStart();
-      const verificationUrl =
-        typeof started.verificationUrl === "string" ? started.verificationUrl : null;
+      const verificationUrl = normalizeHttpUrl(started.verificationUrl);
       const userCode =
-        typeof started.userCode === "string" ? started.userCode : null;
+        typeof started.userCode === "string" && started.userCode.trim() ? started.userCode.trim() : null;
       const instructions =
         typeof started.instructions === "string"
           ? started.instructions
-          : "Run `sbx login` in a terminal and finish the browser sign-in flow.";
+          : "Complete the browser sign-in flow.";
       setSbxAuthInfo({
         checked: true,
         ok: Boolean(started.authenticated),
@@ -5076,7 +5530,7 @@ function NodeDialog({
       onSaved(saved.nodes);
       const prov = await api.studio.nodeAction(built.resolvedId, "provision");
       setProvisionStatus({ ok: prov.ok, detail: prov.detail });
-      onNotice(prov.detail);
+      onNotice(prov.detail, prov.ok ? "info" : "danger");
     } catch (error) {
       const msg = errText(error);
       setProvisionStatus({ ok: false, detail: msg });
@@ -5110,12 +5564,13 @@ function NodeDialog({
             prov.ok
               ? `Saved ${built.resolvedId} & provisioned render environment: ${prov.detail}`
               : `Saved ${built.resolvedId} (provisioning note: ${prov.detail})`,
+            prov.ok ? "info" : "danger",
           );
           onOpenChange(false);
           return;
         } catch (provErr) {
           onSaved(result.nodes);
-          onNotice(`Saved ${built.resolvedId}, but auto-provisioning reported: ${errText(provErr)}`);
+          onNotice(`Saved ${built.resolvedId}, but auto-provisioning reported: ${errText(provErr)}`, "danger");
           onOpenChange(false);
           return;
         }
@@ -5124,7 +5579,7 @@ function NodeDialog({
       onOpenChange(false);
     } catch (error) {
       setFormError(errText(error));
-      onNotice(errText(error));
+      onNotice(errText(error), "danger");
     } finally {
       setBusy(false);
     }
@@ -5134,7 +5589,7 @@ function NodeDialog({
     <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next); }}>
       <DialogContent className="studio-dialog sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle className="font-serif text-2xl">{editing ? "Edit render node" : "Add render node"}</DialogTitle>
+          <DialogTitle className="text-2xl font-semibold tracking-[-0.015em]">{editing ? "Edit render node" : "Add render node"}</DialogTitle>
           <DialogDescription className="sr-only">Configure render node</DialogDescription>
         </DialogHeader>
         <div className="flex flex-wrap gap-1" role="group" aria-label="Node kind">
@@ -5155,9 +5610,9 @@ function NodeDialog({
           <div className="grid gap-3">
             <div className="flex flex-wrap items-center gap-1.5 text-xs">
               <span className="cap is-on">1. SSH Host &amp; Key</span>
-              <span className="text-[#a2a19f]" aria-hidden>-&gt;</span>
+              <span className="text-muted-foreground" aria-hidden>-&gt;</span>
               <span className="cap">2. Auto-Setup</span>
-              <span className="text-[#a2a19f]" aria-hidden>-&gt;</span>
+              <span className="text-muted-foreground" aria-hidden>-&gt;</span>
               <span className="cap">3. Ready</span>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
@@ -5190,7 +5645,7 @@ function NodeDialog({
               </label>
             </div>
             <label className="text-sm">
-              SSH Private Key <span className="text-xs text-[#a2a19f]">(write-only)</span>
+              SSH Private Key <span className="text-xs text-muted-foreground">(write-only)</span>
               <textarea
                 rows={4}
                 className="field mt-1 min-h-24 font-mono"
@@ -5202,9 +5657,9 @@ function NodeDialog({
               />
             </label>
             {editing?.auth.hasSecret ? (
-              <p className="font-mono text-xs text-[#aed1a8]">Key stored · {editing.auth.secretHint || "saved"}</p>
+              <p className="font-mono text-xs text-success">Key stored · {editing.auth.secretHint || "saved"}</p>
             ) : null}
-            <label className="flex items-center gap-2 rounded-lg border border-[#2b2c30] bg-[#101113] px-3 py-2.5 text-sm text-[#f2efe9]">
+            <label className="flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-foreground">
               <input
                 type="checkbox"
                 checked={autoBootstrapSsh}
@@ -5231,8 +5686,8 @@ function NodeDialog({
                 className={cn(
                   "rounded-lg border px-3 py-2 font-mono text-xs",
                   provisionStatus.ok
-                    ? "border-[#3d523b] bg-[#1e281f] text-[#aed1a8]"
-                    : "border-[#69453e] bg-[#2e1f1e] text-[#f0a096]",
+                    ? "border-success/40 bg-success-soft text-success"
+                    : "border-destructive/40 bg-destructive-soft text-destructive",
                 )}
                 role="status"
               >
@@ -5244,7 +5699,7 @@ function NodeDialog({
 
         {kind === "docker-sbx" ? (
           <div className="grid gap-3">
-            <div className="flex flex-col gap-2 rounded-xl border border-[#2b2c30] bg-[#101113] p-3">
+            <div className="flex flex-col gap-2 rounded-xl bg-background p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <span className="cap is-on">1. Sandbox Auth</span>
@@ -5274,49 +5729,44 @@ function NodeDialog({
               </div>
               {sbxAuthInfo ? (
                 <div className="flex flex-col gap-2 text-xs">
-                  <p className={cn("font-mono", sbxAuthInfo.ok ? "text-[#aed1a8]" : "text-[#d6b57b]")}>
+                  <p className={cn("font-mono", sbxAuthInfo.ok ? "text-success" : "text-warning")}>
                     {sbxAuthInfo.detail}
                   </p>
-                  {!sbxAuthInfo.ok && (sbxAuthInfo.userCode || sbxAuthInfo.verificationUrl) ? (
-                    <div className="flex flex-col gap-2 rounded-xl border border-[#2b2c30] bg-[#17181a] p-3">
+                  {!sbxAuthInfo.ok ? (
+                    <div className="flex flex-col gap-2 rounded-2xl bg-card p-3">
                       {sbxAuthInfo.userCode ? (
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-[#a2a19f]">One-time code:</span>
-                          <code className="rounded border border-[#2b2c30] bg-[#101113] px-2.5 py-1 font-mono text-sm font-semibold text-[#f2efe9]">
+                          <span className="text-muted-foreground">Code:</span>
+                          <code className="rounded border border-border bg-background px-2.5 py-1 font-mono text-sm font-semibold text-foreground">
                             {sbxAuthInfo.userCode}
                           </code>
                           <CopyButton value={sbxAuthInfo.userCode} label="Copy code" />
                         </div>
                       ) : null}
-                      {sbxAuthInfo.verificationUrl ? (
+                      {normalizeHttpUrl(sbxAuthInfo.verificationUrl) ? (
                         <div className="flex flex-wrap items-center gap-2">
                           <a
-                            href={sbxAuthInfo.verificationUrl}
+                            href={normalizeHttpUrl(sbxAuthInfo.verificationUrl)!}
                             target="_blank"
                             rel="noreferrer"
-                            className="inline-flex w-fit items-center rounded-lg border border-[#2b2c30] bg-[#101113] px-2.5 py-1 font-mono text-xs text-[#5eead4] hover:border-[#f18b6e]"
+                            className="inline-flex min-h-11 items-center rounded-full bg-muted px-3 font-mono text-[12.5px] text-foreground hover:bg-raised md:min-h-8"
                           >
-                            Open Docker Sign-In
+                            Open sign-in
                           </a>
-                          <CopyButton value={sbxAuthInfo.verificationUrl} label="Copy URL" />
+                          <CopyButton value={normalizeHttpUrl(sbxAuthInfo.verificationUrl)!} label="Copy link" />
                         </div>
-                      ) : null}
-                      <p className="font-mono text-[11px] text-[#a2a19f]">
-                        Waiting for Docker browser sign-in… (auto-checking every 3s)
-                      </p>
-                    </div>
-                  ) : null}
-                  {sbxAuthInfo.instructions ? (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-[#a2a19f]">{sbxAuthInfo.instructions}</span>
-                      <CopyButton value="sbx login" label="Copy sbx login" />
+                      ) : (
+                        <p className="text-xs text-warning" role="status">
+                          Sign-in link pending or unavailable. Click Link Docker Account to request a browser sign-in link.
+                        </p>
+                      )}
                     </div>
                   ) : null}
                 </div>
               ) : null}
             </div>
 
-            <div className="flex flex-col gap-2 rounded-xl border border-[#2b2c30] bg-[#101113] p-3">
+            <div className="flex flex-col gap-2 rounded-xl bg-background p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="cap is-on">2. Sandbox Box</span>
                 <Button
@@ -5328,11 +5778,11 @@ function NodeDialog({
                   {provisioningNow ? "Provisioning…" : "Provision now"}
                 </Button>
               </div>
-              <p className="text-xs text-[#a2a19f]">
+              <p className="text-xs text-muted-foreground">
                 Provision auto-checks if the prebaked Remotion environment (<code>.kit-ready</code>, headless browser, <code>ffmpeg</code>) is in the sandbox, and creates/bakes it if missing.
               </p>
               {detectedSandboxes.length ? <div className="flex flex-wrap items-center gap-2 text-xs">
-                <span className="text-[#a2a19f]">Existing sandboxes:</span>
+                <span className="text-muted-foreground">Existing sandboxes:</span>
                 {detectedSandboxes.map((sandbox) => <button key={sandbox.id || sandbox.name} type="button" className={cn("chip", box === sandbox.name && "is-on")} aria-pressed={box === sandbox.name} onClick={() => setBox(sandbox.name)}>{sandbox.name} · {sandbox.status}{sandbox.cpus != null ? ` · ${sandbox.cpus} vCPU` : ""}</button>)}
               </div> : null}
               <label className="text-sm">
@@ -5345,7 +5795,7 @@ function NodeDialog({
                   onChange={(event) => setBox(event.target.value)}
                 />
               </label>
-              <label className="mt-1 flex items-center gap-2 text-sm text-[#f2efe9]">
+              <label className="mt-1 flex items-center gap-2 text-sm text-foreground">
                 <input
                   type="checkbox"
                   checked={autoProvisionSbx}
@@ -5358,8 +5808,8 @@ function NodeDialog({
                   className={cn(
                     "rounded-lg border px-3 py-2 font-mono text-xs",
                     provisionStatus.ok
-                      ? "border-[#3d523b] bg-[#1e281f] text-[#aed1a8]"
-                      : "border-[#69453e] bg-[#2e1f1e] text-[#f0a096]",
+                      ? "border-success/40 bg-success-soft text-success"
+                      : "border-destructive/40 bg-destructive-soft text-destructive",
                   )}
                   role="status"
                 >
@@ -5379,9 +5829,9 @@ function NodeDialog({
           </div>
         ) : null}
 
-        <details className="text-xs text-[#a2a19f]">
+        <details className="text-xs text-muted-foreground">
           <summary className="cursor-pointer select-none">Advanced node settings</summary>
-          <div className="mt-2 flex flex-col gap-3 rounded-xl border border-[#2b2c30] bg-[#101113] p-3 text-sm text-[#f2efe9]">
+          <div className="mt-2 flex flex-col gap-3 rounded-xl bg-background p-3 text-sm text-foreground">
             <div className="grid gap-3 sm:grid-cols-2">
               <label className="text-sm">
                 Id
@@ -5409,7 +5859,7 @@ function NodeDialog({
             </div>
             <div className="flex flex-wrap items-center gap-4">
               <label className="inline-flex items-center gap-2 text-sm">
-                <span className="text-[11px] text-[#a2a19f]">Priority</span>
+                <span className="text-[12px] text-muted-foreground">Priority</span>
                 <input
                   className="step-input"
                   type="number"
@@ -5464,7 +5914,7 @@ function NodeDialog({
           </div>
         </details>
 
-        {formError ? <p className="text-sm text-[#f0a096]" role="alert">{formError}</p> : null}
+        {formError ? <p className="text-sm text-destructive" role="alert">{formError}</p> : null}
         <DialogFooter>
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
           <Button type="button" disabled={!privileged || busy} onClick={() => void save()}>{busy ? "Saving…" : "Save node"}</Button>
@@ -5474,8 +5924,21 @@ function NodeDialog({
   );
 }
 
-function VoiceTab({ voices, privileged }: { voices: VoiceChoice[]; privileged: boolean }) {
-  const [selectedVoice, setSelectedVoice] = useState<string>(() => voices[0]?.id ?? "");
+export function VoiceTab({
+  providers,
+  privileged,
+  onRefreshCatalog,
+}: {
+  providers: TtsProviderGroup[];
+  privileged: boolean;
+  onRefreshCatalog?: () => Promise<void> | void;
+}) {
+  const initialPref = useMemo(() => readPreferredVoice(), []);
+  const [providerId, setProviderId] = useState<string>(() => initialPref?.providerId || "");
+  const [modelId, setModelId] = useState<string>(() => initialPref?.modelId || "");
+  const [voiceId, setVoiceId] = useState<string>(() => initialPref?.voiceId || "");
+  const providerTouchedRef = useRef(false);
+  const voiceTouchedRef = useRef(false);
   const [src, setSrc] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -5488,10 +5951,66 @@ function VoiceTab({ voices, privileged }: { voices: VoiceChoice[]; privileged: b
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    if (!voices.some((v) => v.id === selectedVoice)) {
-      setSelectedVoice(voices[0]?.id ?? "");
+    void onRefreshCatalog?.();
+  }, [onRefreshCatalog]);
+
+  const provider =
+    providers.find((p) => p.id === providerId) ||
+    providers.find((p) => p.available) ||
+    providers[0] ||
+    null;
+  const activeModel = useMemo(() => {
+    if (!provider) return null;
+    if (modelId) {
+      const hit = provider.models.find((m) => m.id === modelId);
+      if (hit) return hit;
     }
-  }, [voices, selectedVoice]);
+    const voiceHit = provider.voices.find((v) => v.id === voiceId);
+    if (voiceHit) {
+      const hit = provider.models.find((m) => m.id === voiceHit.modelId);
+      if (hit) return hit;
+    }
+    return provider.models[0] || null;
+  }, [provider, modelId, voiceId]);
+  const modelVoices = activeModel?.voices || provider?.voices || [];
+  const voice =
+    modelVoices.find((v) => v.id === voiceId) ||
+    provider?.voices.find((v) => v.id === voiceId) ||
+    modelVoices[0] ||
+    provider?.voices[0] ||
+    null;
+
+  useEffect(() => {
+    if (!providers.length) return;
+    let targetProvider = providers.find((p) => p.id === providerId && p.available);
+    if (!targetProvider && !providerTouchedRef.current && initialPref?.providerId) {
+      targetProvider = providers.find(
+        (p) => (p.id === initialPref.providerId || p.engine === initialPref.providerId) && p.available,
+      );
+    }
+    if (!targetProvider) {
+      targetProvider = providers.find((p) => p.available) || providers[0];
+    }
+    if (!targetProvider) return;
+    if (targetProvider.id !== providerId) setProviderId(targetProvider.id);
+
+    let targetVoice = targetProvider.voices.find((v) => v.id === voiceId);
+    if (
+      !voiceTouchedRef.current &&
+      initialPref?.voiceId &&
+      (targetProvider.id === initialPref.providerId || targetProvider.engine === initialPref.providerId)
+    ) {
+      const prefVoice = targetProvider.voices.find((v) => v.id === initialPref.voiceId);
+      if (prefVoice) targetVoice = prefVoice;
+    }
+    if (!targetVoice) {
+      targetVoice = targetProvider.voices.find((v) => v.default) || targetProvider.voices[0];
+    }
+    if (targetVoice) {
+      if (targetVoice.id !== voiceId) setVoiceId(targetVoice.id);
+      if (targetVoice.modelId !== modelId) setModelId(targetVoice.modelId);
+    }
+  }, [providers, providerId, voiceId, modelId, initialPref]);
 
   useEffect(() => {
     gen.current += 1;
@@ -5508,7 +6027,7 @@ function VoiceTab({ voices, privileged }: { voices: VoiceChoice[]; privileged: b
     setCurrentTime(0);
     setDuration(0);
     setSpendOk(false);
-  }, [selectedVoice]);
+  }, [provider?.id, voice?.id]);
 
   useEffect(() => {
     return () => {
@@ -5517,17 +6036,14 @@ function VoiceTab({ voices, privileged }: { voices: VoiceChoice[]; privileged: b
     };
   }, []);
 
-  const choice = voices.find((v) => v.id === selectedVoice) || voices[0] || null;
-  const isPaid = Boolean(
-    choice &&
-      choice.engine.toLowerCase() !== "edge" &&
-      choice.engine.toLowerCase() !== "edge-tts" &&
-      choice.providerId.toLowerCase() !== "edge" &&
-      choice.providerId.toLowerCase() !== "edge-tts",
-  );
+  const isPaid = isPaidTtsProvider(provider);
 
   async function listen() {
-    if (!choice || busy || !privileged) return;
+    if (!provider || !voice || busy || !privileged) return;
+    if (!provider.available) {
+      setError(`${provider.label} unavailable: ${provider.unavailableReason || "connect in Studio Providers"}`);
+      return;
+    }
     if (isPaid && !spendOk) {
       setError("Confirm spend before synthesizing this paid voice.");
       return;
@@ -5545,7 +6061,7 @@ function VoiceTab({ voices, privileged }: { voices: VoiceChoice[]; privileged: b
     setBusy(true);
     setError("");
     try {
-      const preview = await api.intake.preview(choice.providerId, choice.voiceId, controller.signal);
+      const preview = await api.intake.preview(provider.id, voice.id, controller.signal);
       if (token !== gen.current) return;
       setSrc(preview.audioUrl);
       window.setTimeout(() => {
@@ -5575,33 +6091,81 @@ function VoiceTab({ voices, privileged }: { voices: VoiceChoice[]; privileged: b
 
   return (
     <div className="desk-card studio-voice">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="cap is-on">
-          <AudioLines size={14} aria-hidden /> Edge TTS · Free
-        </span>
-        <span className="cap is-on">
-          <AudioLines size={14} aria-hidden /> Vertex AI · Chirp 3 HD &amp; Gemini
-        </span>
-        <span className="cap is-on">
-          <AudioLines size={14} aria-hidden /> xAI Grok · Subscription
-        </span>
-      </div>
-
-      <div className="mt-4 flex flex-col gap-3 rounded-xl border border-[#2b2c30] bg-[#101113] p-3.5">
+      <div className="flex flex-col gap-3">
         <div className="flex flex-wrap items-end gap-3">
-          <label className="min-w-[220px] flex-1 text-sm" htmlFor="studioNarratorVoice">
+          <label className="min-w-[140px] flex-1 text-sm" htmlFor="studioTtsProvider">
+            Provider
+            <select
+              id="studioTtsProvider"
+              className="field mt-1"
+              value={provider?.id || ""}
+              onChange={(event) => {
+                const nextProvId = event.target.value;
+                providerTouchedRef.current = true;
+                setProviderId(nextProvId);
+                const nextProv = providers.find((p) => p.id === nextProvId);
+                const defVoice = nextProv?.voices.find((v) => v.default) || nextProv?.voices[0];
+                if (defVoice) {
+                  setModelId(defVoice.modelId);
+                  setVoiceId(defVoice.id);
+                }
+              }}
+            >
+              {providers.length === 0 && <option value="">No providers loaded</option>}
+              {providers.map((p) => (
+                <option key={p.id} value={p.id} disabled={!p.available || p.voices.length === 0}>
+                  {p.label}{p.available ? "" : " (Unavailable)"}
+                </option>
+              ))}
+            </select>
+          </label>
+          {provider?.hasExplicitModels ? (
+            <label className="min-w-[180px] flex-1 text-sm" htmlFor="studioTtsModel">
+              Model
+              <select
+                id="studioTtsModel"
+                className="field mt-1"
+                value={activeModel?.id || ""}
+                onChange={(event) => {
+                  const nextModelId = event.target.value;
+                  voiceTouchedRef.current = true;
+                  setModelId(nextModelId);
+                  const nextGroup = provider.models.find((m) => m.id === nextModelId);
+                  const currentShort = voice?.label;
+                  const nextVoice =
+                    nextGroup?.voices.find((v) => v.label === currentShort) ||
+                    nextGroup?.voices.find((v) => v.default) ||
+                    nextGroup?.voices[0];
+                  if (nextVoice) setVoiceId(nextVoice.id);
+                }}
+              >
+                {provider.models.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          <label className="min-w-[180px] flex-1 text-sm" htmlFor="studioNarratorVoice">
             Voice
             <select
               id="studioNarratorVoice"
               className="field mt-1"
-              value={selectedVoice}
-              disabled={voices.length === 0}
-              onChange={(event) => setSelectedVoice(event.target.value)}
+              value={voice?.id || ""}
+              disabled={modelVoices.length === 0}
+              onChange={(event) => {
+                const nextVoiceId = event.target.value;
+                voiceTouchedRef.current = true;
+                setVoiceId(nextVoiceId);
+                const nextVoice = provider?.voices.find((v) => v.id === nextVoiceId);
+                if (nextVoice) setModelId(nextVoice.modelId);
+              }}
             >
-              {voices.length === 0 && <option value="">No voices available</option>}
-              {voices.map((v) => (
+              {modelVoices.length === 0 && <option value="">No voices available</option>}
+              {modelVoices.map((v) => (
                 <option key={v.id} value={v.id}>
-                  {v.voiceLabel} · {v.providerLabel}
+                  {v.label}
                 </option>
               ))}
             </select>
@@ -5609,14 +6173,14 @@ function VoiceTab({ voices, privileged }: { voices: VoiceChoice[]; privileged: b
           <Button
             type="button"
             variant={playing ? "outline" : "default"}
-            className="min-h-11"
-            disabled={!privileged || !choice || busy || (isPaid && !spendOk)}
+            className="min-h-11 md:min-h-9"
+            disabled={!privileged || !provider?.available || !voice || busy || (isPaid && !spendOk)}
             onClick={() => (playing ? stop() : void listen())}
           >
             <AudioLines size={16} aria-hidden /> {busy ? "Generating…" : playing ? "Stop" : "Play sample"}
           </Button>
           {isPaid ? (
-            <label className="flex min-h-11 items-center gap-2 text-xs text-[#a2a19f]">
+            <label className="flex min-h-11 items-center gap-2 text-xs text-muted-foreground md:min-h-9">
               <input
                 type="checkbox"
                 checked={spendOk}
@@ -5631,25 +6195,17 @@ function VoiceTab({ voices, privileged }: { voices: VoiceChoice[]; privileged: b
           <Button
             type="button"
             variant="outline"
-            className="min-h-11"
-            disabled={!choice}
+            className="min-h-11 md:min-h-9"
+            disabled={!provider || !voice || !provider.available}
             onClick={() => {
-              if (!choice) return;
-              try {
-                localStorage.setItem(
-                  "screeningroom.preferredVoice",
-                  JSON.stringify({
-                    providerId: choice.providerId,
-                    voiceId: choice.voiceId,
-                    engine: choice.engine,
-                    voiceLabel: choice.voiceLabel,
-                  }),
-                );
-                localStorage.setItem("screeningroom.voice.provider", choice.providerId);
-                localStorage.setItem("screeningroom.voice.id", choice.voiceId);
-              } catch {
-                /* Storage blocked in private browsing */
-              }
+              if (!provider || !voice) return;
+              writePreferredVoice({
+                providerId: provider.id,
+                modelId: activeModel?.id || voice.modelId,
+                voiceId: voice.id,
+                engine: provider.engine,
+                voiceLabel: voice.label,
+              });
               navigateClient("/new-series.html");
             }}
           >
@@ -5657,15 +6213,29 @@ function VoiceTab({ voices, privileged }: { voices: VoiceChoice[]; privileged: b
           </Button>
         </div>
 
+        {providers.some((p) => !p.available && p.unavailableReason) ? (
+          <ul className="rounded-xl bg-warning-soft px-3 py-2 text-xs text-warning" role="status">
+            {providers
+              .filter((p) => !p.available && p.unavailableReason)
+              .map((p) => (
+                <li key={p.id}>
+                  <strong>{p.label} unavailable:</strong> {p.unavailableReason}
+                </li>
+              ))}
+          </ul>
+        ) : provider?.costNotice ? (
+          <p className="text-xs text-muted-foreground" role="note">{provider.costNotice}</p>
+        ) : null}
+
         <div className="flex items-center gap-3">
-          <Waves className={cn("size-4 shrink-0", playing ? "text-[#5eead4]" : "text-[#a2a19f]")} aria-hidden />
-          <div className="h-2 flex-1 overflow-hidden rounded-full border border-[#2b2c30] bg-[#17181a]">
+          <Waves className={cn("size-4 shrink-0", playing ? "text-primary-text" : "text-muted-foreground")} aria-hidden />
+          <div className="h-2 flex-1 overflow-hidden rounded-full border border-border bg-card">
             <div
-              className="h-full rounded-full bg-[#5eead4] transition-[width] duration-150"
+              className="h-full rounded-full bg-primary transition-[width] duration-150"
               style={{ width: `${duration > 0 ? Math.min(100, Math.round((currentTime / duration) * 100)) : 0}%` }}
             />
           </div>
-          <span className="shrink-0 font-mono text-xs text-[#a2a19f] tabular-nums">
+          <span className="shrink-0 font-mono text-xs text-muted-foreground tabular-nums">
             {fmtAudioTime(currentTime)} / {fmtAudioTime(duration)}
           </span>
           {src ? (
@@ -5682,7 +6252,7 @@ function VoiceTab({ voices, privileged }: { voices: VoiceChoice[]; privileged: b
             />
           ) : null}
         </div>
-        {error ? <p className="text-xs text-[#f0a096]" role="alert">{error}</p> : null}
+        {error ? <p className="text-xs text-destructive" role="alert">{error}</p> : null}
       </div>
     </div>
   );
@@ -5712,7 +6282,7 @@ function IntStepper({
   }
   return (
     <div className="inline-flex items-center gap-1" role="group" aria-label={label}>
-      <span className="text-[11px] text-[#a2a19f]">{label}</span>
+      <span className="text-[12px] text-muted-foreground">{label}</span>
       <button type="button" className="mini" aria-label={`Decrease ${label}`} disabled={disabled} onClick={() => set(value - step)}>−</button>
       <input
         className="step-input"
@@ -5749,7 +6319,7 @@ function InlineConfirm({
   const [error, setError] = useState("");
   return (
     <>
-      <Button type="button" variant="ghost" size="sm" className="min-h-11 text-[#f0a096] md:min-h-8" disabled={disabled} onClick={() => setArmed(true)}>
+      <Button type="button" variant="ghost" size="sm" className="min-h-11 text-destructive md:min-h-8" disabled={disabled} onClick={() => setArmed(true)}>
         {label}
       </Button>
       <Dialog open={armed} onOpenChange={(next) => { if (!busy) { setArmed(next); setError(""); } }}>
@@ -5774,4 +6344,5 @@ function InlineConfirm({
   );
 }
 
+export const StudioPage = StudioSettingsSections;
 export default StudioPage;

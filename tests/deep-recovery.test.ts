@@ -9,7 +9,7 @@
  * - reader: `_setCallForTests`
  * - writer / fact check / promo block / renderlane worker: injected `_hooks`
  * - audio: a local fake external-TTS python command (real subprocess, real ffmpeg)
- * - cleaner: a fake MIT python command that exits non-zero (real subprocess path)
+ * - cleaner: a fake PanelCleaner python that exits non-zero (real subprocess path)
  * - render: injected subprocess runner (no Remotion)
  * - intake: real child processes running tiny local node scripts
  *
@@ -43,27 +43,32 @@ fs.mkdirSync(TMP_ROOT, { recursive: true });
 process.env.TMPDIR = TMP_ROOT;
 
 /**
- * Fake MIT python: the real cleaner `_runBatch` invokes it and it exits non-zero.
- * With MIT_FAKE_SIGNAL=1 it kills itself instead, so `spawnSync.status` is null
- * and only `signal` is set.
+ * Fake PanelCleaner install: the real cleaner `_runPanelCleaner` spawns its python
+ * and it exits non-zero. With PC_FAKE_SIGNAL=1 it kills itself instead, so
+ * `spawnSync.status` is null and only `signal` is set.
  */
-const MIT_DIR = fs.mkdtempSync(path.join(TMP_ROOT, 'mit-'));
-const MIT_PY = path.join(TMP_ROOT, 'mit-fake.py');
+const PC_DIR = fs.mkdtempSync(path.join(TMP_ROOT, 'pcleaner-'));
+const PC_PY = path.join(PC_DIR, 'venv', 'bin', 'python');
+fs.mkdirSync(path.dirname(PC_PY), { recursive: true });
+fs.mkdirSync(path.join(PC_DIR, 'config', 'pcleaner'), { recursive: true });
+fs.mkdirSync(path.join(PC_DIR, 'cache', 'model'), { recursive: true });
+fs.writeFileSync(path.join(PC_DIR, 'config', 'pcleaner', 'pcleanerrc'), '[General]\n');
+fs.writeFileSync(path.join(PC_DIR, 'cache', 'model', 'comictextdetector.pt.onnx'), 'fake');
 fs.writeFileSync(
-  MIT_PY,
+  PC_PY,
   [
     '#!/usr/bin/env python3',
     'import os, signal, sys',
-    'if os.environ.get("MIT_FAKE_SIGNAL"):',
+    'if os.environ.get("PC_FAKE_SIGNAL"):',
     '    os.kill(os.getpid(), signal.SIGKILL)',
-    'sys.stderr.write("fake-mit: detector crashed\\n")',
+    'sys.stderr.write("fake-pcleaner: detector crashed\\n")',
     'sys.exit(3)',
     '',
   ].join('\n'),
   { mode: 0o755 },
 );
-process.env.MANHWA_MIT_DIR = MIT_DIR;
-process.env.MANHWA_MIT_PY = MIT_PY;
+process.env.MANHWA_PCLEANER_DIR = PC_DIR;
+delete process.env.MANHWA_PCLEANER_PY;
 
 /** timeline.ts captures STUDIO_PUBLIC at import; set it before the dynamic import. */
 const STUDIO = fs.mkdtempSync(path.join(TMP_ROOT, 'studio-'));
@@ -125,7 +130,8 @@ beforeAll(() => {
   }
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  (await import('../src/stages/cleaner.js'))._breaker.reset();
   logs = [];
   stderr = [];
   logSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
@@ -1309,7 +1315,7 @@ describe('timeline audio/cleaner recovery', () => {
     expect(fs.statSync(path.join(lineDir, 'line_000.mp3')).mtimeMs).toBe(line0Mtime);
   });
 
-  it('a cleaner non-zero exit fails loudly and never ships the original panel', async () => {
+  it('a cleaner non-zero exit ships the ordinary panel uncleaned instead of failing the chapter', async () => {
     const timeline = await import('../src/stages/timeline.js');
     const fx = await makeTimelineFixture('timeline-cleaner-fail', true);
     const telemetryDir = makeTemp('timeline-cleaner-telemetry');
@@ -1319,20 +1325,59 @@ describe('timeline audio/cleaner recovery', () => {
     });
     telemetry.start('timeline-cleaner-fail', [fx.ch], true);
 
-    await expect(
-      timeline.main(fx.sdir, fx.ch, fx.script, fx.obs, fx.vdir, { env: fx.env }),
-    ).rejects.toThrow(/cleaner batch failed \(rc=3\)/);
+    const props = await timeline.main(fx.sdir, fx.ch, fx.script, fx.obs, fx.vdir, { env: fx.env });
+    expect(fs.existsSync(props)).toBe(true);
 
-    // nothing is rendered from the uncleaned original
-    expect(fs.existsSync(path.join(fx.vdir, 'shots.json'))).toBe(false);
+    // original ships; no cleaned artifact and no permanent rejection stamp
     expect(fs.existsSync(path.join(fx.out, 'cleaned', fx.ch, 'p0001_1.png'))).toBe(false);
     expect(fs.existsSync(path.join(fx.out, 'cleaned', fx.ch, 'p0001_1.png.done'))).toBe(false);
+    expect(fs.existsSync(path.join(fx.out, 'cleaned', fx.ch, 'p0001_1.png.rej'))).toBe(false);
 
     // the failure is logged, not silent
-    expect(stderr.join('\n')).toContain('batch run failed (rc=3)');
+    const err = stderr.join('\n');
+    expect(err).toContain('panelcleaner run failed (rc=3)');
+    expect(err).toContain('shipping 1 panel(s) uncleaned');
     const stages = telemetry._data()!.chapters[fx.ch]!.stages as Record<string, Record<string, unknown>>;
-    expect(stages.clean!.state).toBe('running');
+    expect(stages.clean!.state).toBe('done');
     telemetry._reset();
+  });
+
+  it('a failed promo clean is covered instead of stopping the run', async () => {
+    const cleaner = await import('../src/stages/cleaner.js');
+    const root = makeTemp('promo-cover');
+    const panels = path.join(root, 'panels');
+    fs.mkdirSync(panels, { recursive: true });
+    await sharp({ create: { width: 60, height: 90, channels: 3, background: { r: 200, g: 50, b: 50 } } })
+      .jpeg()
+      .toFile(path.join(panels, 'p0001_1.jpg'));
+    const out = await cleaner.coverPromoPanel(
+      { id: 'p0001_1', promo_item: true, promo_full: true },
+      panels,
+      path.join(root, 'cleaned'),
+    );
+    expect(out).toContain('/covered/');
+    expect(fs.existsSync(out!)).toBe(true);
+    // no stamp: the next run still tries a proper promo clean
+    expect(fs.existsSync(path.join(root, 'cleaned', 'p0001_1.png.done'))).toBe(false);
+    const timeline = await import('../src/stages/timeline.js');
+    expect(
+      timeline._applyCleaned(
+        [{ panel: 'p0001_1.jpg' }],
+        { p0001_1: { id: 'p0001_1', promo_item: true, promo_full: true } },
+        { p0001_1: out },
+      ),
+    ).toBe(1);
+  });
+
+  it('a cleaner crash still fails closed for a promo panel', async () => {
+    const timeline = await import('../src/stages/timeline.js');
+    expect(() =>
+      timeline._applyCleaned(
+        [{ panel: 'p0001_1.jpg' }],
+        { p0001_1: { id: 'p0001_1', promo_item: true } },
+        { p0001_1: null },
+      ),
+    ).toThrow(/promo safety/);
   });
 
   it('timeline awaits cleanBatch so a successful clean is applied', async () => {
@@ -1530,77 +1575,172 @@ describe('render incomplete output and lane fallback', () => {
  * ================================================================== */
 
 describe('cleaner fallback semantics (real cleanBatch, real subprocess)', () => {
-  it('a non-zero cleaner exit throws instead of returning null for every panel', async () => {
-    const cleaner = await import('../src/stages/cleaner.js');
-    const root = makeTemp('cleaner-exit');
+  async function onePanel(name: string): Promise<{ panels: string; cleaned: string }> {
+    const root = makeTemp(name);
     const panels = path.join(root, 'panels');
     const cleaned = path.join(root, 'cleaned');
     fs.mkdirSync(panels, { recursive: true });
     await sharp({ create: { width: 50, height: 70, channels: 3, background: { r: 10, g: 20, b: 30 } } })
       .jpeg()
       .toFile(path.join(panels, 'p0001_1.jpg'));
+    return { panels, cleaned };
+  }
+  const item = [{ id: 'p0001_1', overlay: ['x'.repeat(60)], overlay_chars: 60, world: [] }];
+  const whiteOut = async (srcDir: string) => {
+    const d = await sharp(path.join(srcDir, 'p0001_1.jpg')).linear(0, 255).raw().toBuffer({ resolveWithObject: true });
+    return { p0001_1: { data: new Uint8Array(d.data), width: d.info.width, height: d.info.height } };
+  };
 
-    await expect(
-      cleaner.cleanBatch(
-        [{ id: 'p0001_1', overlay: ['x'.repeat(60)], overlay_chars: 60, world: [] }],
-        panels,
-        cleaned,
-      ),
-    ).rejects.toThrow(/cleaner batch failed \(rc=3\)/);
+  it('a non-zero cleaner exit is retried once, then ships the original with no stamp', async () => {
+    const cleaner = await import('../src/stages/cleaner.js');
+    const { panels, cleaned } = await onePanel('cleaner-exit');
+    const res = await cleaner.cleanBatch(item, panels, cleaned);
+    expect(res).toEqual({ p0001_1: null });
     expect(fs.existsSync(path.join(cleaned, 'p0001_1.png'))).toBe(false);
     expect(fs.existsSync(path.join(cleaned, 'p0001_1.png.done'))).toBe(false);
+    // no .rej: the next run retries the panel instead of skipping it forever
     expect(fs.existsSync(path.join(cleaned, 'p0001_1.png.rej'))).toBe(false);
-    // `_runBatch` inspects `spawnSync.status` and reports the failure loudly.
-    expect(stderr.join('\n')).toContain('batch run failed');
-    expect(stderr.join('\n')).toContain('cleaner:');
+    const err = stderr.join('\n');
+    expect(err).toContain('panelcleaner run failed (rc=3)');
+    expect(err).toContain(`attempt ${cleaner.PCLEANER_ATTEMPTS}/${cleaner.PCLEANER_ATTEMPTS} failed`);
+    expect(err).toContain('shipping 1 panel(s) uncleaned');
   });
 
-  it('a signal-killed cleaner (status null) throws instead of silently succeeding', async () => {
+  it('a signal-killed cleaner ships the original instead of silently succeeding', async () => {
     const cleaner = await import('../src/stages/cleaner.js');
-    const root = makeTemp('cleaner-signal');
-    const panels = path.join(root, 'panels');
-    const cleaned = path.join(root, 'cleaned');
-    fs.mkdirSync(panels, { recursive: true });
-    await sharp({ create: { width: 50, height: 70, channels: 3, background: { r: 10, g: 20, b: 30 } } })
-      .jpeg()
-      .toFile(path.join(panels, 'p0001_1.jpg'));
-
-    process.env.MIT_FAKE_SIGNAL = '1';
+    const { panels, cleaned } = await onePanel('cleaner-signal');
+    process.env.PC_FAKE_SIGNAL = '1';
     try {
-      await expect(
-        cleaner.cleanBatch(
-          [{ id: 'p0001_1', overlay: ['x'.repeat(60)], overlay_chars: 60, world: [] }],
-          panels,
-          cleaned,
-        ),
-      ).rejects.toThrow(/cleaner batch failed \(rc=SIGKILL\)/);
+      expect(await cleaner.cleanBatch(item, panels, cleaned)).toEqual({ p0001_1: null });
     } finally {
-      delete process.env.MIT_FAKE_SIGNAL;
+      delete process.env.PC_FAKE_SIGNAL;
     }
     expect(fs.existsSync(path.join(cleaned, 'p0001_1.png'))).toBe(false);
     expect(stderr.join('\n')).toContain('rc=SIGKILL');
   });
 
-  it('a spawn error (missing executable) fails loudly', async () => {
+  it('a spawn error (unexecutable python) ships the original and logs it', async () => {
     const cleaner = await import('../src/stages/cleaner.js');
-    const root = makeTemp('cleaner-spawn');
-    const panels = path.join(root, 'panels');
-    fs.mkdirSync(panels, { recursive: true });
-    await sharp({ create: { width: 50, height: 70, channels: 3, background: { r: 10, g: 20, b: 30 } } })
-      .jpeg()
-      .toFile(path.join(panels, 'p0001_1.jpg'));
-    const originalMode = fs.statSync(MIT_PY).mode;
-    fs.chmodSync(MIT_PY, 0o000);
+    const { panels, cleaned } = await onePanel('cleaner-spawn');
+    const originalMode = fs.statSync(PC_PY).mode;
+    fs.chmodSync(PC_PY, 0o000);
     try {
-      await expect(
-        cleaner.cleanBatch(
-          [{ id: 'p0001_1', overlay: ['x'.repeat(60)], overlay_chars: 60, world: [] }],
-          panels,
-          path.join(root, 'cleaned'),
-        ),
-      ).rejects.toThrow(/EACCES|permission denied|spawn/i);
+      expect(await cleaner.cleanBatch(item, panels, cleaned)).toEqual({ p0001_1: null });
     } finally {
-      fs.chmodSync(MIT_PY, originalMode);
+      fs.chmodSync(PC_PY, originalMode);
+    }
+    expect(stderr.join('\n')).toMatch(/EACCES|permission denied|spawn/i);
+  });
+
+  it('a failed first attempt is retried and the retry result is used', async () => {
+    const cleaner = await import('../src/stages/cleaner.js');
+    const { panels, cleaned } = await onePanel('cleaner-retry');
+    const realPc = cleaner._hooks._runPanelCleaner;
+    const realVerify = cleaner._hooks.residualOverlay;
+    let calls = 0;
+    cleaner._hooks._runPanelCleaner = async (srcDir: string) => {
+      calls += 1;
+      if (calls === 1) throw new Error('panelcleaner failed (rc=1): boom');
+      return whiteOut(srcDir);
+    };
+    cleaner._hooks.residualOverlay = async () => 0;
+    try {
+      const res = await cleaner.cleanBatch(item, panels, cleaned);
+      expect(res.p0001_1).toBe(path.join(cleaned, 'p0001_1.png'));
+      expect(calls).toBe(2);
+      expect(fs.readFileSync(path.join(cleaned, 'p0001_1.png.done'), 'utf8').trim()).toBe(cleaner._cleanHash([]));
+    } finally {
+      cleaner._hooks._runPanelCleaner = realPc;
+      cleaner._hooks.residualOverlay = realVerify;
+    }
+  });
+
+  it('a timed-out run is not retried (it already burned its full timeout)', async () => {
+    const cleaner = await import('../src/stages/cleaner.js');
+    const { panels, cleaned } = await onePanel('cleaner-timeout');
+    const realPc = cleaner._hooks._runPanelCleaner;
+    let calls = 0;
+    cleaner._hooks._runPanelCleaner = async () => {
+      calls += 1;
+      throw Object.assign(new Error('spawnSync ETIMEDOUT'), { code: 'ETIMEDOUT' });
+    };
+    try {
+      expect(await cleaner.cleanBatch(item, panels, cleaned)).toEqual({ p0001_1: null });
+      expect(calls).toBe(1);
+    } finally {
+      cleaner._hooks._runPanelCleaner = realPc;
+    }
+  });
+
+  it('keeps verified outputs stamped by the retired MIT cleaner', async () => {
+    const cleaner = await import('../src/stages/cleaner.js');
+    const { panels, cleaned } = await onePanel('cleaner-legacy');
+    fs.mkdirSync(cleaned, { recursive: true });
+    fs.copyFileSync(path.join(panels, 'p0001_1.jpg'), path.join(cleaned, 'p0001_1.png'));
+    fs.writeFileSync(path.join(cleaned, 'p0001_1.png.done'), cleaner._legacyMitHash([]));
+    const realPc = cleaner._hooks._runPanelCleaner;
+    let calls = 0;
+    cleaner._hooks._runPanelCleaner = async () => {
+      calls += 1;
+      return {};
+    };
+    try {
+      expect((await cleaner.cleanBatch(item, panels, cleaned)).p0001_1).toBe(path.join(cleaned, 'p0001_1.png'));
+      expect(calls).toBe(0);
+    } finally {
+      cleaner._hooks._runPanelCleaner = realPc;
+    }
+  });
+
+  it('opens the circuit after repeated failed batches and stops spawning the cleaner', async () => {
+    const cleaner = await import('../src/stages/cleaner.js');
+    const realPc = cleaner._hooks._runPanelCleaner;
+    const realVerify = cleaner._hooks.residualOverlay;
+    let calls = 0;
+    cleaner._hooks._runPanelCleaner = async () => {
+      calls += 1;
+      throw new Error('panelcleaner failed (rc=3)');
+    };
+    process.env.MANHWA_CLEANER_MAX_FAILS = '2';
+    try {
+      for (let i = 0; i < 4; i++) {
+        const { panels, cleaned } = await onePanel(`cleaner-breaker-${i}`);
+        expect(await cleaner.cleanBatch(item, panels, cleaned)).toEqual({ p0001_1: null });
+      }
+      // 2 failed batches x 2 attempts, then the circuit skips the next 2 batches
+      expect(calls).toBe(2 * cleaner.PCLEANER_ATTEMPTS);
+      expect(cleaner.cleanerCircuitOpen()).toBe(true);
+      expect(stderr.join('\n')).toContain('circuit open');
+      // half-open after the cooldown: one probe runs, success closes the circuit
+      cleaner._breaker.openUntil = Date.now() - 1;
+      cleaner._hooks._runPanelCleaner = async (srcDir: string) => whiteOut(srcDir);
+      cleaner._hooks.residualOverlay = async () => 0;
+      const { panels, cleaned } = await onePanel('cleaner-breaker-probe');
+      expect((await cleaner.cleanBatch(item, panels, cleaned)).p0001_1).toBeTruthy();
+      expect(cleaner._breaker.fails).toBe(0);
+    } finally {
+      delete process.env.MANHWA_CLEANER_MAX_FAILS;
+      cleaner._hooks._runPanelCleaner = realPc;
+      cleaner._hooks.residualOverlay = realVerify;
+    }
+  });
+
+  it('a verifier outage keeps the original without a permanent .rej', async () => {
+    const cleaner = await import('../src/stages/cleaner.js');
+    const { panels, cleaned } = await onePanel('cleaner-verifier-down');
+    const realPc = cleaner._hooks._runPanelCleaner;
+    const realVerify = cleaner._hooks.residualOverlay;
+    cleaner._hooks._runPanelCleaner = async (srcDir: string) => whiteOut(srcDir);
+    cleaner._hooks.residualOverlay = async () => {
+      throw new Error('residual_overlay verifier unavailable: HTTP 429');
+    };
+    try {
+      expect(await cleaner.cleanBatch(item, panels, cleaned)).toEqual({ p0001_1: null });
+      expect(fs.existsSync(path.join(cleaned, 'p0001_1.png'))).toBe(false);
+      expect(fs.existsSync(path.join(cleaned, 'p0001_1.png.rej'))).toBe(false);
+    } finally {
+      cleaner._hooks._runPanelCleaner = realPc;
+      cleaner._hooks.residualOverlay = realVerify;
     }
   });
 });

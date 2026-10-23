@@ -36,6 +36,7 @@ import {
 import * as secretStore from "../config/secretStore.js";
 import * as studioConfig from "../config/studioConfig.js";
 import * as telemetry from "../telemetry/telemetry.js";
+import { isRefusalText } from "../domain/failure.js";
 
 const SNAPSHOT_ENV = "MANHWA_LANE_CONFIG_SNAPSHOT";
 const UUID_NAMESPACE_URL = "6ba7b811-9dad-11d1-80b4-00c04fd430c8";
@@ -109,6 +110,8 @@ export interface Lane {
   headers?: Record<string, string>;
   extraBody?: Record<string, unknown>;
   reasoningEffort?: studioConfig.ReasoningEffort | null;
+  /** Provider's hard output cap; max_tokens (incl. reasoning headroom) never exceeds it. */
+  maxOutputTokens?: number;
   outDir?: string;
 }
 
@@ -428,6 +431,7 @@ export function laneFromConfigEntry(
       lane.thinking = modelCfg.thinking ?? null;
       lane.stream = Boolean(modelCfg.stream);
       lane.reasoningEffort = modelCfg.reasoningEffort ?? null;
+      if (typeof modelCfg.maxOutputTokens === "number") lane.maxOutputTokens = modelCfg.maxOutputTokens;
     }
     return lane;
   }
@@ -1209,6 +1213,8 @@ function cooldownLeft(name: string): number {
   return Math.max(0, (cooldowns.get(name) ?? 0) - Date.now() / 1000);
 }
 
+const AUTH_COOLDOWN_S = 1800;
+
 function cooldown(name: string, seconds: number, why: string): void {
   const until = Date.now() / 1000 + Math.max(0, seconds);
   cooldowns.set(name, Math.max(cooldowns.get(name) ?? 0, until));
@@ -1224,6 +1230,24 @@ function isFilterBlocked(status: number, err: string): boolean {
   if (low.includes("content_policy")) return true;
   if (status === 422) return true;
   return false;
+}
+
+const RATE_COOLDOWN_S = 90;
+/** Longest one call() waits for a cooling lane before giving up. */
+export const CHAIN_WAIT_MAX_S = 900;
+
+function retryAfterS(header: string | null): number | null {
+  if (!header) return null;
+  const n = Number(header);
+  if (Number.isFinite(n) && n >= 0) return n;
+  const at = Date.parse(header);
+  return Number.isFinite(at) ? Math.max(0, (at - Date.now()) / 1000) : null;
+}
+
+/** 429 needs more air than a 5xx blip: 15s, 30s, 60s, 60s... */
+function rateBackoffMs(attempt: number, status: number): number {
+  if (status !== 429) return backoffMs(attempt);
+  return Math.min(60, 15 * 2 ** attempt + Math.random() * 3) * 1000;
 }
 
 function backoffMs(attempt: number): number {
@@ -1245,6 +1269,84 @@ function contentEmpty(out: Completion): boolean {
   } catch {
     return true;
   }
+}
+
+/**
+ * reasoning_effort to send, or null. thinking=false wins over the stored effort:
+ * Vertex rejects "none" (HTTP 400), so it gets its lowest accepted level.
+ */
+export function effectiveEffort(lane: Lane): string | null {
+  const vertex = lane.protocol === "vertex-openai";
+  if (!vertex && lane.protocol !== "openai-compatible") return null;
+  if (lane.thinking === false) return vertex ? "minimal" : null;
+  return lane.reasoningEffort ?? null;
+}
+
+/** Short operator-facing note for a failed HTTP call: status, upstream message, and what to do. */
+export function httpErrorNote(status: number, body: string): string {
+  let msg = "";
+  try {
+    const j = JSON.parse(body) as { error?: { message?: unknown } | unknown; message?: unknown };
+    const e = Array.isArray(j) ? (j[0] as typeof j)?.error : j.error;
+    const m = (e && typeof e === "object" ? (e as { message?: unknown }).message : e) ?? j.message;
+    if (typeof m === "string") msg = m;
+  } catch {
+    msg = body.replace(/\s+/g, " ").trim();
+  }
+  msg = msg.slice(0, 90);
+  const hint = status === 401
+    ? "key/login rejected - reconnect provider in Studio"
+    : status === 403
+      ? "access denied - check key, plan or model access; lane parked 30 min"
+      : status === 404
+        ? "model or endpoint not found - check model id"
+        : status === 429
+          ? "rate limited - backing off, retrying same lane"
+          : status >= 500
+            ? "provider outage - retrying"
+            : status === 400
+              ? "request rejected - check model settings (effort/thinking/max out)"
+              : "";
+  return [`HTTP ${status}`, msg, hint].filter(Boolean).join(" · ");
+}
+
+function emptyNote(finish: string | null): string {
+  if (finish === "length") return "Empty response · hit token cap (reasoning used it) · retrying with bigger cap";
+  if (finish && TERMINAL_FINISH.has(finish)) return `Empty response · blocked (${finish}) · next lane`;
+  return finish ? `Empty response · ${finish}` : "Empty response";
+}
+
+/** Extra max_tokens reserved for hidden reasoning, by effort level. */
+export function reasoningHeadroom(effort: string | null | undefined): number {
+  switch (String(effort ?? "").toLowerCase()) {
+    case "minimal": return 1024;
+    case "low": return 4096;
+    case "medium": return 12000;
+    case "high": return 24000;
+    case "xhigh": case "max": return 32000;
+    default: return 8000;
+  }
+}
+
+const TERMINAL_FINISH = new Set([
+  "length", "max_tokens", "content_filter", "safety", "prohibited_content",
+  "blocklist", "spii", "recitation", "image_safety", "refusal",
+]);
+
+/** Why a 200 came back empty: finish_reason plus token usage, for the log and retry policy. */
+export function emptyReason(out: Completion): { finish: string | null; detail: string; terminal: boolean } {
+  const choice = out?.choices?.[0] as Record<string, unknown> | undefined;
+  const raw = choice?.finish_reason ?? choice?.stop_reason ?? null;
+  const finish = typeof raw === "string" && raw ? raw.toLowerCase() : null;
+  const usage = out?.usage as Record<string, unknown> | undefined;
+  const details = usage?.completion_tokens_details as Record<string, unknown> | undefined;
+  const parts: string[] = [];
+  if (finish) parts.push(`finish=${finish}`);
+  if (typeof usage?.prompt_tokens === "number") parts.push(`prompt=${usage.prompt_tokens}`);
+  if (typeof usage?.completion_tokens === "number") parts.push(`completion=${usage.completion_tokens}`);
+  if (typeof details?.reasoning_tokens === "number") parts.push(`reasoning=${details.reasoning_tokens}`);
+  if (!choice) parts.push("no choices");
+  return { finish, detail: parts.join(" "), terminal: finish !== null && TERMINAL_FINISH.has(finish) };
 }
 
 /**
@@ -1637,12 +1739,17 @@ async function callLane(
       temperature,
       ...(lane.extraBody ?? {}),
     };
-    if (lane.thinking === false) payload.enable_thinking = false;
-    if (
-      lane.reasoningEffort
-      && (lane.protocol === "openai-compatible" || lane.protocol === "vertex-openai")
-    ) {
-      payload.reasoning_effort = lane.reasoningEffort;
+    // Vertex's OpenAI endpoint rejects unknown fields; it gets effort=minimal instead.
+    if (lane.thinking === false && lane.protocol !== "vertex-openai") payload.enable_thinking = false;
+    const effort = effectiveEffort(lane);
+    if (effort) {
+      payload.reasoning_effort = effort;
+      // Reasoning tokens are billed against max_tokens: without headroom a
+      // high-effort model can spend the whole cap thinking and return "".
+      payload.max_tokens = maxTokens + reasoningHeadroom(effort);
+    }
+    if (typeof lane.maxOutputTokens === "number" && typeof payload.max_tokens === "number") {
+      payload.max_tokens = Math.min(payload.max_tokens, lane.maxOutputTokens);
     }
     if (lane.stream) {
       payload.stream = true;
@@ -1657,8 +1764,9 @@ async function callLane(
       }
     }
   }
-  const body = JSON.stringify(payload);
+  let body = JSON.stringify(payload);
   let last: string | null = null;
+  let grown = false;
   for (let i = 0; i < Math.max(1, retries); i++) {
     let url: string;
     let headers: Record<string, string>;
@@ -1681,17 +1789,31 @@ async function callLane(
       if (!res.ok) {
         const err = buf.subarray(0, 300).toString("utf8");
         last = `HTTP ${res.status}: ${err}`;
-        telemetry.callEnd(statusCall, "error", undefined, `HTTP ${res.status}`);
+        telemetry.callEnd(statusCall, "error", undefined, httpErrorNote(res.status, err));
         log(`ERR  ${tag || laneName} [${laneName}] attempt=${i + 1} ${last}`);
         if (isFilterBlocked(res.status, err)) throw new FilterBlocked(last);
-        if (quotaHit(err)) {
-          const secs = quotaResetS(err) ?? 600;
-          cooldown(lane.name, secs + 60, `quota resets in ~${secs}s`);
-          return { out: null, skip: `quota-exhausted, lane cooling ${secs + 60}s: ${err.slice(0, 120)}` };
+        // Only a stated reset ("resets in 3h", subscription caps) is a real
+        // quota wall. A bare 429 / RESOURCE_EXHAUSTED (Vertex dynamic shared
+        // quota) is a per-minute rate limit: back off and retry this lane.
+        const resetS = quotaResetS(err);
+        if (resetS !== null) {
+          cooldown(lane.name, resetS + 60, `quota resets in ~${resetS}s`);
+          return { out: null, skip: `quota-exhausted, lane cooling ${resetS + 60}s: ${err.slice(0, 120)}` };
         }
-        if (res.status === 429 || res.status >= 500) {
-          await sleepImpl(backoffMs(i));
+        if (res.status === 429 || quotaHit(err) || res.status >= 500) {
+          if (i + 1 >= Math.max(1, retries)) {
+            // Out of in-lane retries: short park so the chain can wait it out.
+            if (res.status === 429 || quotaHit(err)) cooldown(lane.name, RATE_COOLDOWN_S, "rate limited");
+            break;
+          }
+          const ra = retryAfterS(res.headers.get("retry-after"));
+          await sleepImpl(ra !== null ? Math.min(ra, 120) * 1000 : rateBackoffMs(i, res.status));
           continue;
+        }
+        // Auth/permission rejections do not heal between calls: park the lane
+        // so every later call in this run skips it instead of re-hitting it.
+        if (res.status === 401 || res.status === 403) {
+          cooldown(lane.name, AUTH_COOLDOWN_S, `HTTP ${res.status} rejected`);
         }
         return { out: null, skip: last };
       }
@@ -1704,11 +1826,32 @@ async function callLane(
             ? _readSse(raw)
             : JSON.parse(raw) as Completion;
       if (contentEmpty(out)) {
-        last = "HTTP 200 but empty content";
-        telemetry.callEnd(statusCall, "error", undefined, "Empty response");
+        const why = emptyReason(out);
+        last = `HTTP 200 but empty content${why.detail ? ` (${why.detail})` : ""}`;
+        telemetry.callEnd(statusCall, "error", undefined, emptyNote(why.finish));
         log(`ERR  ${tag || laneName} [${laneName}] attempt=${i + 1} ${last}`);
+        // Truncated before any visible text: one retry with a larger cap.
+        if (why.finish === "length" && !grown && typeof payload.max_tokens === "number") {
+          grown = true;
+          payload.max_tokens = Math.min(payload.max_tokens * 2 + 8000, lane.maxOutputTokens ?? 65000);
+          body = JSON.stringify(payload);
+          log(`GROW ${tag || laneName} [${laneName}] max_tokens -> ${payload.max_tokens}`);
+          i--; // the grown retry does not count against `retries`
+          continue;
+        }
+        // Same prompt, same cap, same safety verdict: retrying only burns minutes.
+        if (why.terminal) return { out: null, skip: last };
+        // Unexplained empties: one retry, then hand off to the next lane.
+        if (i >= 1) return { out: null, skip: last };
         await sleepImpl(backoffMs(i));
         continue;
+      }
+      const answer = out.choices?.[0]?.message?.content;
+      if (typeof answer === "string" && answer.length < 1000 && isRefusalText(answer)) {
+        last = `policy refusal: ${answer.slice(0, 120)}`;
+        telemetry.callEnd(statusCall, "error", undefined, "Refused · safety policy · next lane");
+        log(`ERR  ${tag || laneName} [${laneName}] attempt=${i + 1} ${last}`);
+        return { out: null, skip: last };
       }
       const total = out.usage?.total_tokens;
       const shown = typeof total === "number" ? String(total) : "?";
@@ -1794,22 +1937,35 @@ export async function call(messages: ChatMessage[], options: CallOptions = {}): 
 
   const temperature = optNum(options.temperature, defaultTemp);
   telemetry.bind({ role: key });
-  const failures: string[] = [];
-  for (const ln of lanes) {
-    const left = cooldownLeft(ln.name);
-    if (left > 0) {
-      const msg = `lane cooling (${Math.trunc(left)}s left)`;
-      failures.push(`${ln.name}(${ln.model}): ${msg}`);
-      log(`SKIP lane ${ln.name} -> next (${msg})`);
-      continue;
+  let waited = 0;
+  for (;;) {
+    const failures: string[] = [];
+    for (const ln of lanes) {
+      const left = cooldownLeft(ln.name);
+      if (left > 0) {
+        const msg = `lane cooling (${Math.trunc(left)}s left)`;
+        failures.push(`${ln.name}(${ln.model}): ${msg}`);
+        log(`SKIP lane ${ln.name} -> next (${msg})`);
+        continue;
+      }
+      const result = await withLaneSlot(key, ln, () =>
+        callLane(ln, messages, maxTokens, temperature, retries, tag, timeout, ln.name));
+      if (result.out !== null) return result.out;
+      failures.push(`${ln.name}(${ln.model}): ${result.skip}`);
+      log(`SKIP lane ${ln.name} -> next (${result.skip})`);
     }
-    const result = await withLaneSlot(key, ln, () =>
-      callLane(ln, messages, maxTokens, temperature, retries, tag, timeout, ln.name));
-    if (result.out !== null) return result.out;
-    failures.push(`${ln.name}(${ln.model}): ${result.skip}`);
-    log(`SKIP lane ${ln.name} -> next (${result.skip})`);
+    // Every lane failed. If one is only cooling briefly (rate limit), wait for
+    // it instead of failing the whole chapter in one second.
+    const soonest = Math.min(...lanes.map((ln) => cooldownLeft(ln.name)).filter((s) => s > 0));
+    if (!Number.isFinite(soonest) || waited + soonest > CHAIN_WAIT_MAX_S) {
+      throw new AllLanesFailed(`all lanes failed: ${failures.join(" | ")}`);
+    }
+    const nap = Math.ceil(soonest) + 1;
+    log(`WAIT ${tag || key}: all lanes busy, retrying in ${nap}s (waited ${Math.round(waited)}s of ${CHAIN_WAIT_MAX_S}s)`);
+    telemetry.notice(`${tag || key}: all lanes busy (rate limit), retrying in ${nap}s`, "warn");
+    await sleepImpl(nap * 1000);
+    waited += nap;
   }
-  throw new AllLanesFailed(`all lanes failed: ${failures.join(" | ")}`);
 }
 
 export function pagesIn(chdir: string): string[] {

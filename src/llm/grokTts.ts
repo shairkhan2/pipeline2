@@ -123,8 +123,9 @@ function grokTokenCacheKey(outDir: string, providerId: string, rawSecret: string
  */
 export async function resolveGrokAccessToken(
   env: NodeJS.ProcessEnv = process.env,
-  opts?: { fetchImpl?: typeof fetch; nowSec?: number },
+  opts?: { fetchImpl?: typeof fetch; nowSec?: number; signal?: AbortSignal },
 ): Promise<GrokTtsCredentials> {
+  opts?.signal?.throwIfAborted();
   const studio = readStudioGrokConfig(env);
   if (!studio) {
     throw new Error("No Grok TTS credentials: connect a grok-subscription or xai provider in Studio");
@@ -192,7 +193,7 @@ export async function resolveGrokAccessToken(
         ...(clientId ? { client_id: clientId } : {}),
       }),
       redirect: "error",
-      signal: AbortSignal.timeout(30_000),
+      signal: opts?.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
     });
     if (!res.ok) {
       const detail = scrubSecrets(await res.text().catch(() => "")).slice(0, 240);
@@ -366,6 +367,7 @@ export interface SynthesizeGrokTtsOptions {
   speed?: number;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
 }
 
 /**
@@ -373,6 +375,7 @@ export interface SynthesizeGrokTtsOptions {
  * Unknown voices fail loudly; there is no silent fallback.
  */
 export async function synthesizeGrokTtsToFile(opts: SynthesizeGrokTtsOptions): Promise<void> {
+  opts.signal?.throwIfAborted();
   const text = String(opts.text ?? "");
   if (!text.trim()) throw new Error("Grok TTS text is empty");
   const env = opts.env ?? process.env;
@@ -383,10 +386,10 @@ export async function synthesizeGrokTtsToFile(opts: SynthesizeGrokTtsOptions): P
   }
   const speedRaw = typeof opts.speed === "number" && Number.isFinite(opts.speed) ? opts.speed : 1;
   const speed = Math.min(4, Math.max(0.25, speedRaw));
-  const credentials = await resolveGrokAccessToken(env, { fetchImpl: opts.fetchImpl });
+  const credentials = await resolveGrokAccessToken(env, { fetchImpl: opts.fetchImpl, signal: opts.signal });
+  opts.signal?.throwIfAborted();
   const doFetch = opts.fetchImpl ?? fetch;
   const destPath = path.resolve(opts.destPath);
-  fs.mkdirSync(path.dirname(destPath), { recursive: true });
   const res = await doFetch(GROK_TTS_URL, {
     method: "POST",
     headers: {
@@ -403,7 +406,7 @@ export async function synthesizeGrokTtsToFile(opts: SynthesizeGrokTtsOptions): P
       speed,
     }),
     redirect: "error",
-    signal: AbortSignal.timeout(180_000),
+    signal: opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(180_000)]) : AbortSignal.timeout(180_000),
   });
   if (!res.ok) {
     const detail = scrubSecrets(await res.text().catch(() => "")).slice(0, 300);
@@ -426,10 +429,13 @@ export async function synthesizeGrokTtsToFile(opts: SynthesizeGrokTtsOptions): P
   } else {
     audio = Buffer.from(await res.arrayBuffer());
   }
+  opts.signal?.throwIfAborted();
   if (audio.length === 0) throw new Error("Grok TTS returned empty audio");
+  fs.mkdirSync(path.dirname(destPath), { recursive: true });
   // Atomic write: a killed process must never leave a truncated MP3 behind.
   const tmpPath = `${destPath}.tmp-${process.pid}`;
   try {
+    opts.signal?.throwIfAborted();
     fs.writeFileSync(tmpPath, audio);
     fs.renameSync(tmpPath, destPath);
   } catch (err) {

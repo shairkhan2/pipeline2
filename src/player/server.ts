@@ -39,10 +39,12 @@ import {
 import type { LaneSession, SendJson } from './lanes.js';
 import { handleIntakeRoute, initIntakeQueue as initJobsQueue, parseJsonParam, parseOutroConfig, streamUploadToStaging } from './jobs.js';
 import { MAX_ZIP_BYTES } from '../intake/ingest.js';
-import { extendSeries, generateSeriesOutro, getSeriesMergeState, inspectSeriesOutro, mergeSeriesChapters, resolveSeriesDir } from './seriesTools.js';
+import { extendSeries, generateSeriesOutro, getSeriesMergeState, inspectSeriesOutro, mergeSeriesChapters, resolveSeriesDir, setSeriesOutroAttachment } from './seriesTools.js';
+import { getSeriesSettings, patchSeriesSettings } from './seriesSettings.js';
 import { assertNoSymlinks } from './storageTrash.js';
 import { handleSetupRoute, isSetupOpen } from './setup.js';
 import { handleStudioRoute } from './studio.js';
+import { handleLanguagesMediaRoute, handleLanguagesRoute, initLanguageQueue, languagesApiMatch, stopLanguageQueue } from './languages.js';
 import { streamFile } from './stream.js';
 export { streamFile } from './stream.js';
 
@@ -257,28 +259,40 @@ export function checkCookie(req: IncomingMessage): boolean {
 
 export const LOGIN_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Screening Room — sign in</title>
-<meta name="theme-color" content="#101113">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=Fraunces:ital,opsz,wght@0,9..144,400;1,9..144,400&display=swap" rel="stylesheet">
+<title>Sign in · Screening Room</title>
+<link rel="icon" type="image/png" href="/icons/icon-192.png">
+<meta name="theme-color" content="#ffffff">
+<script>(function(){try{var m=localStorage.getItem("sr-theme-mode");var d=m==="dark"||((m===null||m==="system")&&matchMedia("(prefers-color-scheme: dark)").matches);document.documentElement.classList.toggle("dark",d);document.querySelector('meta[name="theme-color"]').content=d?"#1b1b1d":"#ffffff";}catch(e){}})();</script>
 <style>
- *{box-sizing:border-box}html{color-scheme:dark}body{background:#101113;color:#f2efe9;font:14px/1.5 'DM Sans',system-ui,sans-serif;margin:0;min-height:100svh;display:grid;place-items:center;padding:40px 24px;-webkit-font-smoothing:antialiased}
- .layout{width:min(100%,1040px)}.brand{display:flex;align-items:center;gap:12px;font-weight:600;font-size:18px;letter-spacing:-.5px}.mark{display:grid;place-items:center;width:36px;height:40px;border-radius:10px;background:#f18b6e;color:#201713}.mark svg{width:23px;height:23px}
- main{display:grid;grid-template-columns:1.2fr 1fr;gap:100px;align-items:center;margin:75px 0 85px}.eyebrow{font-size:10px;color:#f18b6e;letter-spacing:2px}.intro h1{font:400 clamp(40px,5vw,65px)/1.07 'Fraunces',Georgia,serif;letter-spacing:-2px;margin:23px 0}.intro em{font-weight:400;color:#e6b298}.intro p{color:#a2a19f;max-width:34ch;font-size:13px;line-height:1.9}.reel{display:flex;align-items:center;gap:16px;color:#a2a19f;font-size:10px;letter-spacing:1px;margin-top:45px}.reel::before{content:'';width:36px;height:1px;background:#f18b6e}
- form{border:1px solid #34312e;border-radius:14px;padding:34px;background:#191a1d}h2{font-size:24px;letter-spacing:-.6px;font-weight:500;margin:0 0 8px}.subtitle{color:#a2a19f;font-size:12px;margin:0 0 16px}.bad{color:#f2aa94;font-size:12px;min-height:20px;margin-bottom:8px}label{display:block;color:#d6d1c9;font-size:11px;margin-bottom:8px}input{font:inherit;font-size:13px;width:100%;padding:12px 13px;background:#101113;color:#f2efe9;border:1px solid #373737;border-radius:7px;min-height:46px;margin-bottom:20px}input::placeholder{color:#747370}input:focus{outline:2px solid #f18b6e;outline-offset:2px}button{font:500 13px 'DM Sans',system-ui,sans-serif;width:100%;padding:13px 15px;min-height:46px;background:#f18b6e;color:#241b17;border:1px solid #f18b6e;border-radius:7px;cursor:pointer;margin-top:4px}button:hover{background:#f5a087}button:focus-visible{outline:2px solid #f18b6e;outline-offset:4px}.session-note{text-align:center;font-size:10px;color:#a2a19f;margin:17px 0 0}.footer{border-top:1px solid #2b2c30;padding-top:22px;display:flex;justify-content:space-between;color:#a2a19f;font-size:10px;gap:20px}.footer span:first-child{letter-spacing:1.5px;font-size:9px}
- @media(max-width:700px){body{padding:28px 22px}.layout{max-width:420px}main{grid-template-columns:1fr;gap:28px;margin:40px 0}.intro h1{font-size:43px;margin:17px 0}.intro p,.reel{display:none}form{padding:26px}h2{font-size:22px}input{font-size:16px}.footer{font-size:9px;flex-wrap:wrap}.brand{font-size:16px}.eyebrow{font-size:9px}}
-</style></head><body><div class="layout">
-<div class="brand"><span class="mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 11 7-11 7Z" fill="currentColor"/></svg></span>Screening Room<span style="color:#f18b6e">.</span></div>
-<main><div class="intro"><span class="eyebrow">YOUR PRIVATE CINEMA</span><h1>A good story.<br><em>A little escape.</em></h1><p>Step inside. Your manhwa collection and your next great adventure are waiting.</p><div class="reel">ONE CHAPTER AT A TIME</div></div>
+ :root{color-scheme:light;--bg:#fff;--card:#f4f4f5;--fg:#18181b;--muted:#52525b;--input:#b4b4bc;--ring:#18181b;--btn:#18181b;--btn-fg:#fff;--bad:#c81e1e;--bad-soft:#fdeeee}
+ .dark{color-scheme:dark;--bg:#1b1b1d;--card:#252527;--fg:#f4f4f5;--muted:#a9a9b1;--input:#55555c;--ring:#f4f4f5;--btn:#f4f4f5;--btn-fg:#18181b;--bad:#f87171;--bad-soft:#3a1e1f}
+ *{box-sizing:border-box}html,body{margin:0}body{min-height:100svh;display:grid;place-items:center;padding:32px 20px;background:var(--bg);color:var(--fg);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+ main{width:min(100%,400px)}
+ .brand{display:flex;align-items:center;gap:10px;margin:0 0 28px;font-weight:600;font-size:16px}
+ .mark{display:grid;place-items:center;width:40px;height:40px;border-radius:14px;background:var(--card)}
+ h1{margin:0 0 6px;font-size:28px;line-height:1.15;letter-spacing:-.02em;font-weight:650}
+ .sub{margin:0 0 24px;color:var(--muted)}
+ form{display:grid;gap:14px;padding:22px;border-radius:24px;background:var(--card)}
+ label{display:grid;gap:6px;font-size:14px;font-weight:500}
+ input{width:100%;min-height:46px;padding:10px 14px;border:1px solid var(--input);border-radius:14px;background:var(--bg);color:var(--fg);font:inherit;font-size:16px}
+ input:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px color-mix(in srgb,var(--ring) 20%,transparent)}
+ button{min-height:48px;margin-top:4px;border:0;border-radius:999px;background:var(--btn);color:var(--btn-fg);font:inherit;font-size:15.5px;font-weight:600;cursor:pointer}
+ button:focus-visible{outline:2px solid var(--ring);outline-offset:3px}
+ .bad{margin:0;padding:10px 14px;border-radius:14px;background:var(--bad-soft);color:var(--fg);font-size:14px}
+ .bad:empty{display:none}
+ .note{margin:16px 4px 0;color:var(--muted);font-size:13.5px}
+</style></head><body><main>
+<div class="brand"><span class="mark"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><rect x="2.5" y="4" width="12" height="16" rx="3" fill="currentColor" opacity=".18"/><rect x="6" y="2.5" width="12" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m10.5 8 5 2.75-5 2.75Z" fill="currentColor"/></svg></span>Screening Room</div>
+<h1>Sign in</h1>
+<p class="sub">Your manhwa library, pipeline and studio.</p>
 <form method="post" action="/login">
- <h2>Welcome back.</h2><p class="subtitle">Take your seat. The story is about to begin.</p>
- <div class="bad" role="alert">__BAD__</div>
- <label for="user">Username</label><input id="user" name="user" placeholder="Enter your username" autocomplete="username" required>
- <label for="pass">Password</label><input id="pass" name="pass" type="password" placeholder="Enter your password" autocomplete="current-password" required>
- <button type="submit">Enter the screening room &nbsp; →</button>
- <p class="session-note">You’ll stay signed in for up to 30 days.</p>
-</form></main><footer class="footer"><span>SCREENING ROOM</span><span>A little escape. One chapter at a time.</span></footer></div></body></html>`;
+ <p class="bad" role="alert">__BAD__</p>
+ <label for="user">Username<input id="user" name="user" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus></label>
+ <label for="pass">Password<input id="pass" name="pass" type="password" autocomplete="current-password" required></label>
+ <button type="submit">Sign in</button>
+</form>
+<p class="note">You stay signed in on this device for up to 30 days.</p>
+</main></body></html>`;
 
 function readBody(req: IncomingMessage): Promise<URLSearchParams> {
   return new Promise((resolve, reject) => {
@@ -313,6 +327,9 @@ export const MIME: Record<string, string> = {
   '.jpeg': 'image/jpeg',
   '.png': 'image/png',
   '.svg': 'image/svg+xml',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
 };
 
 const durationCache = new Map<string, Promise<number | null>>();
@@ -534,6 +551,19 @@ function readJsonFile(file: string): Record<string, any> {
   }
 }
 
+/**
+ * Optional `includeOutro` override for one merge request.
+ *
+ * `undefined` (absent / unparsable) keeps the saved series preference, which falls back
+ * to the legacy "include a rendered outro" default when nothing is saved. Only the exact
+ * strings `true`/`false` are treated as an explicit, one-off override.
+ */
+function parseIncludeOutroParam(raw: string | null): boolean | undefined {
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  return undefined;
+}
+
 /* ---------- intake queue startup reconcile ---------- */
 
 /** Startup reconcile for the persistent intake queue (best-effort, never fatal). */
@@ -542,6 +572,11 @@ export async function initIntakeQueue(): Promise<void> {
     await initJobsQueue();
   } catch (err) {
     console.error('intake startup reconcile warning:', (err as Error).message);
+  }
+  try {
+    initLanguageQueue();
+  } catch (err) {
+    console.error('language startup reconcile warning:', (err as Error).message);
   }
 }
 
@@ -638,6 +673,7 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse): 
 
     // Extensionless SPA routes: `/status` serves `status.html`, and so on.
     const extensionless: Record<string, string> = {
+      '/settings': 'studio.html',
       '/status': 'status.html',
       '/meter': 'meter.html',
       '/new-series': 'new-series.html',
@@ -648,6 +684,10 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse): 
 
     if (pathname === '/api/studio' || pathname.startsWith('/api/studio/')) {
       return await handleStudioRoute(req, res, pathname, u, session, sendJson);
+    }
+
+    if (languagesApiMatch(pathname)) {
+      return await handleLanguagesRoute(req, res, pathname, session, sendJson, u);
     }
 
     if (pathname.startsWith('/api/intake/')) {
@@ -707,7 +747,41 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse): 
       return await streamFile(req, res, file, MIME[path.extname(file).toLowerCase()] || 'image/avif');
     }
 
+    const settingsMatch = /^\/api\/series\/([^/]+)\/settings$/.exec(pathname);
+    if (settingsMatch) {
+      const slug = validateSlug(settingsMatch[1]);
+      if (!slug) { req.resume(); return sendJson(res, 400, { error: 'Invalid series slug' }); }
+      const dir = resolveSeriesDir({ seriesRoot: SERIES_ROOT, slug });
+      if (req.method === 'GET') return sendJson(res, 200, getSeriesSettings(dir));
+      if (req.method !== 'PATCH') { req.resume(); return sendJson(res, 405, { error: 'method not allowed' }); }
+      if (!session.privileged) { req.resume(); return sendJson(res, 403, { error: 'Persistent account required to modify series' }); }
+      const body = await readJsonBody(req, MAX_LANE_CONFIG_BODY_BYTES);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJson(res, 400, { error: 'JSON object body required' });
+      const csrf = verifyCsrf(req, session, typeof body.csrfToken === 'string' ? body.csrfToken : '');
+      if (!csrf.ok) return sendJson(res, 403, { error: csrf.error });
+      const { csrfToken: _token, ...patch } = body;
+      return sendJson(res, 200, patchSeriesSettings(dir, patch));
+    }
     const seriesMatch = /^\/api\/series\/([^/]+)\/(outro|merge|extend)$/.exec(pathname);
+    // Outro attachment: a series-level saved preference, never a rewrite of chapter files.
+    const outroAttachmentMatch = /^\/api\/series\/([^/]+)\/outro\/attachment$/.exec(pathname);
+    if (outroAttachmentMatch) {
+      const slug = validateSlug(outroAttachmentMatch[1]);
+      if (!slug) { req.resume(); return sendJson(res, 400, { error: 'Invalid series slug' }); }
+      const opts = { seriesRoot: SERIES_ROOT, slug };
+      if (req.method === 'GET' || req.method === 'HEAD') {
+        const state = getSeriesMergeState(opts);
+        return sendJson(res, 200, { ok: true, slug, attachment: state.attachment, merge: state });
+      }
+      if (req.method !== 'POST') { req.resume(); return sendJson(res, 405, { error: 'method not allowed' }); }
+      if (!session.privileged) { req.resume(); return sendJson(res, 403, { error: 'Persistent account required to modify series' }); }
+      const body = await readJsonBody(req, MAX_LANE_CONFIG_BODY_BYTES);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJson(res, 400, { error: 'JSON object body required' });
+      const csrf = verifyCsrf(req, session, typeof body.csrfToken === 'string' ? body.csrfToken : '');
+      if (!csrf.ok) return sendJson(res, 403, { error: csrf.error });
+      if (typeof body.enabled !== 'boolean') return sendJson(res, 400, { error: 'enabled must be a boolean' });
+      return sendJson(res, 200, await setSeriesOutroAttachment({ ...opts, enabled: body.enabled }));
+    }
     if (seriesMatch) {
       const slug = validateSlug(seriesMatch[1]);
       if (!slug) { req.resume(); return sendJson(res, 400, { error: 'Invalid series slug' }); }
@@ -716,7 +790,7 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse): 
       const isRead = req.method === 'GET' || req.method === 'HEAD';
       if (isRead) {
         if (action === 'outro') return sendJson(res, 200, inspectSeriesOutro(opts));
-        if (action === 'merge') return sendJson(res, 200, getSeriesMergeState({ ...opts, includeOutro: u.searchParams.get('includeOutro') !== 'false' }));
+        if (action === 'merge') return sendJson(res, 200, getSeriesMergeState({ ...opts, includeOutro: parseIncludeOutroParam(u.searchParams.get('includeOutro')) }));
         return sendJson(res, 405, { error: 'method not allowed' });
       }
       if (req.method !== 'POST') { req.resume(); return sendJson(res, 405, { error: 'method not allowed' }); }
@@ -753,7 +827,8 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse): 
         provider: typeof body.provider === 'string' ? body.provider : undefined,
         voice: typeof body.voice === 'string' ? body.voice : undefined,
         renderVideo: body.renderVideo !== false, synthesizeAudio: body.synthesizeAudio !== false }));
-      if (action === 'merge') return sendJson(res, 200, await mergeSeriesChapters({ ...opts, includeOutro: body.includeOutro !== false }));
+      if (action === 'merge') return sendJson(res, 200, await mergeSeriesChapters({ ...opts,
+        includeOutro: typeof body.includeOutro === 'boolean' ? body.includeOutro : undefined }));
       if (body.zipPath || body.chapterFolders || body.env || body.repoRoot || body.spawnWorker !== undefined) return sendJson(res, 400, { error: 'Host paths and runtime overrides are not accepted; upload a ZIP instead' });
       return sendJson(res, 201, await extendSeries({ ...opts,
         chapters: typeof body.chapters === 'string' ? body.chapters : 'all',
@@ -866,6 +941,7 @@ print(json.dumps(R.quota_overview(fresh=${fresh ? 'True' : 'False'})))`;
     }
 
     if (pathname.startsWith('/media/')) {
+      if (await handleLanguagesMediaRoute(req, res, pathname, u, sendJson)) return undefined;
       // /media/<slug>/<ch>/video.mp4 -> series/<slug>/out/<ch>/video.mp4
       // /media/<slug>/full.mp4 -> series/<slug>/out/full/video/video.mp4
       const parts = pathname.slice('/media/'.length).split('/');
@@ -944,6 +1020,7 @@ export function createPlayerServer(): http.Server {
 }
 
 export const server = createPlayerServer();
+server.once('close', stopLanguageQueue);
 
 function ranDirectly(): boolean {
   const entry = process.argv[1];

@@ -4,8 +4,7 @@
  * `MANHWA_RENDER_REMOTE=<ssh host>` (env.sh sets `lappy`) enables it; empty -> VM only.
  * Laptop layout (~/render-worker, NOT the laptop's own ~/manhwa checkout):
  *   studio/     remotion-studio copy (+ its own node_modules)       -> render
- *   mit/        /opt/manga-image-translator copy (code + models)    -> bubble cleaner
- *   mit-venv/   /opt/mit-venv312 copy (same python 3.14 on both)
+ *   (bubble cleaning always runs on the VM via PanelCleaner, never here)
  *   jobs/       per-job scratch, removed after each job
  *
  * `healthy()` is the dispatch gate: nothing is sent unless the laptop answers ssh,

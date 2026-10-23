@@ -1,15 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
-import {
-  Activity,
-  Clapperboard,
-  Gauge,
-  Image,
-  Plus,
-  SlidersHorizontal,
-} from "lucide-react";
+import { Activity, Images, LibraryBig, Plus, Settings } from "lucide-react";
 
+import { Tooltip, TooltipProvider } from "@/components/ui/tooltip";
 import { api, type PipelineStatus, type Session } from "@/lib/api";
+import { useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
+import { SettingsSheet } from "./SettingsSheet";
 
 export type AppRoute = "library" | "artwork" | "new-series" | "studio" | "status" | "meter";
 
@@ -25,24 +21,22 @@ interface NavItem {
   id: AppRoute;
   href: string;
   label: string;
-  icon: typeof Clapperboard;
-  group: "collection" | "workspace";
+  icon: typeof LibraryBig;
 }
 
 const NAV: NavItem[] = [
-  { id: "library", href: "/", label: "Library", icon: Clapperboard, group: "collection" },
-  { id: "artwork", href: "/#/artwork", label: "Artwork", icon: Image, group: "collection" },
-  { id: "new-series", href: "/new-series.html", label: "New series", icon: Plus, group: "workspace" },
-  { id: "studio", href: "/studio.html", label: "Studio", icon: SlidersHorizontal, group: "workspace" },
-  { id: "status", href: "/status.html", label: "Pipeline", icon: Activity, group: "workspace" },
-  { id: "meter", href: "/meter.html", label: "Meter room", icon: Gauge, group: "workspace" },
+  { id: "library", href: "/", label: "Library", icon: LibraryBig },
+  { id: "artwork", href: "/#/artwork", label: "Artwork", icon: Images },
+  { id: "new-series", href: "/new-series.html", label: "New series", icon: Plus },
+  { id: "status", href: "/status.html", label: "Pipeline", icon: Activity },
 ];
+const SETTINGS: NavItem = { id: "studio", href: "/studio.html", label: "Settings", icon: Settings };
 
 export function detectAppRoute(loc: { pathname: string; hash: string } = window.location): AppRoute | null {
   const path = loc.pathname.replace(/\/+$/, "") || "/";
   const hash = loc.hash || "";
   if (path === "/setup" || path.endsWith("/setup.html")) return null;
-  if (path === "/studio" || path.endsWith("/studio.html")) return "studio";
+  if (path === "/settings" || path === "/studio" || path.endsWith("/studio.html")) return "studio";
   if (path === "/status" || path.endsWith("/status.html")) return "status";
   if (path === "/meter" || path.endsWith("/meter.html")) return "meter";
   if (path === "/new-series" || path.endsWith("/new-series.html")) return "new-series";
@@ -73,7 +67,9 @@ function isSetupLocation(): boolean {
   return path === "/setup" || path.endsWith("/setup.html") || window.location.hash.startsWith("#/setup");
 }
 
-function statusTone(status: PipelineStatus | null): "running" | "quiet" | "idle" {
+type Tone = "running" | "quiet" | "idle";
+
+function statusTone(status: PipelineStatus | null): Tone {
   if (!status) return "idle";
   if (status.running && status.progress) return "running";
   if (status.running) return "quiet";
@@ -83,9 +79,10 @@ function statusTone(status: PipelineStatus | null): "running" | "quiet" | "idle"
 export function AppShell({ active, title, eyebrow, actions, children }: AppShellProps) {
   const [route, setRoute] = useState<AppRoute | null>(active ?? null);
   const [session, setSession] = useState<Session | null>(null);
-  const [seriesCount, setSeriesCount] = useState<number | null>(null);
   const [status, setStatus] = useState<PipelineStatus | null>(null);
   const [studioAlert, setStudioAlert] = useState(false);
+  // Apply persisted appearance and keep system/theme changes in sync across every page.
+  useTheme();
 
   useEffect(() => {
     if (active) setRoute(active);
@@ -125,14 +122,6 @@ export function AppShell({ active, title, eyebrow, actions, children }: AppShell
 
   useEffect(() => {
     let stop = false;
-    const loadLibrary = () => {
-      api
-        .library()
-        .then((library) => {
-          if (!stop) setSeriesCount(library.series?.length ?? 0);
-        })
-        .catch(() => {});
-    };
     const loadStatus = () => {
       if (typeof document !== "undefined" && document.hidden) return;
       api
@@ -143,53 +132,57 @@ export function AppShell({ active, title, eyebrow, actions, children }: AppShell
         .catch(() => {});
     };
     const loadAlert = () => {
-      api
-        .studio.catalog()
+      api.studio
+        .catalog()
         .then((catalog) => {
           if (stop) return;
-          const failed = catalog.providers?.some((provider) => provider.lastTest && provider.lastTest.ok === false);
-          setStudioAlert(Boolean(failed));
+          setStudioAlert(Boolean(catalog.providers?.some((provider) => provider.lastTest && provider.lastTest.ok === false)));
         })
         .catch(() => {});
     };
-    loadLibrary();
     loadStatus();
     loadAlert();
     const cur = active ?? route;
     const statusTimer = cur === "status" ? null : window.setInterval(loadStatus, 5000);
-    const libraryTimer = cur === "library" || cur === "artwork" ? null : window.setInterval(loadLibrary, 20000);
     return () => {
       stop = true;
       if (statusTimer !== null) window.clearInterval(statusTimer);
-      if (libraryTimer !== null) window.clearInterval(libraryTimer);
     };
   }, [active, route]);
 
   const tone = statusTone(status);
-  const privileged = session?.privileged !== false;
-  const role = session ? (session.privileged ? "Admin" : "Read-only") : "…";
   const currentRoute = route ?? active ?? null;
   const section = NAV.find((item) => item.id === currentRoute)?.label ?? title ?? "Library";
+  const heading = title ?? section;
+  const privileged = session?.privileged !== false;
 
   function handleNavClick(item: NavItem) {
+    if (item.id === "studio") {
+      window.dispatchEvent(new Event("open-settings"));
+      return;
+    }
     setRoute(item.id);
     navigateClient(item.href);
   }
 
   return (
-    <div className="screening-shell min-h-dvh bg-[#101113] text-[#f2efe9]" style={{ fontFamily: '"DM Sans", system-ui, sans-serif' }}>
-      <style>{SHELL_CSS}</style>
-      <a
-        href="#main-content"
-        className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-[#f18b6e] focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:text-[#201713] focus:outline-none"
-      >
-        Skip to content
-      </a>
-      <div className="shell-frame">
-        <aside className="shell-side" aria-label="Workspace">
+    <TooltipProvider>
+      <div className="app-shell min-h-dvh bg-background text-foreground">
+        <a
+          href="#main-content"
+          className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-[70] focus:rounded-full focus:bg-foreground focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:text-background"
+        >
+          Skip to content
+        </a>
+
+        <aside
+          className="fixed inset-y-0 left-0 z-40 hidden w-[72px] flex-col items-center border-r border-border bg-rail py-3 md:flex"
+          aria-label="Workspace"
+        >
           <a
-            className="shell-brand"
             href="/"
+            aria-label="Screening Room, library"
+            className="mb-2 grid size-11 place-items-center rounded-2xl text-foreground transition-colors hover:bg-card"
             onClick={(event) => {
               if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
               event.preventDefault();
@@ -197,305 +190,180 @@ export function AppShell({ active, title, eyebrow, actions, children }: AppShell
               navigateClient("/");
             }}
           >
-            <span className="shell-mark" aria-hidden>
-              <svg viewBox="0 0 24 24" className="size-3.5 fill-current">
-                <path d="M8 5.5v13l11-6.5-11-6.5z" />
-              </svg>
-            </span>
-            <span className="shell-brand-name">
-              Screening
-              <br />
-              Room<span className="text-[#f18b6e]">.</span>
-            </span>
+            <BrandMark />
           </a>
-
-          <nav className="shell-nav" aria-label="Main">
-            <p className="shell-caption">Your collection</p>
-            {NAV.filter((item) => item.group === "collection").map((item) => (
-              <ShellLink
+          <nav aria-label="Main" className="flex flex-1 flex-col items-center justify-center gap-1.5">
+            {NAV.map((item) => (
+              <RailLink
                 key={item.id}
                 item={item}
                 current={item.id === currentRoute}
-                count={item.id === "library" ? seriesCount : null}
-                onNavigate={handleNavClick}
-              />
-            ))}
-            <p className="shell-caption">Workspace</p>
-            {NAV.filter((item) => item.group === "workspace").map((item) => (
-              <ShellLink
-                key={item.id}
-                item={item}
-                current={item.id === currentRoute}
-                statusTone={item.id === "status" ? tone : undefined}
+                tone={item.id === "status" ? tone : undefined}
                 statusLabel={item.id === "status" ? status?.state : undefined}
                 alert={item.id === "studio" ? studioAlert : false}
-                readOnly={item.id === "studio" && session ? !privileged : false}
                 onNavigate={handleNavClick}
               />
             ))}
           </nav>
-
-          <div className="mt-auto px-3 pb-4">
-            <div className="shell-user" title={session ? `${session.user} · ${role}` : "Session"}>
-              <span className="shell-user-dot" data-role={session?.privileged ? "admin" : "viewer"} />
-              <span className="min-w-0">
-                <span className="block truncate font-mono text-[11px] tracking-wide text-[#f2efe9]">
-                  {session?.user ?? "—"}
-                </span>
-                <span className="block text-[10px] tracking-[0.14em] text-[#a2a19f] uppercase">{role}</span>
-              </span>
-            </div>
-            <p className="mt-4 px-1 font-serif text-[13px] leading-snug text-[#a2a19f]">
-              Made for the stories
-              <br />
-              you get lost in.
-            </p>
-          </div>
+          <Tooltip label="Settings"><button type="button" aria-label="Settings" className="grid size-11 place-items-center rounded-full hover:bg-muted" onClick={() => handleNavClick(SETTINGS)}><Settings size={21} strokeWidth={1.75} aria-hidden /></button></Tooltip>
         </aside>
 
-        <div className="shell-main">
-          <header className="shell-top">
-            <div className="min-w-0">
-              <p className="text-[10px] tracking-[0.18em] text-[#a2a19f] uppercase">{eyebrow ?? "Screening Room"}</p>
-              <p className="truncate font-serif text-lg text-[#f2efe9]">
-                {title ?? section}
-              </p>
+        <div className="min-w-0 md:pl-[72px]">
+          <header className="sticky top-0 z-30 flex min-h-16 items-center gap-3 bg-background/85 px-4 py-3 backdrop-blur-md supports-[backdrop-filter]:bg-background/70 md:px-8">
+            <div className="flex min-w-0 items-center gap-2">
+              <a
+                href="/"
+                aria-label="Screening Room, library"
+                className="grid size-10 shrink-0 place-items-center rounded-full bg-card md:hidden"
+              >
+                <BrandMark small />
+              </a>
+              <div className="flex min-w-0 items-center gap-2 rounded-full bg-card py-2 pr-4 pl-3 shadow-float max-md:shadow-none">
+                {eyebrow && eyebrow !== "Workspace" ? (
+                  <>
+                    <span className="truncate text-[14px] text-muted-foreground max-sm:hidden">{eyebrow}</span>
+                    <span className="text-muted-foreground/60 max-sm:hidden" aria-hidden>/</span>
+                  </>
+                ) : null}
+                <span className="truncate text-[15px] font-medium">{heading}</span>
+              </div>
             </div>
-            <div className="flex items-center gap-2">{actions}</div>
+            <div className="ml-auto flex min-w-0 items-center gap-2">
+              {actions ? <div className="flex min-w-0 items-center gap-2">{actions}</div> : null}
+              {!privileged ? (
+                <span className="rounded-full bg-card px-3 py-2 text-[13px] text-muted-foreground max-sm:hidden" title="Temporary viewing account">
+                  View only
+                </span>
+              ) : null}
+            </div>
           </header>
-          <main id="main-content" tabIndex={-1} className="shell-content">
+          <main id="main-content" tabIndex={-1} className="shell-content mx-auto w-full max-w-[1320px] px-4 pt-2 pb-28 outline-none md:px-8 md:pb-14">
             {children}
           </main>
         </div>
-      </div>
 
-      <nav className="shell-bottom" aria-label="Mobile">
-        {NAV.map((item) => (
-          <ShellLink
-            key={item.id}
-            item={item}
-            current={item.id === currentRoute}
-            compact
-            count={item.id === "library" ? seriesCount : null}
-            statusTone={item.id === "status" ? tone : undefined}
-            alert={item.id === "studio" ? studioAlert : false}
-            onNavigate={handleNavClick}
-          />
-        ))}
-      </nav>
-    </div>
+        <nav
+          aria-label="Mobile"
+          className="fixed inset-x-3 bottom-3 z-40 grid grid-cols-5 rounded-[22px] bg-card/95 p-1.5 shadow-float backdrop-blur-md md:hidden"
+          style={{ marginBottom: "env(safe-area-inset-bottom)" }}
+        >
+          {[...NAV, SETTINGS].map((item) => (
+            <MobileLink
+              key={item.id}
+              item={item}
+              current={item.id === currentRoute || (item.id === "studio" && currentRoute === "meter")}
+              tone={item.id === "status" ? tone : undefined}
+              alert={item.id === "studio" ? studioAlert : false}
+              onNavigate={handleNavClick}
+            />
+          ))}
+        </nav>
+        <SettingsSheet />
+      </div>
+    </TooltipProvider>
   );
 }
 
-function ShellLink({
+function BrandMark({ small = false }: { small?: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" className={small ? "size-[18px]" : "size-[22px]"} aria-hidden>
+      <rect x="2.5" y="4" width="12" height="16" rx="3" fill="currentColor" opacity="0.18" />
+      <rect x="6" y="2.5" width="12" height="16" rx="3" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <path d="m10.5 8 5 2.75-5 2.75Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function StatusDot({ tone, className }: { tone: Tone; className?: string }) {
+  if (tone === "idle") return null;
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "absolute size-2 rounded-full ring-2 ring-rail",
+        tone === "running" ? "bg-success" : "bg-warning",
+        className,
+      )}
+    />
+  );
+}
+
+function linkClick(item: NavItem, onNavigate?: (item: NavItem) => void) {
+  return (event: React.MouseEvent<HTMLAnchorElement>) => {
+    if (!onNavigate || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+    event.preventDefault();
+    onNavigate(item);
+  };
+}
+
+function RailLink({
   item,
   current,
-  compact = false,
-  count = null,
-  statusTone: tone,
+  tone,
   statusLabel,
-  alert = false,
-  readOnly = false,
+  alert,
   onNavigate,
 }: {
   item: NavItem;
   current: boolean;
-  compact?: boolean;
-  count?: number | null;
-  statusTone?: "running" | "quiet" | "idle";
+  tone?: Tone;
   statusLabel?: string;
-  alert?: boolean;
-  readOnly?: boolean;
+  alert: boolean;
   onNavigate?: (item: NavItem) => void;
 }) {
   const Icon = item.icon;
+  const label = tone && tone !== "idle" ? `${item.label}: ${tone === "running" ? "run in progress" : (statusLabel || "busy").toLowerCase()}` : alert ? `${item.label}: a provider failed its last test` : item.label;
   return (
-    <a
-      href={item.href}
-      className={cn("shell-link", current && "is-on", compact && "is-compact")}
-      aria-current={current ? "page" : undefined}
-      title={tone ? `Pipeline: ${(statusLabel || tone).toLowerCase()}` : item.label}
-      onClick={(event) => {
-        if (!onNavigate || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
-        event.preventDefault();
-        onNavigate(item);
-      }}
-    >
-      <span className="relative grid size-5 place-items-center">
-        <Icon className="size-4" strokeWidth={1.75} aria-hidden />
-        {tone ? <span className="shell-dot" data-state={tone} /> : null}
-        {alert ? <span className="shell-alert" /> : null}
-      </span>
-      <span className="shell-link-label">{item.label}</span>
-      {typeof count === "number" ? (
-        <span className="shell-count" aria-label={`${count} series`}>
-          {count}
-        </span>
-      ) : null}
-      {readOnly ? <span className="shell-readonly">Read-only</span> : null}
-    </a>
+    <Tooltip label={label}>
+      <a
+        href={item.href}
+        aria-label={label}
+        aria-current={current ? "page" : undefined}
+        onClick={linkClick(item, onNavigate)}
+        className={cn(
+          "relative grid size-11 place-items-center rounded-full text-foreground transition-colors",
+          current ? "bg-muted" : "hover:bg-card",
+        )}
+      >
+        <Icon className="size-[21px]" strokeWidth={current ? 2 : 1.7} aria-hidden />
+        {tone ? <StatusDot tone={tone} className="top-2 right-2" /> : null}
+        {alert ? <span aria-hidden className="absolute top-2 right-2 size-2 rounded-full bg-destructive ring-2 ring-rail" /> : null}
+      </a>
+    </Tooltip>
   );
 }
 
-const SHELL_CSS = `
-.screening-shell { color-scheme: dark; }
-.shell-frame {
-  display: grid;
-  grid-template-columns: 218px minmax(0, 1fr);
-  min-height: 100dvh;
+function MobileLink({
+  item,
+  current,
+  tone,
+  alert,
+  onNavigate,
+}: {
+  item: NavItem;
+  current: boolean;
+  tone?: Tone;
+  alert: boolean;
+  onNavigate?: (item: NavItem) => void;
+}) {
+  const Icon = item.icon;
+  if (item.id === "studio") return <button type="button" onClick={() => onNavigate?.(item)} className="flex min-h-12 flex-col items-center justify-center gap-0.5 rounded-2xl text-[12px] font-medium text-muted-foreground"><Icon className="size-5" strokeWidth={1.75} aria-hidden /><span>Settings</span></button>;
+  return (
+    <a
+      href={item.href}
+      aria-current={current ? "page" : undefined}
+      onClick={linkClick(item, onNavigate)}
+      className={cn(
+        "relative flex min-h-12 flex-col items-center justify-center gap-0.5 rounded-2xl text-[12px] font-medium transition-colors",
+        current ? "bg-background text-foreground shadow-float" : "text-muted-foreground",
+      )}
+    >
+      <span className="relative">
+        <Icon className="size-5" strokeWidth={current ? 2 : 1.7} aria-hidden />
+        {tone ? <StatusDot tone={tone} className="-top-0.5 -right-1 ring-card" /> : null}
+        {alert ? <span aria-hidden className="absolute -top-0.5 -right-1 size-2 rounded-full bg-destructive ring-2 ring-card" /> : null}
+      </span>
+      <span className="max-w-full truncate px-0.5">{item.label}</span>
+    </a>
+  );
 }
-.shell-side {
-  position: sticky;
-  top: 0;
-  display: flex;
-  height: 100dvh;
-  flex-direction: column;
-  border-right: 1px solid #2b2c30;
-  background: #17181a;
-}
-.shell-brand {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 22px 18px 16px;
-  color: #f2efe9;
-  text-decoration: none;
-}
-.shell-mark {
-  display: grid;
-  width: 34px;
-  height: 34px;
-  place-items: center;
-  border-radius: 10px;
-  background: #f18b6e;
-  color: #201713;
-}
-.shell-brand-name {
-  font-family: Fraunces, Georgia, serif;
-  font-size: 17px;
-  line-height: 1.05;
-  letter-spacing: -0.02em;
-}
-.shell-caption {
-  margin: 14px 18px 6px;
-  font-size: 10px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: #a2a19f;
-}
-.shell-nav { display: flex; flex-direction: column; padding: 0 10px; }
-.shell-link {
-  display: flex;
-  min-height: 40px;
-  align-items: center;
-  gap: 10px;
-  border-radius: 10px;
-  padding: 8px 10px;
-  color: #a2a19f;
-  text-decoration: none;
-  font-size: 14px;
-}
-.shell-link:hover { color: #f2efe9; background: #1e2024; }
-.shell-link.is-on {
-  color: #f2efe9;
-  background: rgba(241, 139, 110, 0.14);
-  box-shadow: inset 2px 0 0 #f18b6e;
-}
-.shell-link-label { min-width: 0; }
-.shell-count, .shell-readonly {
-  margin-left: auto;
-  border-radius: 999px;
-  background: #1e2024;
-  padding: 1px 7px;
-  font-family: "JetBrains Mono", ui-monospace, monospace;
-  font-size: 10px;
-  color: #f2efe9;
-}
-.shell-readonly { letter-spacing: 0.04em; text-transform: uppercase; color: #d6b57b; }
-.shell-dot, .shell-alert {
-  position: absolute;
-  right: -3px;
-  bottom: -2px;
-  width: 7px;
-  height: 7px;
-  border-radius: 99px;
-  border: 1px solid #17181a;
-}
-.shell-dot[data-state="running"] { background: #5eead4; box-shadow: 0 0 0 3px rgba(94, 234, 212, 0.16); }
-.shell-dot[data-state="quiet"] { background: #d6b57b; }
-.shell-dot[data-state="idle"] { background: #3c3e44; }
-.shell-alert { background: #f18b6e; }
-.shell-user {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  border: 1px solid #2b2c30;
-  border-radius: 12px;
-  background: #101113;
-  padding: 8px 10px;
-}
-.shell-user-dot {
-  width: 8px;
-  height: 8px;
-  flex: none;
-  border-radius: 99px;
-  background: #3c3e44;
-}
-.shell-user-dot[data-role="admin"] { background: #aed1a8; }
-.shell-user-dot[data-role="viewer"] { background: #d6b57b; }
-.shell-main { min-width: 0; }
-.shell-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  border-bottom: 1px solid #2b2c30;
-  padding: 16px 28px;
-}
-.shell-content { padding: 24px 28px 40px; }
-.shell-bottom { display: none; }
-.font-serif { font-family: Fraunces, Georgia, serif; }
-@media (pointer: coarse) {
-  .shell-link { min-height: 44px; }
-}
-@media (max-width: 960px) {
-  .shell-frame { grid-template-columns: 1fr; }
-  .shell-side { display: none; }
-  .shell-top, .shell-content { padding-left: 16px; padding-right: 16px; }
-  .shell-content { padding-bottom: 88px; }
-  .shell-bottom {
-    position: fixed;
-    right: 0;
-    bottom: 0;
-    left: 0;
-    z-index: 40;
-    display: grid;
-    grid-template-columns: repeat(6, minmax(44px, 1fr));
-    border-top: 1px solid #2b2c30;
-    background: #17181a;
-    padding-bottom: env(safe-area-inset-bottom);
-  }
-  .shell-link.is-compact {
-    min-height: 44px;
-    flex-direction: column;
-    justify-content: center;
-    gap: 2px;
-    border-radius: 0;
-    padding: 6px 2px 7px;
-    font-size: 10px;
-    box-shadow: none;
-  }
-  .shell-link.is-compact .shell-link-label {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 100%;
-  }
-  .shell-link.is-compact.is-on { box-shadow: inset 0 2px 0 #f18b6e; }
-  .shell-link.is-compact .shell-count,
-  .shell-link.is-compact .shell-readonly { display: none; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .shell-dot[data-state="running"] { box-shadow: none; }
-}
-`;

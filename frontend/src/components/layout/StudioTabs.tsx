@@ -1,103 +1,61 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { AnimatedTab } from "@/components/ui/animated-tabs";
+import { Palette, UserRound, Plug, GitBranch, Server, AudioLines, FileText, Sparkles, Gauge, HardDrive, Keyboard, ChevronLeft, ChevronRight, LogIn } from "lucide-react";
+import { Tooltip } from "@/components/ui/tooltip";
 
-const descriptions: Record<string, string> = {
-  providers: "Connect your AI services and manage the models available to your pipeline.",
-  routing: "Choose the model for each stage. Order fallbacks in the sequence they should run.",
-  nodes: "Set output quality and manage the machines that render your chapters.",
-  voice: "Listen to a narration sample before choosing a voice for your next series.",
-  prompts: "Shape how each stage reads, matches, and narrates your chapters.",
+const ICONS: Record<string, typeof Palette> = {
+  appearance: Palette, account: UserRound, providers: Plug, routing: GitBranch, nodes: Server,
+  voice: AudioLines, prompts: FileText, outro: Sparkles, usage: Gauge, storage: HardDrive, shortcuts: Keyboard,
 };
 
 /** Keep visited panels mounted so switching sections does not discard a draft. */
 export function StudioTabs({ tabs }: { tabs: AnimatedTab[] }) {
-  const tabsRef = useRef(tabs);
-  tabsRef.current = tabs;
-  const readTab = () => {
-    const value = new URLSearchParams(window.location.search).get("tab");
-    return tabsRef.current.find((tab) => tab.id === value)?.id ?? tabsRef.current[0]?.id ?? "";
-  };
-  const [active, setActive] = useState(readTab);
+  const read = () => new URLSearchParams(window.location.search).get("settings") || "appearance";
+  const [active, setActive] = useState(read);
   const [visited, setVisited] = useState(() => new Set([active]));
-  const buttons = useRef<(HTMLButtonElement | null)[]>([]);
-  const workspace = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    workspace.current?.querySelectorAll<HTMLMediaElement>("[role=tabpanel][hidden] audio, [role=tabpanel][hidden] video")
-      .forEach((media) => media.pause());
-  }, [active]);
-
+  const [detail, setDetail] = useState(!window.history.state?.settingsList);
+  const workspace = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const sync = () => {
-      const next = readTab();
+      const next = read();
       setActive(next);
-      setVisited((current) => new Set([...current, next]));
+      setVisited(current => new Set([...current, next]));
+      setDetail(!window.history.state?.settingsList);
     };
     window.addEventListener("popstate", sync);
     return () => window.removeEventListener("popstate", sync);
   }, []);
-
+  useEffect(() => {
+    workspace.current?.querySelectorAll<HTMLMediaElement>("[role=tabpanel][hidden] audio, [role=tabpanel][hidden] video").forEach(media => media.pause());
+  }, [active]);
   function select(id: string) {
-    if (id === active) return;
     setActive(id);
-    setVisited((current) => new Set([...current, id]));
+    setVisited(current => new Set([...current, id]));
+    setDetail(true);
     const url = new URL(window.location.href);
-    url.searchParams.set("tab", id);
-    window.history.pushState(null, "", url);
+    url.searchParams.set("settings", id);
+    window.history.replaceState({ ...window.history.state, settingsList: false }, "", url);
   }
-
-  function onKey(event: KeyboardEvent, index: number) {
-    const positions: Record<string, number> = {
-      ArrowRight: (index + 1) % tabs.length,
-      ArrowLeft: (index + tabs.length - 1) % tabs.length,
-      Home: 0,
-      End: tabs.length - 1,
-    };
-    if (!(event.key in positions)) return;
-    event.preventDefault();
-    const next = positions[event.key];
-    select(tabs[next].id);
-    buttons.current[next]?.focus();
-  }
-
-  return (
-    <div className="studio-workspace" ref={workspace}>
-      <div className="studio-tabs" role="tablist" aria-label="Studio sections">
-        {tabs.map((tab, index) => (
-          <button
-            key={tab.id}
-            ref={(node) => { buttons.current[index] = node; }}
-            id={`studio-tab-${tab.id}`}
-            type="button"
-            role="tab"
-            aria-selected={active === tab.id}
-            aria-controls={`studio-panel-${tab.id}`}
-            tabIndex={active === tab.id ? 0 : -1}
-            onClick={() => select(tab.id)}
-            onKeyDown={(event) => onKey(event, index)}
-          >
-            {tab.icon}<span>{tab.label}</span>
-          </button>
-        ))}
-      </div>
-      {tabs.map((tab) => (
-        <section
-          key={tab.id}
-          id={`studio-panel-${tab.id}`}
-          role="tabpanel"
-          aria-labelledby={`studio-tab-${tab.id}`}
-          hidden={active !== tab.id}
-          tabIndex={0}
-        >
-          {visited.has(tab.id) && <>
-            <header className="studio-section-heading">
-              <h2>{tab.label}</h2>
-              <p>{descriptions[tab.id]}</p>
-            </header>
-            {tab.content}
-          </>}
-        </section>
-      ))}
+  return <div className="settings-workspace" data-detail={detail} ref={workspace}>
+    <aside className="settings-sidebar">
+      <h2 className="mb-4 px-3 text-[22px] font-semibold">Settings</h2>
+      <nav className="settings-sections" aria-label="Settings sections">
+        {tabs.map(tab => { const Icon = ICONS[tab.id] ?? Palette; return <button
+          key={tab.id} id={`studio-tab-${tab.id}`} type="button"
+          aria-current={active === tab.id ? "true" : undefined}
+          aria-controls={`studio-panel-${tab.id}`} onClick={() => select(tab.id)}>
+          <Icon className="size-[18px] shrink-0" strokeWidth={1.75} aria-hidden />
+          <span className="flex-1">{tab.label}</span><ChevronRight className="size-4 sm:hidden" aria-hidden />
+        </button>; })}
+      </nav>
+      <a href="/login" className="settings-switch"><LogIn size={18} strokeWidth={1.75} aria-hidden />Switch account</a>
+    </aside>
+    <div className="settings-content">
+      <Tooltip label="Back to settings"><button type="button" aria-label="Back to settings" className="settings-back" onClick={() => setDetail(false)}><ChevronLeft size={20} strokeWidth={1.75} aria-hidden />Settings</button></Tooltip>
+      {tabs.map(tab => <section key={tab.id} id={`studio-panel-${tab.id}`} role="tabpanel" aria-labelledby={`studio-tab-${tab.id}`} hidden={active !== tab.id}>
+        <header className="mb-5 pr-8"><h2 className="text-[22px] font-semibold">{tab.label}</h2></header>
+        {visited.has(tab.id) ? tab.content : null}
+      </section>)}
     </div>
-  );
+  </div>;
 }

@@ -290,7 +290,7 @@ export function pagesHash(chdir: string): string {
 
 /** Default locations of the two files whose bytes feed `promoCacheHash`. */
 export interface CleanerPaths {
-  /** cleaner.py `CONFIG` (cleaner_config.json). */
+  /** cleaner.ts `PCLEANER_PROFILE` (panelcleaner_profile.ini). */
   configPath: string;
   /** cleaner.py `PROMO_ADAPTER` (tools/promo_ocr_export.py). */
   adapterPath: string;

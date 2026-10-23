@@ -7,10 +7,12 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from "react";
-import { Cloud, Link2, Monitor, RefreshCw, Server, Upload, X } from "lucide-react";
+import { Activity, Cloud, Info, Link2, Monitor, RefreshCw, Rocket, Server, Upload, Volume2, X } from "lucide-react";
 
 import { AppShell } from "@/components/layout/AppShell";
+import { StyleFields, type EditableTtsStyle } from '@/components/library/StyleFields';
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Dropzone } from "@/components/ui/dropzone";
 import {
   Stepper,
@@ -20,7 +22,7 @@ import {
   StepperTitle,
   StepperTrigger,
 } from "@/components/ui/stepper";
-import { Terminal, TerminalBody, TerminalHeader, TerminalLine } from "@/components/ui/terminal";
+import { ErrorNotice, Notice, RawDetails } from "@/components/ui/notice";
 import {
   api,
   getCsrfToken,
@@ -29,17 +31,31 @@ import {
   type JobsList,
   type OutroConfigInput,
   type OutroHookType,
+  type ProviderView,
   type RenderNode,
   type RenderQuality,
+  type StudioSettingsState,
 } from "@/lib/api";
+import { describeError, describeJobFailure, errorLine, parseFailureNote, type ErrorInfo } from "@/lib/errors";
+import { retryCountdown, useRetryClock, type AutoRetry } from "@/lib/retry";
 import { parseDriveId } from "@/lib/driveUrl";
 import {
+  buildIntakeLanes,
   DEFAULT_LANE_ID,
-  inferLaneKind,
   LANE_ID_RE,
   RENDER_KIND_META,
+  type IntakeLaneOption,
   type RenderLaneKind,
 } from "@/lib/renderLanes";
+import {
+  buildTtsProviders,
+  conciseVoiceName,
+  isPaidTtsProvider,
+  readPreferredVoice,
+  writePreferredVoice,
+  type TtsProviderGroup,
+  type TtsVoiceItem,
+} from "@/lib/tts";
 import { cn } from "@/lib/utils";
 
 /**
@@ -74,29 +90,7 @@ type FieldName = "title" | "slug" | "gdrive" | "file" | "voice" | "chapters" | "
 type FieldErrors = Partial<Record<FieldName, string>>;
 type JobAction = "retry" | "continue" | "cancel" | "stop" | "pause" | "resume";
 
-interface VoiceOption {
-  id: string;
-  label: string;
-  default: boolean;
-}
-
-interface CatalogProvider {
-  id: string;
-  label: string;
-  available: boolean;
-  unavailableReason: string;
-  costNotice: string;
-  engine: string;
-  voices: VoiceOption[];
-}
-
-interface LaneOption {
-  id: string;
-  label: string;
-  available: boolean;
-  unavailableReason: string | null;
-  kind: LaneKind;
-}
+type LaneOption = IntakeLaneOption;
 
 interface JobProgress {
   phase?: string;
@@ -112,6 +106,9 @@ interface JobProgress {
 }
 
 interface IntakeJob {
+  notBefore?: number | null;
+  autoRetry?: AutoRetry;
+  failureDetail?: string | null;
   id: string;
   status?: string;
   paused?: boolean;
@@ -147,9 +144,8 @@ interface UploadState {
 const IDLE_UPLOAD: UploadState = { active: false, phase: "", loaded: 0, total: null, pct: null };
 
 function errText(error: unknown): string {
-  if (isApiError(error)) return error.message;
-  if (error instanceof Error) return error.message;
-  return "Request failed";
+  const info = describeError(error);
+  return errorLine(error) + (info.requestId ? ` Request ID: ${info.requestId}` : "");
 }
 
 function slugify(text: string): string {
@@ -180,7 +176,7 @@ function fmtAge(ts: number | undefined): string {
 }
 
 function cleanVoiceName(label: string): string {
-  return String(label || "").replace(/\s*\([^)]*\)/g, "").trim() || String(label || "");
+  return conciseVoiceName(label, label);
 }
 
 function statusOf(job: IntakeJob | null | undefined): string {
@@ -193,10 +189,6 @@ function normalizeLaneId(raw: unknown): string {
   return LANE_ID_RE.test(value) ? value : DEFAULT_LANE;
 }
 
-function kindOf(id: string, nodeKind?: string): LaneKind {
-  return inferLaneKind(id, nodeKind);
-}
-
 function maxZipBytes(catalog: IntakeCatalog | null): number {
   const limits = catalog?.limits;
   if (limits && typeof limits === "object" && "maxZipBytes" in limits) {
@@ -206,90 +198,31 @@ function maxZipBytes(catalog: IntakeCatalog | null): number {
   return MAX_ZIP_FALLBACK;
 }
 
-function asProviders(catalog: IntakeCatalog | null): CatalogProvider[] {
-  if (!catalog || !Array.isArray(catalog.providers)) return [];
-  return catalog.providers.flatMap((item) => {
-    const id = String(item.id || "").trim();
-    if (!id) return [];
-    const voices = Array.isArray(item.voices)
-      ? item.voices.flatMap((voice) => {
-          if (!voice || typeof voice !== "object") return [];
-          const record = voice as Record<string, unknown>;
-          const voiceId = String(record.id || "").trim();
-          if (!voiceId) return [];
-          return [{ id: voiceId, label: String(record.label || voiceId), default: record.default === true }];
-        })
-      : [];
-    return [{
-      id,
-      label: String(item.label || id),
-      available: item.available !== false,
-      unavailableReason: typeof item.unavailableReason === "string" ? item.unavailableReason : "",
-      costNotice: typeof item.costNotice === "string" ? item.costNotice : "",
-      engine: typeof item.engine === "string" ? item.engine : id,
-      voices,
-    }];
-  });
+function resolveDefaultQuality(
+  settings: StudioSettingsState | null,
+  catalog: IntakeCatalog | null,
+): RenderQuality {
+  const fromSettings = settings?.renderQuality || settings?.settings?.renderQuality;
+  if (fromSettings === "1080p" || fromSettings === "720p") return fromSettings;
+  const caps = catalog?.capabilities as { renderQuality?: { default?: unknown } } | undefined;
+  const fromCatalog = catalog?.defaultRenderQuality || caps?.renderQuality?.default;
+  if (fromCatalog === "1080p" || fromCatalog === "720p") return fromCatalog;
+  return "1080p";
 }
 
-function catalogLaneRows(raw: unknown): Array<Record<string, unknown>> {
-  if (Array.isArray(raw)) return raw.filter((item) => item && typeof item === "object") as Array<Record<string, unknown>>;
-  if (raw && typeof raw === "object") {
-    return Object.values(raw as Record<string, unknown>).filter((item) => item && typeof item === "object") as Array<Record<string, unknown>>;
-  }
-  return [];
-}
-
-function buildLanes(catalog: IntakeCatalog | null, nodes: RenderNode[]): LaneOption[] {
-  const byId = new Map<string, LaneOption>();
-  for (const item of catalogLaneRows(catalog?.renderLanes)) {
-    const id = String(item.id || "").trim().toLowerCase();
-    if (!LANE_ID_RE.test(id)) continue;
-    const node = nodes.find((entry) => entry.id.toLowerCase() === id);
-    byId.set(id, {
-      id,
-      label: String(item.label || node?.label || id),
-      available: id === DEFAULT_LANE ? true : item.available !== false,
-      unavailableReason: id === DEFAULT_LANE ? null : typeof item.unavailableReason === "string" ? item.unavailableReason : null,
-      kind: kindOf(id, typeof item.kind === "string" ? item.kind : node?.kind),
-    });
-  }
-  for (const node of nodes) {
-    const id = node.id.trim().toLowerCase();
-    if (!LANE_ID_RE.test(id)) continue;
-    const existing = byId.get(id);
-    const disabled = node.enabled === false;
-    if (existing) {
-      byId.set(id, { ...existing, kind: kindOf(id, node.kind), label: existing.label || node.label });
-    } else {
-      byId.set(id, {
-        id,
-        label: node.label || id,
-        available: !disabled,
-        unavailableReason: disabled ? "disabled in render-nodes.json" : null,
-        kind: kindOf(id, node.kind),
-      });
-    }
-  }
-  if (!byId.has(DEFAULT_LANE)) {
-    byId.set(DEFAULT_LANE, { id: DEFAULT_LANE, label: "Auto", available: true, unavailableReason: null, kind: "inherit" });
-  }
-  const inherit = byId.get(DEFAULT_LANE)!;
-  const rest = [...byId.values()].filter((lane) => lane.id !== DEFAULT_LANE);
-  return [inherit, ...rest];
-}
-
-function defaultLaneId(catalog: IntakeCatalog | null, lanes: LaneOption[]): string {
+function defaultLaneId(
+  catalog: IntakeCatalog | null,
+  settings: StudioSettingsState | null,
+): string {
+  const fromSettings = settings?.defaultRenderLane ?? settings?.settings?.defaultRenderLane;
   const caps = catalog?.capabilities;
-  const raw = caps && typeof caps === "object" ? (caps as { renderLane?: { default?: unknown } }).renderLane?.default : undefined;
-  const preferred = normalizeLaneId(raw || DEFAULT_LANE);
-  return lanes.find((lane) => lane.id === preferred && lane.available)?.id || lanes.find((lane) => lane.available)?.id || DEFAULT_LANE;
+  const fromCaps = caps && typeof caps === "object" ? (caps as { renderLane?: { default?: unknown } }).renderLane?.default : undefined;
+  const raw = fromSettings ?? catalog?.defaultRenderLane ?? fromCaps ?? DEFAULT_LANE;
+  return normalizeLaneId(raw);
 }
 
-function isPaidExternal(provider: CatalogProvider | null): boolean {
-  if (!provider) return false;
-  const engine = provider.engine.toLowerCase();
-  return engine !== "edge" && engine !== "edge-tts";
+function isPaidExternal(provider: TtsProviderGroup | null): boolean {
+  return isPaidTtsProvider(provider);
 }
 
 function normalizeChapters(raw: string): { ok: true; spec: string } | { ok: false; error: string } {
@@ -360,22 +293,28 @@ function pipelineProgress(job: IntakeJob): { chapter: string | null; index: numb
 }
 
 function friendlyJobError(job: IntakeJob): string {
-  const raw = String(job.error || "").trim();
-  if (!raw) return "";
-  const lower = raw.toLowerCase();
-  if (/quota|too many users have viewed|rate limit|429/.test(lower)) {
-    return `Download limit reached: ${raw} Retry in a few hours, or upload the ZIP instead.`;
-  }
-  if (/not found|404|permission|access denied|private/.test(lower)) {
-    return `The link is not publicly readable: ${raw} Set the ZIP to “Anyone with the link”, then retry.`;
-  }
-  if (/already exists|never overwritten/.test(lower)) {
-    return `That series folder already exists: ${raw} Choose a different slug.`;
-  }
-  if (/zip|archive|corrupt|invalid/.test(lower)) {
-    return `The archive could not be read: ${raw} Re-export the ZIP and try again.`;
-  }
-  return raw;
+  return String(job.error || "").trim() ? describeJobFailure(job.error, job.statusNote).title : "";
+}
+
+function JobFailure({ job }: { job: IntakeJob }) {
+  if (job.status !== "failed" && job.status !== "interrupted") return null;
+  if (!job.error && !job.failureDetail) return null;
+  const failure = describeJobFailure(job.error, job.statusNote);
+  const hint = job.failureDetail ? (/audio|voice|tts/i.test(job.failureDetail) && /429|rate limit/i.test(job.failureDetail) ? "Voice rate limited" : parseFailureNote(job.failureDetail).title) : /quota|rate limit|429|too many users/i.test(job.error || "")
+    ? "Try later or upload a ZIP."
+    : /permission|access denied|private|not found|404/i.test(job.error || "")
+      ? "Make the Drive link public."
+      : /timeout|timed out/i.test(job.error || "")
+        ? "Check the source link."
+        : failure.reason;
+  return <Notice
+    tone="danger"
+    title={failure.title}
+    className="mt-3"
+    details={<RawDetails text={[job.failureDetail, job.error, job.statusNote].filter(Boolean).join("\n")} />}
+  >
+    {[hint, job.autoRetry?.count ? `tried ${job.autoRetry.count}×` : ""].filter(Boolean).join(" · ") || undefined}
+  </Notice>;
 }
 
 function canAction(job: IntakeJob, action: JobAction, privileged: boolean, unsupported: Set<string>): boolean {
@@ -396,7 +335,7 @@ function canAction(job: IntakeJob, action: JobAction, privileged: boolean, unsup
   if (action === "resume") return status === "paused";
   if (action === "stop" || action === "cancel") return ACTIVE_STATUSES.has(status);
   if (Array.isArray(job.actions) && job.actions.includes(action)) return true;
-  if (action === "retry") return status === "failed" || status === "interrupted";
+  if (action === "retry") return status === "failed" || status === "interrupted" || (status === "queued" && (job.notBefore || 0) > Date.now() / 1000);
   return false;
 }
 
@@ -473,9 +412,9 @@ function fmtAudioTime(seconds: number): string {
 
 function FieldError({ id, message }: { id: string; message?: string }) {
   return (
-    <p id={id} hidden={!message} className="mt-1 text-sm text-[#f0a096]" role="alert">
-      {message || ""}
-    </p>
+    <div id={id} hidden={!message} className="mt-2">
+      {message ? <Notice tone="danger" title="Check input" details={<RawDetails text={message} />} /> : null}
+    </div>
   );
 }
 
@@ -491,12 +430,12 @@ function VoicePreview({
   voice,
   privileged,
 }: {
-  provider: CatalogProvider | null;
-  voice: VoiceOption | null;
+  provider: TtsProviderGroup | null;
+  voice: TtsVoiceItem | null;
   privileged: boolean;
 }) {
   const [src, setSrc] = useState("");
-  const [error, setError] = useState("");
+  const [error, setError] = useState<string | ErrorInfo>("");
   const [busy, setBusy] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -575,7 +514,7 @@ function VoicePreview({
       }, 40);
     } catch (err) {
       if (token !== gen.current) return;
-      setError(errText(err));
+      setError(describeError(err));
     } finally {
       if (token === gen.current) setBusy(false);
     }
@@ -596,7 +535,7 @@ function VoicePreview({
 
   return (
     <section
-      className="mt-3 rounded-xl border border-[#2b2c30] bg-[#101113] p-3"
+      className="mt-3 rounded-xl bg-background p-3"
       aria-label="Voice sample player"
       data-playing={playing ? "" : undefined}
     >
@@ -612,7 +551,7 @@ function VoicePreview({
             {busy ? "Generating…" : playing ? "Stop" : "Listen sample"}
           </Button>
           {paid ? (
-            <label className="flex min-h-11 items-center gap-2 text-xs text-[#a2a19f]">
+            <label className="flex min-h-11 items-center gap-2 text-xs text-muted-foreground">
               <input
                 type="checkbox"
                 checked={spendOk}
@@ -622,17 +561,17 @@ function VoicePreview({
                 }}
               />
               <span>
-                Confirm paid synthesis{provider?.costNotice ? ` · ${provider.costNotice}` : ""}
+                Allow paid preview
               </span>
             </label>
           ) : (
-            <span className="text-xs text-[#a2a19f]" role="note">
-              {!privileged
+            <Tooltip side="top" label={
+              !privileged
                 ? "Temporary accounts cannot generate previews."
                 : provider && !provider.available
                   ? `Preview unavailable (${provider.unavailableReason || "not configured"}).`
-                  : provider?.costNotice || "Free Edge TTS narration"}
-            </span>
+                  : provider?.costNotice || "Free Edge TTS narration"
+            }><button type="button" aria-label="Preview information" className="grid size-11 place-items-center text-muted-foreground"><Info className="size-[18px]" strokeWidth={1.75} aria-hidden /></button></Tooltip>
           )}
         </div>
         {src ? (
@@ -649,13 +588,13 @@ function VoicePreview({
               onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
               onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
             />
-            <span className="shrink-0 font-mono text-xs text-[#a2a19f] tabular-nums">
+            <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
               {fmtAudioTime(currentTime)} / {fmtAudioTime(duration)}
             </span>
           </div>
         ) : null}
       </div>
-      {error ? <p className="mt-2 text-xs text-[#f0a096]" role="alert">{error}</p> : null}
+      {error ? <ErrorNotice className="mt-2" info={typeof error === "string" ? describeError(error) : error} onRetry={() => void listen()} /> : null}
     </section>
   );
 }
@@ -676,13 +615,13 @@ function StagePips({ job }: { job: IntakeJob }) {
       : knownChapters ? Math.min(100, Math.round((chapterCount! / pipe!.total!) * 100)) : null;
   return (
     <div className="mt-3">
-      <ol className="flex flex-wrap gap-2 text-[11px] tracking-wide text-[#a2a19f] uppercase" aria-label="Production progress">
+      <ol className="flex flex-wrap gap-2 text-[12.5px] text-muted-foreground" aria-label="Production progress">
         {STAGE_ORDER.map((stage, index) => {
           const done = status === "completed" || index < current;
           const on = status !== "completed" && index === current;
           return (
-            <li key={stage} className={cn("rounded-full border px-2 py-1", done && "border-[#3d523b] text-[#aed1a8]", on && "border-[#5eead4] text-[#5eead4]")}>
-              {stage}
+            <li key={stage} className={cn("rounded-full bg-muted px-3 py-1", done && "bg-success-soft text-success", on && "bg-info-soft text-info")}>
+              {{ download: "Download", extract: "Extract", pipeline: "Production" }[stage]}
             </li>
           );
         })}
@@ -706,22 +645,28 @@ export default function NewSeriesPage() {
   const [file, setFile] = useState<File | null>(null);
   const [chapters, setChapters] = useState("all");
   const [providerId, setProviderId] = useState("");
+  const [modelId, setModelId] = useState("");
   const [voiceId, setVoiceId] = useState("");
+  const [style, setStyle] = useState<import('@/lib/api').SeriesStyle>({});
+  const [ttsStyle, setTtsStyle] = useState<EditableTtsStyle>({});
   const [background, setBackground] = useState("starfield");
   const [motion, setMotion] = useState("cut");
   const [laneId, setLaneId] = useState(DEFAULT_LANE);
-  const [renderQuality, setRenderQuality] = useState<RenderQuality>("720p");
+  const [renderQuality, setRenderQuality] = useState<RenderQuality>("1080p");
   const [outroEnabled, setOutroEnabled] = useState(false);
   const [outroTotalChapters, setOutroTotalChapters] = useState(50);
   const [outroCoveredChapters, setOutroCoveredChapters] = useState(20);
   const [outroHookType, setOutroHookType] = useState<OutroHookType>("part2");
   const [outroCustomPrompt, setOutroCustomPrompt] = useState("");
   const [catalog, setCatalog] = useState<IntakeCatalog | null>(null);
+  const [settingsState, setSettingsState] = useState<StudioSettingsState | null>(null);
+  const [studioProviders, setStudioProviders] = useState<ProviderView[]>([]);
   const [nodes, setNodes] = useState<RenderNode[]>([]);
   const [privileged, setPrivileged] = useState(true);
   const [errors, setErrors] = useState<FieldErrors>({});
-  const [alert, setAlert] = useState<{ text: string; ok: boolean } | null>(null);
+  const [alert, setAlert] = useState<{ text: string; ok: boolean; info?: ErrorInfo } | null>(null);
   const [jobs, setJobs] = useState<IntakeJob[]>([]);
+  const retryNow = useRetryClock(Math.max(0, ...jobs.map((job) => job.notBefore || 0)));
   const [jobsLoaded, setJobsLoaded] = useState(false);
   const [queueNotice, setQueueNotice] = useState("");
   const [external, setExternal] = useState<Array<{ series?: string }>>([]);
@@ -730,30 +675,51 @@ export default function NewSeriesPage() {
   const [showForm, setShowForm] = useState(true);
   const [showLaunch, setShowLaunch] = useState(false);
   const [missingQuery, setMissingQuery] = useState<{ job: string; series: string } | null>(null);
-  const [actionNote, setActionNote] = useState<{ text: string; ok: boolean } | null>(null);
+  const [actionNote, setActionNote] = useState<{ text: string; ok: boolean; info?: ErrorInfo } | null>(null);
   const [continueDrafts, setContinueDrafts] = useState<Record<string, string>>({});
   const [openLogs, setOpenLogs] = useState<Set<string>>(() => new Set());
   const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set());
   const [unsupported, setUnsupported] = useState<Set<string>>(() => new Set());
   const [submitting, setSubmitting] = useState(false);
   const [upload, setUpload] = useState<UploadState>(IDLE_UPLOAD);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
   const uploadAbort = useRef<AbortController | null>(null);
   const focusField = useRef<string | null>(null);
   const restored = useRef(false);
   const laneTouched = useRef(false);
+  const qualityTouched = useRef(false);
+  const providerTouched = useRef(false);
+  const voiceTouched = useRef(false);
   const jobsSig = useRef("");
 
-  const providers = useMemo(() => asProviders(catalog), [catalog]);
-  const lanes = useMemo(() => buildLanes(catalog, nodes), [catalog, nodes]);
-  const provider = providers.find((item) => item.id === providerId) || null;
-  const voice = provider?.voices.find((item) => item.id === voiceId) || provider?.voices[0] || null;
+  const savedDefaultLane = useMemo(() => defaultLaneId(catalog, settingsState), [catalog, settingsState]);
+  const providers = useMemo(() => buildTtsProviders(catalog, studioProviders), [catalog, studioProviders]);
+  const lanes = useMemo(
+    () => buildIntakeLanes(catalog, nodes, savedDefaultLane, laneId),
+    [catalog, nodes, savedDefaultLane, laneId],
+  );
+  const provider = providers.find((item) => item.id === providerId) || providers.find((item) => item.available) || providers[0] || null;
+  const activeModelGroup = useMemo(() => {
+    if (!provider) return null;
+    if (modelId) {
+      const hit = provider.models.find((m) => m.id === modelId);
+      if (hit) return hit;
+    }
+    const voiceHit = provider.voices.find((v) => v.id === voiceId);
+    if (voiceHit) {
+      const hit = provider.models.find((m) => m.id === voiceHit.modelId);
+      if (hit) return hit;
+    }
+    return provider.models[0] || null;
+  }, [provider, modelId, voiceId]);
+  const modelVoices = activeModelGroup?.voices || provider?.voices || [];
+  const voice = modelVoices.find((item) => item.id === voiceId) || provider?.voices.find((item) => item.id === voiceId) || modelVoices[0] || provider?.voices[0] || null;
   const backgrounds = catalog?.backgrounds?.length ? catalog.backgrounds : ["starfield", "storm-valley", "mist-pines"];
   const motions = catalog?.motions?.length ? catalog.motions : ["cut", "duo"];
   const driveId = parseDriveId(gdriveUrl);
   const slugPreview = slug || slugify(title);
   const chosenLane = lanes.find((lane) => lane.id === laneId) || lanes[0];
   const activeJob = jobs.find((job) => job.id === activeId) || null;
+  const activeWaiting = statusOf(activeJob) === "queued" && (activeJob?.notBefore || 0) > retryNow;
   const spending = typeof catalog?.spendingNotice === "string"
     ? catalog.spendingNotice
     : "Runs ingestion, vision, script, TTS, cleaning, and video rendering across selected chapters.";
@@ -780,91 +746,105 @@ export default function NewSeriesPage() {
     }
   }, []);
 
-  useEffect(() => {
-    let stop = false;
-    void (async () => {
-      try {
-        const [nextCatalog, nodeRes, settingsRes] = await Promise.all([
-          api.intake.catalog(),
-          api.studio.nodes().catch(() => ({ nodes: [] as RenderNode[], runtimeNodes: [] })),
-          api.studio.getSettings().catch(() => null),
-        ]);
-        if (stop) return;
-        setCatalog(nextCatalog);
-        setNodes(nodeRes.nodes || []);
-        const q = settingsRes?.renderQuality || settingsRes?.settings?.renderQuality;
-        if (q === "720p" || q === "1080p") setRenderQuality(q);
-        if (nextCatalog.privileged === false) setPrivileged(false);
-      } catch (error) {
-        if (!stop) setAlert({ text: errText(error), ok: false });
+  const refreshDefaultsAndCatalog = useCallback(async () => {
+    try {
+      const [nextCatalog, nodeRes, settingsRes, provRes] = await Promise.all([
+        api.intake.catalog(),
+        api.studio.nodes().catch(() => ({ nodes: [] as RenderNode[], runtimeNodes: [] })),
+        api.studio.getSettings().catch(() => null),
+        api.studio.providers().catch(() => null),
+      ]);
+      setCatalog(nextCatalog);
+      setNodes(nodeRes.nodes || []);
+      if (settingsRes) setSettingsState(settingsRes);
+      if (Array.isArray(provRes?.providers)) setStudioProviders(provRes.providers);
+      if (!qualityTouched.current) {
+        setRenderQuality(resolveDefaultQuality(settingsRes, nextCatalog));
       }
-    })();
+      if (!laneTouched.current) {
+        setLaneId(defaultLaneId(nextCatalog, settingsRes));
+      }
+      if (nextCatalog.privileged === false) setPrivileged(false);
+    } catch (error) {
+      setAlert((current) => current ?? { text: errText(error), info: describeError(error), ok: false });
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshDefaultsAndCatalog();
     void loadJobs();
-    return () => {
-      stop = true;
-    };
-  }, [loadJobs]);
+  }, [loadJobs, refreshDefaultsAndCatalog]);
 
   useEffect(() => {
     const id = window.setInterval(() => {
       if (!document.hidden) void loadJobs();
     }, 4000);
-    const onVis = () => {
-      if (!document.hidden) void loadJobs();
+    const onReturn = () => {
+      if (!document.hidden) {
+        void loadJobs();
+        void refreshDefaultsAndCatalog();
+      }
     };
-    document.addEventListener("visibilitychange", onVis);
+    document.addEventListener("visibilitychange", onReturn);
+    window.addEventListener("focus", onReturn);
+    window.addEventListener("popstate", onReturn);
     return () => {
       window.clearInterval(id);
-      document.removeEventListener("visibilitychange", onVis);
+      document.removeEventListener("visibilitychange", onReturn);
+      window.removeEventListener("focus", onReturn);
+      window.removeEventListener("popstate", onReturn);
     };
-  }, [loadJobs]);
+  }, [loadJobs, refreshDefaultsAndCatalog]);
 
   useEffect(() => {
-    if (!catalog) return;
-    const list = asProviders(catalog);
-    let storedProvider = "";
-    let storedVoice = "";
-    try {
-      const raw = localStorage.getItem("screeningroom.preferredVoice");
-      if (raw) {
-        const parsed = JSON.parse(raw) as { providerId?: string; voiceId?: string; engine?: string };
-        storedProvider = parsed.providerId || parsed.engine || "";
-        storedVoice = parsed.voiceId || "";
-      } else {
-        storedProvider = localStorage.getItem("screeningroom.voice.provider") || "";
-        storedVoice = localStorage.getItem("screeningroom.voice.id") || "";
-      }
-    } catch {
-      /* Storage blocked */
+    if (!providers.length) return;
+    const stored = readPreferredVoice();
+    let targetProvider = providers.find((item) => item.id === providerId);
+    if ((!targetProvider || !providerTouched.current) && stored?.providerId) {
+      const fromStored = providers.find(
+        (item) =>
+          (item.id === stored.providerId || item.engine === stored.providerId) &&
+          item.available,
+      );
+      if (fromStored) targetProvider = fromStored;
     }
-    const matchedProvider = storedProvider
-      ? list.find((item) => (item.id === storedProvider || item.engine === storedProvider) && item.available)
-      : undefined;
-    const preferred =
-      matchedProvider ||
-      list.find((item) => item.id === catalog.defaultProvider && item.available) ||
-      list.find((item) => item.available) ||
-      list[0];
-    setProviderId((current) => current || preferred?.id || "");
-    if (matchedProvider && storedVoice && matchedProvider.voices.some((item) => item.id === storedVoice)) {
-      setVoiceId((current) => current || storedVoice);
+    if (!targetProvider) {
+      targetProvider =
+        (catalog?.defaultProvider
+          ? providers.find((item) => item.id === catalog.defaultProvider && item.available)
+          : undefined) ||
+        providers.find((item) => item.available) ||
+        providers[0];
     }
-    if (catalog.defaultBackground) setBackground((current) => current || catalog.defaultBackground);
-    if (catalog.defaultMotion) setMotion((current) => current || catalog.defaultMotion);
-  }, [catalog]);
+    if (!targetProvider) return;
+    if (targetProvider.id !== providerId) {
+      setProviderId(targetProvider.id);
+    }
 
-  useEffect(() => {
-    if (!provider) return;
-    if (!provider.voices.some((item) => item.id === voiceId)) {
-      const next = provider.voices.find((item) => item.default) || provider.voices[0];
-      setVoiceId(next?.id || "");
+    let targetVoice = targetProvider.voices.find((item) => item.id === voiceId);
+    if (
+      !voiceTouched.current &&
+      stored?.voiceId &&
+      (targetProvider.id === stored.providerId || targetProvider.engine === stored.providerId)
+    ) {
+      const storedVoice = targetProvider.voices.find((item) => item.id === stored.voiceId);
+      if (storedVoice) targetVoice = storedVoice;
     }
-  }, [provider, voiceId]);
+    if (!targetVoice) {
+      targetVoice = targetProvider.voices.find((item) => item.default) || targetProvider.voices[0];
+    }
+    if (targetVoice) {
+      if (targetVoice.id !== voiceId) setVoiceId(targetVoice.id);
+      if (targetVoice.modelId !== modelId) setModelId(targetVoice.modelId);
+    }
+    if (catalog?.defaultBackground) setBackground((current) => current || catalog.defaultBackground);
+    if (catalog?.defaultMotion) setMotion((current) => current || catalog.defaultMotion);
+  }, [catalog, providers, providerId, voiceId, modelId]);
 
   useEffect(() => {
     if (laneTouched.current) return;
-    setLaneId(defaultLaneId(catalog, lanes));
-  }, [catalog, lanes]);
+    setLaneId(defaultLaneId(catalog, settingsState));
+  }, [catalog, settingsState]);
 
   useEffect(() => {
     if (!jobsLoaded || restored.current) return;
@@ -1007,32 +987,22 @@ export default function NewSeriesPage() {
     uploadAbort.current?.abort();
   }
 
-  async function launch(options?: { qualityOverride?: RenderQuality; useDefaultVoice?: boolean }) {
+  async function launch() {
     if (submitting || !privileged) return;
     if (!validateStory()) return;
-    const edgeProvider =
-      providers.find(
-        (item) =>
-          item.available &&
-          (item.id === "edge" || item.id === "edge-tts" || item.engine === "edge" || item.engine === "edge-tts"),
-      ) ||
-      providers.find((item) => item.available) ||
-      provider;
-    const resolvedProvider = options?.useDefaultVoice ? edgeProvider || provider : provider;
-    const resolvedVoice = options?.useDefaultVoice
-      ? resolvedProvider?.voices.find((item) => item.default) || resolvedProvider?.voices[0] || voice
-      : voice;
-    if (!options?.useDefaultVoice && (!resolvedProvider?.available || !resolvedVoice)) {
+    if (!provider?.available || !voice) {
       setStep(1);
-      setField("voice", "Choose an available narrator before continuing.");
+      setField(
+        "voice",
+        provider && !provider.available
+          ? `${provider.label} unavailable: ${provider.unavailableReason || "connect in Studio"}`
+          : "Choose an available narrator before continuing.",
+      );
       return;
     }
-    const finalProviderId = resolvedProvider?.id || "edge";
-    const finalVoiceId = resolvedVoice?.id || "en-US-AndrewMultilingualNeural";
-    const finalQuality: RenderQuality = options?.qualityOverride || renderQuality;
-    if (options?.qualityOverride) {
-      setRenderQuality(options.qualityOverride);
-    }
+    const finalProviderId = provider.id;
+    const finalVoiceId = voice.id;
+    const finalQuality: RenderQuality = renderQuality;
     const nextSlug = (slugTouched ? slug : slugify(title)).trim().toLowerCase();
     setSlug(nextSlug);
     const chapterCheck = normalizeChapters(chapters);
@@ -1080,6 +1050,8 @@ export default function NewSeriesPage() {
           renderLane: lane.id,
           renderQuality: finalQuality,
           outroConfig,
+          style,
+          tts: { ...ttsStyle, speed: ttsStyle.speed ?? undefined },
         }) as IntakeJob;
         setGdriveUrl("");
       } else {
@@ -1101,6 +1073,8 @@ export default function NewSeriesPage() {
             renderLane: lane.id || DEFAULT_LANE,
             renderQuality: finalQuality,
             outroConfig,
+            style,
+            tts: { ...ttsStyle, speed: ttsStyle.speed ?? undefined },
           },
           controller.signal,
           (pct, loaded, total) => {
@@ -1119,7 +1093,9 @@ export default function NewSeriesPage() {
       setSlug("");
       setSlugTouched(false);
       laneTouched.current = false;
-      setLaneId(DEFAULT_LANE);
+      qualityTouched.current = false;
+      setLaneId(defaultLaneId(catalog, settingsState));
+      setRenderQuality(resolveDefaultQuality(settingsState, catalog));
       setAlert({
         text: `Queued ${created.title || title.trim()} (series/${created.slug || nextSlug}) as ${created.id}. The pipeline runs in the background.`,
         ok: true,
@@ -1135,7 +1111,7 @@ export default function NewSeriesPage() {
       await loadJobs();
     } catch (error) {
       const message = errText(error);
-      setAlert({ text: message === "Upload cancelled" ? "Upload cancelled." : message, ok: false });
+      setAlert({ text: message === "Upload cancelled" ? "Upload cancelled." : message, info: describeError(error), ok: false });
     } finally {
       uploadAbort.current = null;
       setUpload(IDLE_UPLOAD);
@@ -1197,7 +1173,7 @@ export default function NewSeriesPage() {
         setUnsupported((current) => new Set(current).add(`${jobId}:${action === "cancel" ? "stop" : action}`));
         setActionNote({ text: "This server does not support that action yet. Use “View pipeline” to watch the run.", ok: false });
       } else {
-        setActionNote({ text: errText(error), ok: false });
+        setActionNote({ text: errText(error), info: describeError(error), ok: false });
       }
     } finally {
       setBusyIds((current) => {
@@ -1232,7 +1208,7 @@ export default function NewSeriesPage() {
   const listedJobs = showLaunch && activeId ? jobs.filter((job) => job.id !== activeId) : jobs;
   const activeJobs = listedJobs.filter((job) => ACTIVE_STATUSES.has(statusOf(job)));
   const recentJobs = listedJobs.filter((job) => !ACTIVE_STATUSES.has(statusOf(job)));
-  const queueLabel = allActiveJobs.length || workerActive
+  const queueLabel = allActiveJobs.some((job) => statusOf(job) === "queued" && (job.notBefore || 0) > retryNow) ? "Retrying" : allActiveJobs.length || workerActive
     ? allActiveJobs[0] ? `Running · ${allActiveJobs[0].title || allActiveJobs[0].slug}` : "Running"
     : jobs.some((job) => statusOf(job) === "queued")
       ? `${jobs.filter((job) => statusOf(job) === "queued").length} queued`
@@ -1248,6 +1224,7 @@ export default function NewSeriesPage() {
 
   function renderJob(job: IntakeJob) {
     const status = statusOf(job);
+    const waiting = status === "queued" && (job.notBefore || 0) > retryNow;
     const logs = Array.isArray(job.logTail) ? job.logTail : [];
     const errorText = friendlyJobError(job);
     const busy = busyIds.has(job.id);
@@ -1258,23 +1235,19 @@ export default function NewSeriesPage() {
     const resumable = canAction(job, "resume", privileged, unsupported);
     const lane = normalizeLaneId(job.renderLane);
     return (
-      <article key={job.id} className={cn("rounded-xl border bg-[#17181a] p-4", job.id === activeId ? "border-[#f18b6e]" : "border-[#2b2c30]")} data-job={job.id} data-selected={job.id === activeId ? "true" : undefined}>
+      <article key={job.id} className="min-w-0 rounded-[22px] bg-card p-4 [overflow-wrap:anywhere] md:p-5" data-job={job.id} data-selected={job.id === activeId ? "true" : undefined}>
         <div className="flex items-start justify-between gap-3">
-          <h3 className="font-serif text-xl">{job.title || job.slug || job.id}</h3>
-          <span className="rounded-full border border-[#2b2c30] px-2 py-1 font-mono text-[10px] tracking-wide uppercase">{status}</span>
+          <h3 className="min-w-0 break-words text-[17px] font-semibold">{job.title || job.slug || job.id}</h3>
+          <span className={cn("shrink-0 rounded-full px-3 py-1 text-xs font-medium", waiting ? "bg-warning-soft text-warning" : status === "failed" ? "bg-destructive-soft text-destructive" : status === "completed" ? "bg-success-soft text-success" : "bg-muted text-muted-foreground")}>{waiting ? "Retrying" : status.charAt(0).toUpperCase() + status.slice(1)}</span>
         </div>
-        <p className="mt-1 text-sm text-[#a2a19f]">
-          {cleanVoiceName(job.tts?.voiceLabel || job.tts?.voiceId || job.tts?.providerLabel || "Narrated")}
+        <p className="mt-0.5 text-[13.5px] text-muted-foreground" title={`${cleanVoiceName(job.tts?.voiceLabel || job.tts?.voiceId || job.tts?.providerLabel || "Narrated")} · render ${lane}`}>
+          {waiting ? `Retry ${job.autoRetry?.count ?? 1} of ${job.autoRetry?.max ?? 3}` : job.ingestedChapters?.length ? `${job.ingestedChapters.length} ${job.ingestedChapters.length === 1 ? "chapter" : "chapters"}` : `Chapters ${job.chapters || "all"}`}
           {" · "}
-          {job.ingestedChapters?.length ? `${job.ingestedChapters.length} chapters ready` : `Chapters: ${job.chapters || "all"}`}
-          {" · "}
-          Render: {lane}
-          {" · "}
-          {fmtAge(job.updatedAt || job.createdAt)}
+          {waiting ? <span role="timer">in {retryCountdown(job.notBefore!, retryNow)}</span> : fmtAge(job.updatedAt || job.createdAt)}
         </p>
-        <StagePips job={job} />
-        {job.statusNote && !errorText ? <p className="mt-2 text-sm text-[#a2a19f]">{job.statusNote}</p> : null}
-        {errorText ? <p className="mt-2 text-sm text-[#f0a096]" role="alert">{errorText}</p> : null}
+        {job.statusNote && !errorText && status !== "completed" ? <details className="mt-2 text-xs text-muted-foreground"><summary className="min-h-11 cursor-pointer py-3">Details</summary><RawDetails text={job.statusNote} /></details> : null}
+        <JobFailure job={job} />
+        {waiting && job.autoRetry?.lastFailure ? <p className="mt-2 text-sm text-muted-foreground">{parseFailureNote(job.autoRetry.lastFailure).title}</p> : null}
         {logs.length ? (
           <details
             className="mt-3"
@@ -1289,23 +1262,16 @@ export default function NewSeriesPage() {
               });
             }}
           >
-            <summary className="cursor-pointer text-sm text-[#a2a19f]">Raw log ({logs.length} lines)</summary>
-            <Terminal className="mt-2">
-              <TerminalHeader>job {job.id}</TerminalHeader>
-              <TerminalBody>
-                {logs.map((line, index) => (
-                  <TerminalLine key={`${job.id}-${index}`}>{line}</TerminalLine>
-                ))}
-              </TerminalBody>
-            </Terminal>
+            <summary className="inline-flex min-h-10 cursor-pointer items-center text-[13.5px] text-muted-foreground select-none hover:text-foreground">Log</summary>
+            <pre tabIndex={0} aria-label={`Raw log for ${job.id}`} className="mt-2 max-h-64 overflow-auto rounded-2xl bg-muted p-4 font-mono text-xs leading-6 text-foreground">{logs.join("\n")}</pre>
           </details>
         ) : null}
         <div className="mt-3 flex flex-wrap gap-2">
-          <a className="inline-flex min-h-11 items-center text-sm text-[#f18b6e]" href={job.statusUrl || "/status.html"}>View pipeline</a>
+          <Tooltip label="View pipeline" side="top"><a aria-label="View pipeline" className="grid size-11 place-items-center rounded-full bg-muted text-muted-foreground" href={job.statusUrl || "/status.html"}><Activity className="size-[18px]" strokeWidth={1.75} aria-hidden /></a></Tooltip>
           {status === "completed" ? (
-            <a className="inline-flex min-h-11 items-center rounded-lg bg-[#f18b6e] px-3 text-sm text-[#201713]" href={job.libraryUrl || "/"}>Watch</a>
+            <a className="inline-flex min-h-11 items-center rounded-full bg-primary px-4 text-[14.5px] font-medium text-primary-foreground hover:bg-primary-hover" href={job.libraryUrl || "/"}>Watch</a>
           ) : null}
-          {pausable ? (
+          {pausable && !waiting ? (
             <Button type="button" variant="outline" className="min-h-11" disabled={busy} onClick={() => void runAction(job.id, "pause")}>
               {busy ? "Working…" : "Pause"}
             </Button>
@@ -1322,7 +1288,7 @@ export default function NewSeriesPage() {
           ) : null}
           {retryable ? (
             <Button type="button" variant="outline" className="min-h-11" disabled={busy} onClick={() => void runAction(job.id, "retry")}>
-              {busy ? "Retrying…" : "Retry"}
+              {busy ? "Retrying…" : waiting ? "Retry now" : "Retry"}
             </Button>
           ) : null}
           {continuable ? (
@@ -1348,56 +1314,50 @@ export default function NewSeriesPage() {
       )}
     >
       <style>{PAGE_CSS}</style>
-      <div className="mx-auto flex max-w-5xl flex-col gap-6">
+      <div className="mx-auto flex max-w-5xl flex-col gap-6 [&_[role=alert]_button]:min-h-11">
         <div className="flex items-end justify-between gap-3">
           <div>
-            <p className="text-[10px] tracking-[0.18em] text-[#a2a19f] uppercase">Create a series</p>
-            <h1 className="font-serif text-3xl">New series</h1>
+            <h1 className="text-3xl font-semibold tracking-[-0.02em]">New series</h1>
           </div>
-          <span className="rounded-full border border-[#2b2c30] px-3 py-1 text-xs">{queueLabel}</span>
+          <span className="rounded-full bg-muted px-3 py-1.5 text-xs">{queueLabel}</span>
         </div>
 
         {privileged ? null : (
-          <p className="rounded-xl border border-[#605139] bg-[#2a241b] px-4 py-3 text-sm text-[#d6b57b]" role="alert">
-            Signed in with a temporary viewing account. Temporary accounts can watch the library and view status, but cannot preview voices or start paid pipeline jobs.
-          </p>
+          <Notice tone="warning" title="View only" />
         )}
         {alert && !(showLaunch && activeJob) ? (
-          <p className={cn("rounded-xl border px-4 py-3 text-sm", alert.ok ? "border-[#3d523b] bg-[#1e281f] text-[#aed1a8]" : "border-[#69453e] bg-[#2e1f1e] text-[#f0a096]")} role="alert">
-            {alert.text}
-          </p>
+          alert.ok ? <Notice tone="success" title="Queued" details={<RawDetails text={alert.text} />} /> : <ErrorNotice info={alert.info} error={alert.text} />
         ) : null}
 
         {showLaunch ? (
-          <section className="rounded-2xl border border-[#2b2c30] bg-[#17181a] p-5" tabIndex={-1} aria-labelledby="successHeading">
+          <section className="rounded-[22px] bg-card p-5" tabIndex={-1} aria-labelledby="successHeading">
             {missingQuery && !activeJob ? (
               <>
-                <p className="text-[10px] tracking-[0.16em] text-[#f0a096] uppercase">Run not found</p>
-                <h2 id="successHeading" className="mt-1 font-serif text-2xl">No run found for {missingQuery.job || missingQuery.series}</h2>
-                <p className="mt-2 text-sm text-[#a2a19f]">Check Recent runs below, or start a new series.</p>
+                <Notice tone="danger" title="Run not found" details={<RawDetails text={missingQuery.job || missingQuery.series} />} />
+                <h2 id="successHeading" className="sr-only">Run not found</h2>
               </>
             ) : activeJob ? (
               <>
-                <p className="text-[10px] tracking-[0.16em] text-[#a2a19f] uppercase">{statusOf(activeJob)}</p>
-                <h2 id="successHeading" className="mt-1 font-serif text-2xl">{activeJob.title || activeJob.slug || "This series"}</h2>
-                {!friendlyJobError(activeJob) ? (
-                  <p className="mt-2 text-sm text-[#a2a19f]">{activeJob.statusNote || "This page updates live."}</p>
-                ) : null}
-                <StagePips job={activeJob} />
-                <p className="mt-3 text-sm">
-                  Render lane <strong className="font-mono">{laneLabel(normalizeLaneId(activeJob.renderLane), lanes)}</strong>
-                </p>
-                {friendlyJobError(activeJob) ? <p className="mt-2 text-sm text-[#f0a096]" role="alert">{friendlyJobError(activeJob)}</p> : null}
+                <div className="flex items-start justify-between gap-3">
+                  <h2 id="successHeading" className="min-w-0 text-2xl font-semibold tracking-[-0.015em]">{activeJob.title || activeJob.slug || "This series"}</h2>
+                  <span className={cn("shrink-0 rounded-full px-3 py-1 text-xs font-medium", activeWaiting ? "bg-warning-soft text-warning" : "bg-muted text-muted-foreground")}>{activeWaiting ? "Retrying" : statusOf(activeJob).replace(/^./, (c) => c.toUpperCase())}</span>
+                </div>
+                {activeWaiting ? <>
+                  <p className="mt-2 text-sm text-muted-foreground">Retry {activeJob.autoRetry?.count ?? 1} of {activeJob.autoRetry?.max ?? 3} · <span role="timer">in {retryCountdown(activeJob.notBefore!, retryNow)}</span></p>
+                  {activeJob.autoRetry?.lastFailure ? <p className="mt-2 text-sm text-muted-foreground">{parseFailureNote(activeJob.autoRetry.lastFailure).title}</p> : null}
+                  <details className="mt-2 text-xs text-muted-foreground"><summary className="min-h-11 cursor-pointer py-3">Details</summary><RawDetails text={[activeJob.autoRetry?.lastFailure, activeJob.failureDetail, activeJob.error, activeJob.statusNote].filter(Boolean).join("\n")} /></details>
+                </> : <StagePips job={activeJob} />}
+                <JobFailure job={activeJob} />
               </>
             ) : (
-              <h2 id="successHeading" className="font-serif text-2xl">Preparing production</h2>
+              <h2 id="successHeading" className="text-2xl font-semibold tracking-[-0.015em]">Preparing production</h2>
             )}
             {actionNote ? (
-              <p className={cn("mt-3 text-sm", actionNote.ok ? "text-[#aed1a8]" : "text-[#f0a096]")} role="status">{actionNote.text}</p>
+              actionNote.ok ? <Notice className="mt-3" tone="success" title="Updated" details={<RawDetails text={actionNote.text} />} /> : <ErrorNotice className="mt-3" info={actionNote.info} error={actionNote.text} />
             ) : null}
             <div className="mt-4 flex flex-wrap items-end gap-2">
-              <a className="inline-flex min-h-11 items-center rounded-lg bg-[#f18b6e] px-3 text-sm text-[#201713]" href={activeJob?.statusUrl || "/status.html"}>View pipeline</a>
-              {activeJob && canAction(activeJob, "pause", privileged, unsupported) ? (
+              <Tooltip label="View pipeline" side="top"><a aria-label="View pipeline" className="grid size-11 place-items-center rounded-full bg-muted" href={activeJob?.statusUrl || "/status.html"}><Activity className="size-[18px]" strokeWidth={1.75} aria-hidden /></a></Tooltip>
+              {activeJob && !activeWaiting && canAction(activeJob, "pause", privileged, unsupported) ? (
                 <Button type="button" variant="outline" className="min-h-11" disabled={busyIds.has(activeId)} onClick={() => void runAction(activeId, "pause")}>Pause</Button>
               ) : null}
               {activeJob && canAction(activeJob, "resume", privileged, unsupported) ? (
@@ -1407,7 +1367,7 @@ export default function NewSeriesPage() {
                 <Button type="button" variant="outline" className="min-h-11" disabled={busyIds.has(activeId)} onClick={() => void runAction(activeId, "stop")}>Stop</Button>
               ) : null}
               {activeJob && canAction(activeJob, "retry", privileged, unsupported) ? (
-                <Button type="button" variant="outline" className="min-h-11" disabled={busyIds.has(activeId)} onClick={() => void runAction(activeId, "retry")}>Retry</Button>
+                <Button type="button" variant="outline" className="min-h-11" disabled={busyIds.has(activeId)} onClick={() => void runAction(activeId, "retry")}>{activeWaiting ? "Retry now" : "Retry"}</Button>
               ) : null}
               {activeJob && canAction(activeJob, "continue", privileged, unsupported) ? (
                 <form
@@ -1427,7 +1387,7 @@ export default function NewSeriesPage() {
                     Continue chapters
                     <input
                       id="continueChapters"
-                      className="mt-1 min-h-11 w-40 rounded-lg border border-[#2b2c30] bg-[#101113] px-3 font-mono text-base"
+                      className="field mt-1 min-h-11 w-40 font-mono"
                       value={continueDrafts[activeId] || ""}
                       placeholder="2-5 or all"
                       autoComplete="off"
@@ -1441,7 +1401,7 @@ export default function NewSeriesPage() {
               <Button type="button" variant="ghost" className="min-h-11" onClick={createAnother}>Create another series</Button>
             </div>
             {activeJob && canAction(activeJob, "continue", privileged, unsupported) ? (
-              <p id="continueHint" className="mt-2 text-xs text-[#a2a19f]">Reuses the staged archive without re-downloading.</p>
+              <span id="continueHint" className="sr-only">Reuses the staged archive.</span>
             ) : null}
           </section>
         ) : null}
@@ -1449,7 +1409,7 @@ export default function NewSeriesPage() {
         {showForm ? (
           <form
             id="intakeForm"
-            className="rounded-2xl border border-[#2b2c30] bg-[#17181a] p-4 md:p-5"
+            className="rounded-[22px] bg-card p-5 md:p-5"
             noValidate
             aria-busy={submitting}
             onSubmit={(event: FormEvent) => {
@@ -1463,7 +1423,7 @@ export default function NewSeriesPage() {
                 <StepperItem key={item.title} step={index + 1} disabled={submitting}>
                   <StepperTrigger className="min-h-11">
                     <StepperIndicator>
-                    {index < step ? null : String(index + 1).padStart(2, "0")}
+                    {index < step ? null : index === 0 ? <Link2 className="size-4" aria-hidden /> : index === 1 ? <Volume2 className="size-4" aria-hidden /> : <Rocket className="size-4" aria-hidden />}
                   </StepperIndicator>
                     <StepperTitle>{item.title}</StepperTitle>
                   </StepperTrigger>
@@ -1475,12 +1435,12 @@ export default function NewSeriesPage() {
             <fieldset disabled={submitting} className="min-w-0 border-0 p-0">
               {step === 0 ? (
                 <section aria-labelledby="sourceHeading">
-                  <h2 id="sourceHeading" tabIndex={-1} className="font-serif text-2xl">Source</h2>
+                  <h2 id="sourceHeading" tabIndex={-1} className="sr-only">Source</h2>
                   <label className="mt-4 block text-sm" htmlFor="seriesTitle">
                     Title
                     <input
                       id="seriesTitle"
-                      className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#101113] px-3 text-base"
+                      className="field mt-1 min-h-11"
                       value={title}
                       maxLength={120}
                       required
@@ -1494,15 +1454,15 @@ export default function NewSeriesPage() {
                     />
                   </label>
                   <FieldError id="titleError" message={errors.title} />
-                  <details className="mt-2 text-xs text-[#a2a19f]" open={Boolean(errors.slug)}>
+                  <details className="mt-2 text-xs text-muted-foreground" open={Boolean(errors.slug)}>
                     <summary className="cursor-pointer select-none">
-                      Custom folder slug (series/{slugPreview || "…"})
+                      Folder ID
                     </summary>
-                    <label className="mt-2 block text-sm text-[#f2efe9]" htmlFor="seriesSlug">
+                    <label className="mt-2 block text-sm text-foreground" htmlFor="seriesSlug">
                       Slug preview
                       <input
                         id="seriesSlug"
-                        className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#101113] px-3 font-mono text-base"
+                        className="field mt-1 min-h-11 font-mono"
                         value={slugTouched ? slug : slugPreview}
                         maxLength={64}
                         pattern="[a-z0-9]+(-[a-z0-9]+)*"
@@ -1515,26 +1475,26 @@ export default function NewSeriesPage() {
                         }}
                       />
                     </label>
-                    <p id="slugPreview" className="mt-1 font-mono text-xs text-[#a2a19f]">series/{slugPreview || "—"}</p>
+                    <p id="slugPreview" className="mt-1 font-mono text-xs text-muted-foreground">series/{slugPreview || "—"}</p>
                   </details>
                   <FieldError id="slugError" message={errors.slug} />
 
-                  <div className="mt-4 grid grid-cols-2 gap-2" role="tablist" aria-label="Archive source method" onKeyDown={onTabKey}>
-                    <button type="button" role="tab" id="tabGdrive" className={cn("min-h-11 rounded-lg border px-3 text-left text-sm", sourceMode === "gdrive" ? "border-[#f18b6e] bg-[rgba(241,139,110,0.14)]" : "border-[#2b2c30]")} aria-selected={sourceMode === "gdrive"} aria-controls="paneGdrive" onClick={() => setSourceMode("gdrive")}>
-                      <Link2 className="mr-2 inline size-4" aria-hidden /> Google Drive ZIP
+                  <div className="mt-4 grid grid-cols-2 gap-1 rounded-full bg-muted p-1" role="tablist" aria-label="Archive source method" onKeyDown={onTabKey}>
+                    <button type="button" role="tab" id="tabGdrive" className={cn("min-h-11 rounded-full px-4 text-left text-[14.5px] font-medium transition-colors", sourceMode === "gdrive" ? "bg-background text-foreground shadow-float" : "text-muted-foreground hover:text-foreground")} aria-selected={sourceMode === "gdrive"} aria-controls="paneGdrive" onClick={() => setSourceMode("gdrive")}>
+                      <Link2 className="mr-2 inline size-4" aria-hidden /> Drive link
                     </button>
-                    <button type="button" role="tab" id="tabUpload" className={cn("min-h-11 rounded-lg border px-3 text-left text-sm", sourceMode === "upload" ? "border-[#f18b6e] bg-[rgba(241,139,110,0.14)]" : "border-[#2b2c30]")} aria-selected={sourceMode === "upload"} aria-controls="paneUpload" onClick={() => setSourceMode("upload")}>
+                    <button type="button" role="tab" id="tabUpload" className={cn("min-h-11 rounded-full px-4 text-left text-[14.5px] font-medium transition-colors", sourceMode === "upload" ? "bg-background text-foreground shadow-float" : "text-muted-foreground hover:text-foreground")} aria-selected={sourceMode === "upload"} aria-controls="paneUpload" onClick={() => setSourceMode("upload")}>
                       <Upload className="mr-2 inline size-4" aria-hidden /> Upload ZIP
                     </button>
                   </div>
 
                   {sourceMode === "gdrive" ? (
-                    <div id="paneGdrive" role="tabpanel" aria-labelledby="tabGdrive" className="mt-4">
+                    <div id="paneGdrive" role="tabpanel" aria-labelledby="tabGdrive" className="relative mt-4">
                       <label className="block text-sm" htmlFor="gdriveUrl">
                         Drive ZIP URL
                         <input
                           id="gdriveUrl"
-                          className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#101113] px-3 font-mono text-base"
+                          className="field mt-1 min-h-11 font-mono"
                           type="url"
                           value={gdriveUrl}
                           placeholder="https://drive.google.com/file/d/..."
@@ -1548,12 +1508,7 @@ export default function NewSeriesPage() {
                           }}
                         />
                       </label>
-                      {driveId ? (
-                        <p className="mt-2 rounded-lg border border-[#3d523b] bg-[#1e281f] px-3 py-2 text-sm text-[#aed1a8]">
-                          Drive ZIP ready · File {driveId.slice(0, 10)}…
-                        </p>
-                      ) : null}
-                      <p className="mt-1 text-xs text-[#a2a19f]">Share as Anyone with the link.</p>
+                      <Tooltip label="Share as Anyone with the link." side="top"><button type="button" aria-label="Drive link help" className="absolute -top-3 right-0 grid size-11 place-items-center text-muted-foreground"><Info className="size-[18px]" strokeWidth={1.75} aria-hidden /></button></Tooltip>
                       <FieldError id="gdriveError" message={errors.gdrive} />
                     </div>
                   ) : (
@@ -1574,13 +1529,13 @@ export default function NewSeriesPage() {
                           applyFile(accepted[0] || null);
                         }}
                         onError={() => setField("file", "Could not read that file. Try another .zip archive.")}
-                        className="bg-[#101113] p-4"
+                        className="bg-background p-4"
                       >
                         <span className="flex items-center gap-3 text-start">
-                          <Upload className="size-5 shrink-0 text-[#f18b6e]" aria-hidden />
+                          <Upload className="size-5 shrink-0 text-primary-text" aria-hidden />
                           <span>
                             <strong className="block">{file ? file.name : "Drop .zip or browse"}</strong>
-                            <span id="fileMeta" className="text-sm text-[#a2a19f]">
+                            <span id="fileMeta" className="text-sm text-muted-foreground">
                               {file ? `${fmtBytes(file.size)} · ready to upload` : "Chapters or .cbz archive"}
                             </span>
                           </span>
@@ -1609,7 +1564,7 @@ export default function NewSeriesPage() {
                     Chapters
                     <input
                       id="chaptersSpec"
-                      className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#101113] px-3 font-mono text-base"
+                      className="field mt-1 min-h-11 font-mono"
                       value={chapters}
                       placeholder="all, 1-5, or 1,2,3"
                       aria-invalid={errors.chapters ? true : undefined}
@@ -1625,7 +1580,7 @@ export default function NewSeriesPage() {
                       <button
                         key={preset}
                         type="button"
-                        className="min-h-11 rounded-full border border-[#2b2c30] px-3 text-sm"
+                        className="min-h-11 rounded-full border border-border px-3 text-sm"
                         aria-pressed={chapters.trim() === preset}
                         onClick={() => {
                           setChapters(preset);
@@ -1642,53 +1597,137 @@ export default function NewSeriesPage() {
 
               {step === 1 ? (
                 <section aria-labelledby="narrationHeading">
-                  <h2 id="narrationHeading" tabIndex={-1} className="font-serif text-2xl">Voice & style</h2>
-                  <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                  <h2 id="narrationHeading" tabIndex={-1} className="sr-only">Voice &amp; style</h2>
+                  <div className={cn("mt-4 grid gap-3", provider?.hasExplicitModels ? "sm:grid-cols-3" : "sm:grid-cols-2")}>
                     <label className="text-sm" htmlFor="ttsProvider">
                       Provider
                       <select
                         id="ttsProvider"
-                        className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#101113] px-3 text-base"
-                        value={providerId}
+                        className="field mt-1 min-h-11"
+                        value={provider?.id || providerId}
                         onChange={(event) => {
-                          setProviderId(event.target.value);
+                          const nextProviderId = event.target.value;
+                          providerTouched.current = true;
+                          setProviderId(nextProviderId);
+                          const nextProv = providers.find((item) => item.id === nextProviderId);
+                          const nextDefaultVoice = nextProv?.voices.find((v) => v.default) || nextProv?.voices[0];
+                          if (nextDefaultVoice) {
+                            setModelId(nextDefaultVoice.modelId);
+                            setVoiceId(nextDefaultVoice.id);
+                            if (nextProv?.available) {
+                              writePreferredVoice({
+                                providerId: nextProv.id,
+                                modelId: nextDefaultVoice.modelId,
+                                voiceId: nextDefaultVoice.id,
+                                engine: nextProv.engine,
+                                voiceLabel: nextDefaultVoice.label,
+                              });
+                            }
+                          }
                           setField("voice", "");
                         }}
                       >
                         {providers.map((item) => (
-                          <option key={item.id} value={item.id} disabled={!item.available}>
+                          <option key={item.id} value={item.id} disabled={!item.available || item.voices.length === 0}>
                             {item.label}{item.available ? "" : " (Unavailable)"}
                           </option>
                         ))}
                       </select>
                     </label>
+                    {provider?.hasExplicitModels ? (
+                      <label className="text-sm" htmlFor="ttsModel">
+                        Model
+                        <select
+                          id="ttsModel"
+                          className="field mt-1 min-h-11"
+                          value={activeModelGroup?.id || ""}
+                          onChange={(event) => {
+                            const nextModelId = event.target.value;
+                            voiceTouched.current = true;
+                            setModelId(nextModelId);
+                            const nextGroup = provider.models.find((m) => m.id === nextModelId);
+                            const currentShort = voice?.label;
+                            const nextVoice =
+                              nextGroup?.voices.find((v) => v.label === currentShort) ||
+                              nextGroup?.voices.find((v) => v.default) ||
+                              nextGroup?.voices[0];
+                            if (nextVoice) {
+                              setVoiceId(nextVoice.id);
+                              if (provider.available) {
+                                writePreferredVoice({
+                                  providerId: provider.id,
+                                  modelId: nextModelId,
+                                  voiceId: nextVoice.id,
+                                  engine: provider.engine,
+                                  voiceLabel: nextVoice.label,
+                                });
+                              }
+                            }
+                            setField("voice", "");
+                          }}
+                        >
+                          {provider.models.map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    ) : null}
                     <label className="text-sm" htmlFor="ttsVoice">
                       Narrator voice
                       <select
                         id="ttsVoice"
-                        className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#101113] px-3 text-base"
+                        className="field mt-1 min-h-11"
                         value={voice?.id || ""}
                         aria-invalid={errors.voice ? true : undefined}
                         aria-describedby="voiceError"
                         onChange={(event) => {
-                          setVoiceId(event.target.value);
+                          const nextVoiceId = event.target.value;
+                          voiceTouched.current = true;
+                          setVoiceId(nextVoiceId);
+                          const nextVoice = provider?.voices.find((v) => v.id === nextVoiceId);
+                          if (nextVoice && provider) {
+                            setModelId(nextVoice.modelId);
+                            if (provider.available) {
+                              writePreferredVoice({
+                                providerId: provider.id,
+                                modelId: nextVoice.modelId,
+                                voiceId: nextVoice.id,
+                                engine: provider.engine,
+                                voiceLabel: nextVoice.label,
+                              });
+                            }
+                          }
                           setField("voice", "");
                         }}
                       >
-                        {(provider?.voices || []).map((item) => (
+                        {modelVoices.map((item) => (
                           <option key={item.id} value={item.id}>{item.label}</option>
                         ))}
                       </select>
                     </label>
                   </div>
+                  {providers.some((item) => !item.available && item.unavailableReason) ? (
+                    <ul className="mt-3 rounded-xl bg-warning-soft px-3 py-2 text-xs text-warning" role="status">
+                      {providers
+                        .filter((item) => !item.available && item.unavailableReason)
+                        .map((item) => (
+                          <li key={item.id}>
+                            <strong>{item.label} unavailable:</strong> {item.unavailableReason}
+                          </li>
+                        ))}
+                    </ul>
+                  ) : null}
                   <FieldError id="voiceError" message={errors.voice} />
                   <VoicePreview provider={provider} voice={voice} privileged={privileged} />
+                  <StyleFields catalog={catalog} style={style} tts={ttsStyle} onStyle={setStyle} onTts={setTtsStyle} disabled={!privileged} />
                   <div className="mt-5 grid gap-4 sm:grid-cols-2">
                     <div>
                       <p className="text-sm">Background</p>
                       <div className="mt-2 flex flex-wrap gap-2" role="group" aria-label="Background world">
                         {backgrounds.map((id) => (
-                          <button key={id} type="button" className={cn("min-h-11 rounded-lg border px-3 text-sm", background === id ? "border-[#f18b6e]" : "border-[#2b2c30]")} aria-pressed={background === id} onClick={() => setBackground(id)}>
+                          <button key={id} type="button" className={cn("min-h-11 rounded-full px-4 text-sm", background === id ? "bg-primary-soft text-primary-text" : "bg-muted")} aria-pressed={background === id} onClick={() => setBackground(id)}>
                             {BG_LABELS[id] || id}
                           </button>
                         ))}
@@ -1698,31 +1737,24 @@ export default function NewSeriesPage() {
                       <p className="text-sm">Panel motion</p>
                       <div className="mt-2 flex flex-wrap gap-2" role="group" aria-label="Panel card motion">
                         {motions.map((id) => (
-                          <button key={id} type="button" className={cn("min-h-11 rounded-lg border px-3 text-sm", motion === id ? "border-[#f18b6e]" : "border-[#2b2c30]")} aria-pressed={motion === id} onClick={() => setMotion(id)}>
+                          <button key={id} type="button" className={cn("min-h-11 rounded-full px-4 text-sm", motion === id ? "bg-primary-soft text-primary-text" : "bg-muted")} aria-pressed={motion === id} onClick={() => setMotion(id)}>
                             {MOTION_LABELS[id] || id}
                           </button>
                         ))}
                       </div>
                     </div>
                   </div>
-                  {providers.some((item) => !item.available && item.unavailableReason) ? (
-                    <ul className="mt-4 text-sm text-[#d6b57b]">
-                      {providers.filter((item) => !item.available && item.unavailableReason).map((item) => (
-                        <li key={item.id}><strong>{item.label}</strong> — {item.unavailableReason}</li>
-                      ))}
-                    </ul>
-                  ) : null}
                 </section>
               ) : null}
 
               {step === 2 ? (
                 <section aria-labelledby="productionHeading">
-                  <h2 id="productionHeading" tabIndex={-1} className="font-serif text-2xl">Launch</h2>
+                  <h2 id="productionHeading" tabIndex={-1} className="sr-only">Launch</h2>
                   <label className="mt-4 block text-sm" htmlFor="renderLane">
                     Render lane
                     <select
                       id="renderLane"
-                      className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#101113] px-3 text-base"
+                      className="field mt-1 min-h-11"
                       value={chosenLane?.id || DEFAULT_LANE}
                       disabled={!privileged}
                       aria-invalid={errors.renderLane ? true : undefined}
@@ -1748,18 +1780,21 @@ export default function NewSeriesPage() {
                       })}
                     </select>
                   </label>
-                  <p id="renderLaneNote" className="mt-1 flex items-center gap-2 text-xs text-[#a2a19f]">
+                  <span id="renderLaneNote" className="sr-only">
                     <LaneIcon kind={chosenLane?.kind || "inherit"} />
                     {chosenLane && chosenLane.id !== DEFAULT_LANE
                       ? chosenLane.available
-                        ? `${chosenLane.label} only · no fallback · waits if offline`
-                        : `${chosenLane.label} unavailable: ${chosenLane.unavailableReason || "not available"}`
-                      : "Follows global policy · waits if offline"}
-                  </p>
+                        ? `${chosenLane.label} only · waits if offline`
+                        : `Default lane ${chosenLane.label} is unavailable (${chosenLane.unavailableReason || "disabled or removed"}). Choose Auto or another available lane.`
+                      : "Follows lane policy"}
+                  </span>
+                  {chosenLane && !chosenLane.available ? (
+                    <Notice className="mt-2" tone="danger" title="Lane unavailable" details={<RawDetails text={`${chosenLane.label}: ${chosenLane.unavailableReason || "disabled or removed"}`} />} />
+                  ) : null}
                   {unavailableLanes.length ? (
                     <details className="mt-2 text-sm">
                       <summary>Unavailable: {unavailableLanes.map((lane) => lane.label).join(", ")}</summary>
-                      <ul className="mt-2 text-[#d6b57b]">
+                      <ul className="mt-2 text-warning">
                         {unavailableLanes.map((lane) => (
                           <li key={lane.id}><strong>{lane.label}</strong> — {lane.unavailableReason || "unavailable"}</li>
                         ))}
@@ -1768,12 +1803,12 @@ export default function NewSeriesPage() {
                   ) : null}
                   <FieldError id="renderLaneError" message={errors.renderLane} />
 
-                  <div className="mt-4 rounded-xl border border-[#2b2c30] bg-[#101113] p-3">
+                  <div className="mt-4 rounded-xl bg-background p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
-                        <p className="text-sm font-medium">Render Quality</p>
-                        <p className="text-xs text-[#a2a19f]">
-                          {renderQuality === "720p" ? "1280×720 Fast Render (--scale=0.6667)" : "1920×1080 Full HD (--scale=1)"}
+                        <p className="text-sm font-medium">Render quality</p>
+                        <p className="text-xs text-muted-foreground">
+                          {renderQuality === "720p" ? "1280×720" : "1920×1080"}
                         </p>
                       </div>
                       <div className="flex gap-2" role="radiogroup" aria-label="Render quality">
@@ -1784,25 +1819,25 @@ export default function NewSeriesPage() {
                             role="radio"
                             aria-checked={renderQuality === q}
                             className={cn(
-                              "min-h-11 rounded-lg border px-3 text-sm",
-                              renderQuality === q ? "border-[#f18b6e] bg-[rgba(241,139,110,0.14)]" : "border-[#2b2c30]",
+                              "min-h-11 rounded-full px-4 text-sm",
+                              renderQuality === q ? "bg-primary-soft text-primary-text" : "bg-muted",
                             )}
-                            onClick={() => setRenderQuality(q)}
+                            onClick={() => {
+                              qualityTouched.current = true;
+                              setRenderQuality(q);
+                            }}
                           >
-                            {q === "1080p" ? "1080p (Full HD)" : "720p (Fast Render)"}
+                            {q}
                           </button>
                         ))}
                       </div>
                     </div>
                   </div>
 
-                  <div className="mt-4 rounded-xl border border-[#2b2c30] bg-[#101113] p-3">
+                  <div className="mt-4 rounded-xl bg-background p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
-                        <p className="text-sm font-medium">Outro Announcement (Character-Panel Showcase)</p>
-                        <p className="text-xs text-[#a2a19f]">
-                          Auto-selects best character panels from <code>bible.json</code> + <code>obs</code> and narrates a contextual episode outro.
-                        </p>
+                        <p className="text-sm font-medium">Episode outro</p>
                       </div>
                       <label className="flex min-h-11 items-center gap-2 text-sm">
                         <input
@@ -1814,47 +1849,47 @@ export default function NewSeriesPage() {
                       </label>
                     </div>
                     {outroEnabled ? (
-                      <div className="mt-3 space-y-3 border-t border-[#2b2c30] pt-3">
+                      <div className="mt-3 space-y-3 border-t border-border pt-3">
                         <div className="grid gap-3 sm:grid-cols-3">
-                          <label className="text-xs text-[#a2a19f]">
+                          <label className="text-xs text-muted-foreground">
                             Total chapters so far
                             <input
                               type="number"
                               min={1}
-                              className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 font-mono text-sm text-[#f2efe9]"
+                              className="mt-1 min-h-11 w-full rounded-xl bg-card px-3 font-mono text-sm text-foreground"
                               value={outroTotalChapters}
                               onChange={(event) => setOutroTotalChapters(Math.max(1, Number(event.target.value) || 1))}
                             />
                           </label>
-                          <label className="text-xs text-[#a2a19f]">
+                          <label className="text-xs text-muted-foreground">
                             Covered chapters
                             <input
                               type="number"
                               min={1}
-                              className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 font-mono text-sm text-[#f2efe9]"
+                              className="mt-1 min-h-11 w-full rounded-xl bg-card px-3 font-mono text-sm text-foreground"
                               value={outroCoveredChapters}
                               onChange={(event) => setOutroCoveredChapters(Math.max(1, Number(event.target.value) || 1))}
                             />
                           </label>
-                          <label className="text-xs text-[#a2a19f]">
+                          <label className="text-xs text-muted-foreground">
                             Hook type
                             <select
-                              className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-sm text-[#f2efe9]"
+                              className="mt-1 min-h-11 w-full rounded-xl bg-card px-3 text-sm text-foreground"
                               value={outroHookType}
                               onChange={(event) => setOutroHookType(event.target.value as OutroHookType)}
                             >
-                              <option value="part2">Part 2 (part2)</option>
-                              <option value="next_chapter">Next Chapter (next_chapter)</option>
-                              <option value="new_series">New Series (new_series)</option>
-                              <option value="custom">Custom (custom)</option>
+                              <option value="part2">Part 2</option>
+                              <option value="next_chapter">Next chapter</option>
+                              <option value="new_series">New series</option>
+                              <option value="custom">Custom</option>
                             </select>
                           </label>
                         </div>
                         {outroHookType === "custom" ? (
-                          <label className="block text-xs text-[#a2a19f]">
+                          <label className="block text-xs text-muted-foreground">
                             Custom outro call-to-action
                             <input
-                              className="mt-1 min-h-11 w-full rounded-lg border border-[#2b2c30] bg-[#17181a] px-3 text-sm text-[#f2efe9]"
+                              className="mt-1 min-h-11 w-full rounded-xl bg-card px-3 text-sm text-foreground"
                               value={outroCustomPrompt}
                               placeholder="Ask viewers to drop a comment for Part 2"
                               onChange={(event) => setOutroCustomPrompt(event.target.value)}
@@ -1865,24 +1900,30 @@ export default function NewSeriesPage() {
                     ) : null}
                   </div>
 
-                  <dl className="mt-4 divide-y divide-[#2b2c30] rounded-xl border border-[#2b2c30]" aria-live="polite">
+                  <dl className="sr-group mt-4 divide-y divide-border bg-muted [&_dd]:min-w-0 [&_dd]:break-words [&_dd]:text-right [&_dt]:shrink-0" aria-live="polite">
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Series</dt><dd>{title.trim() || "Not set"}</dd></div>
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Slug</dt><dd className="font-mono">{slugPreview || "Not set"}</dd></div>
-                    <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Narration</dt><dd>{provider && voice ? `${provider.label} · ${voice.label}` : "Not set"}</dd></div>
+                    <div className="flex justify-between gap-3 px-3 py-2 text-sm">
+                      <dt>Narration</dt>
+                      <dd>
+                        {provider && voice
+                          ? provider.hasExplicitModels && activeModelGroup
+                            ? `${provider.label} · ${activeModelGroup.label} · ${voice.label}`
+                            : `${provider.label} · ${voice.label}`
+                          : "Not set"}
+                      </dd>
+                    </div>
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Chapters</dt><dd className="font-mono">{chapters.trim() || "all"}</dd></div>
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Source & style</dt><dd>{sourceMode === "upload" ? file?.name || "No ZIP selected" : driveId ? "Google Drive ZIP" : "Waiting for link"} · {BG_LABELS[background] || background} · {MOTION_LABELS[motion] || motion}</dd></div>
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Render lane & quality</dt><dd>{laneLabel(chosenLane?.id || DEFAULT_LANE, lanes)} · {renderQuality}</dd></div>
                     {outroEnabled ? (
                       <div className="flex justify-between gap-3 px-3 py-2 text-sm">
-                        <dt>Outro announcement</dt>
-                        <dd className="font-mono">{outroCoveredChapters}/{outroTotalChapters} ch · {outroHookType}</dd>
+                        <dt>Episode outro</dt>
+                        <dd className="font-mono">{outroCoveredChapters}/{outroTotalChapters} ch</dd>
                       </div>
                     ) : null}
                   </dl>
-                  <details className="mt-4" open={advancedOpen} onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}>
-                    <summary className="cursor-pointer text-sm">Advanced options · slug</summary>
-                    <p className="mt-2 text-sm text-[#a2a19f]">{spending}</p>
-                  </details>
+                  <Tooltip label={provider?.costNotice || spending} side="top"><button type="button" aria-label="Run cost information" className="mt-2 grid size-11 place-items-center text-muted-foreground"><Info className="size-[18px]" strokeWidth={1.75} aria-hidden /></button></Tooltip>
                 </section>
               ) : null}
             </fieldset>
@@ -1900,68 +1941,56 @@ export default function NewSeriesPage() {
               </div>
             ) : null}
 
+            {chosenLane && !chosenLane.available && step !== 2 ? (
+              <Notice className="mt-4" tone="danger" title="Lane unavailable" details={<RawDetails text={`${chosenLane.label}: ${chosenLane.unavailableReason || "disabled or removed"}. Choose another lane in Launch.`} />} />
+            ) : null}
+
             <div className="mt-5 flex flex-wrap items-center gap-2">
-              <Button type="button" variant="outline" className="min-h-11" hidden={step === 0} disabled={submitting} onClick={() => goToStep(step - 1)}>Back</Button>
-              <span className="font-mono text-xs text-[#a2a19f]">{String(step + 1).padStart(2, "0")} / 03</span>
-              {step === 0 ? (
-                <>
-                  <Button
-                    type="button"
-                    className="min-h-11"
-                    disabled={!privileged || submitting}
-                    onClick={() => void launch({ qualityOverride: "720p", useDefaultVoice: true })}
-                  >
-                    {submitting
-                      ? sourceMode === "upload"
-                        ? "Uploading & validating…"
-                        : "Validating & queueing…"
-                      : "Quick Start (Default Voice & 720p)"}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="min-h-11"
-                    disabled={submitting}
-                    onClick={() => goToStep(1)}
-                  >
-                    Customize Voice &amp; Render →
-                  </Button>
-                </>
-              ) : step === 1 ? (
-                <Button type="button" className="min-h-11" disabled={submitting} onClick={() => goToStep(2)}>
-                  Next: Launch
+              <Button type="button" variant="outline" className="min-h-11 md:min-h-9" hidden={step === 0} disabled={submitting} onClick={() => goToStep(step - 1)}>Back</Button>
+              {step < 2 ? (
+                <Button
+                  type="button"
+                  variant="default"
+                  className="min-h-11 md:min-h-9"
+                  disabled={submitting}
+                  onClick={() => goToStep(step + 1)}
+                >
+                  Continue
                 </Button>
-              ) : (
-                <Button type="submit" className="min-h-11" disabled={!privileged || submitting}>
-                  {submitting ? (sourceMode === "upload" ? "Uploading & validating…" : "Validating & queueing…") : sourceMode === "upload" ? "Upload ZIP & start" : "Download ZIP & start"}
-                </Button>
-              )}
+              ) : null}
+              {step === 2 ? <Button
+                type="submit"
+                className="min-h-11 md:min-h-9"
+                disabled={!privileged || submitting || Boolean(chosenLane && !chosenLane.available) || Boolean(provider && !provider.available)}
+              >
+                {submitting
+                  ? sourceMode === "upload"
+                    ? "Uploading & validating…"
+                    : "Validating & queueing…"
+                  : "Start series"}
+              </Button> : null}
             </div>
           </form>
         ) : null}
 
         {showLaunch && !activeJobs.length && !recentJobs.length ? null : (
           <section aria-labelledby="queueHeading">
-            <h2 id="queueHeading" className="font-serif text-2xl">Active & recent runs</h2>
+            <h2 id="queueHeading" className="sr-section-label">Runs</h2>
             {external.length && !allActiveJobs.length ? (
-              <p className="mt-3 rounded-xl border border-[#605139] bg-[#2a241b] px-4 py-3 text-sm text-[#d6b57b]">
-                Another series ({external[0]?.series || "unknown"}) is currently running. New series will start right after.
-              </p>
+              <Notice className="mt-3" tone="info" title="Queued" details={<RawDetails text={`Waiting for ${external[0]?.series || "the active run"}.`} />} />
             ) : null}
-            {queueNotice ? <p className="mt-3 text-sm text-[#d6b57b]" role="status">{queueNotice}</p> : null}
-            {!jobsLoaded ? <p className="mt-3 text-sm text-[#a2a19f]">Loading intake jobs…</p> : null}
+            {queueNotice ? <Notice className="mt-3" tone="warning" title="Queue unavailable" details={<RawDetails text={queueNotice} />} /> : null}
+            {!jobsLoaded ? <p className="mt-3 text-sm text-muted-foreground">Loading intake jobs…</p> : null}
             {jobsLoaded && !jobs.length ? (
-              <p className="mt-3 rounded-xl border border-[#2b2c30] bg-[#17181a] px-4 py-6 text-sm text-[#a2a19f]">No active runs. Started series appear here while chapters download and render.</p>
+              <p className="mt-3 rounded-2xl bg-card px-4 py-6 text-sm text-muted-foreground">No runs</p>
             ) : null}
             {activeJobs.length ? (
               <div className="mt-3 flex flex-col gap-3">
-                <h3 className="text-sm tracking-wide text-[#a2a19f] uppercase">Active</h3>
                 {activeJobs.map(renderJob)}
               </div>
             ) : null}
             {recentJobs.length ? (
               <div className="mt-4 flex flex-col gap-3">
-                <h3 className="text-sm tracking-wide text-[#a2a19f] uppercase">Recent</h3>
                 {recentJobs.map(renderJob)}
               </div>
             ) : null}
@@ -1978,14 +2007,14 @@ const PAGE_CSS = `
   height: 8px;
   overflow: hidden;
   border-radius: 99px;
-  background: #101113;
-  border: 1px solid #2b2c30;
+  background: var(--background);
+  border: 1px solid var(--border);
 }
 .upload-track > i {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: #f18b6e;
+  background: var(--primary);
 }
 .upload-track.is-busy > i {
   width: 40%;

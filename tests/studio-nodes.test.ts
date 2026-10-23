@@ -823,6 +823,30 @@ describe('nodeRegistry provision: fresh docker-sbx and ssh accounts', () => {
     expect(started.instructions).toContain('sbx login');
   });
 
+  it('reports no fake link when `sbx login` prints no URL, and strips ANSI escapes', () => {
+    nodeRegistry._setLocalRunnerForTests((args) => {
+      if (String(args[0]).includes('sh')) return { status: 0, stdout: '/usr/bin/sbx', stderr: '' };
+      return { status: 1, stdout: 'Run `sbx login` to authenticate.\nDocs: https://docs.sbx.dev/start\n', stderr: '' };
+    });
+    const none = nodeRegistry.sandboxAuthStart();
+    expect(none.verificationUrl).toBeNull();
+    expect(none.userCode).toBeNull();
+    expect(none.instructions).not.toMatch(/https?:\/\//);
+    expect(none.instructions).toContain('no sign-in link');
+
+    nodeRegistry._setLocalRunnerForTests((args) => {
+      if (String(args[0]).includes('sh')) return { status: 0, stdout: '/usr/bin/sbx', stderr: '' };
+      return {
+        status: 1,
+        stdout: '\u001b[36mOpen this URL to sign in: https://login.docker.com/activate?user_code=ANSI-CODE\u001b[0m\n',
+        stderr: '',
+      };
+    });
+    const ansi = nodeRegistry.sandboxAuthStart();
+    expect(ansi.verificationUrl).toBe('https://login.docker.com/activate?user_code=ANSI-CODE');
+    expect(ansi.userCode).toBe('ANSI-CODE');
+  });
+
   it('falls back to `sbx exec` when `sbx start` is unsupported and probes on `status` action', () => {
     const calls: string[][] = [];
     cloudlane._setRunnerForTests((args) => {

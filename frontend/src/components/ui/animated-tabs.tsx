@@ -101,7 +101,7 @@ export function AnimatedTabs({
                     transition={spring}
                     className={
                       variant === "pill"
-                        ? "absolute inset-0 rounded-full bg-primary shadow-[0_4px_18px_-6px_rgba(0,0,0,.5)]"
+                        ? "absolute inset-0 rounded-full bg-primary shadow-float"
                         : "absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-foreground"
                     }
                   />

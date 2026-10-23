@@ -39,8 +39,12 @@ import {
   _setFetchForTests,
   _setSleepForTests,
   call,
+  effectiveEffort,
+  emptyReason,
+  httpErrorNote,
   imgB64,
   laneSnapshotStatus,
+  reasoningHeadroom,
   pageBlocks,
   parseJson,
   parse_json,
@@ -447,6 +451,141 @@ describe("llm/client SSE and retry policy", () => {
       expect(urls).toHaveLength(3);
       expect(sleeps.length).toBe(2);
     }
+  });
+
+  it("reserves reasoning headroom in max_tokens for reasoning lanes", async () => {
+    const bodies: Array<{ max_tokens: number; reasoning_effort?: string }> = [];
+    useVision([{ ...testLane("think"), reasoningEffort: "high", protocol: "openai-compatible" } as Lane]);
+    _setFetchForTests(async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return http(200, okBody("done"));
+    });
+    await call([{ role: "user", content: "x" }], { lane: "vision", retries: 1, maxTokens: 6000 });
+    expect(bodies[0]!.reasoning_effort).toBe("high");
+    expect(bodies[0]!.max_tokens).toBe(6000 + reasoningHeadroom("high"));
+  });
+
+  it("grows max_tokens once on an empty finish=length, then skips the lane without burning retries", async () => {
+    const sleeps: number[] = [];
+    _setSleepForTests(async (ms) => {
+      sleeps.push(ms);
+    });
+    const empty = JSON.stringify({ choices: [{ message: { content: "" }, finish_reason: "length" }], usage: {} });
+    const caps: number[] = [];
+    useVision([testLane("trunc"), testLane("next")]);
+    _setFetchForTests(async (input, init) => {
+      const url = String(input);
+      if (url.includes("/next/")) return http(200, okBody("fallback"));
+      caps.push(JSON.parse(String(init?.body ?? "{}")).max_tokens);
+      return http(200, empty);
+    });
+    const out = await call([{ role: "user", content: "x" }], { lane: "vision", retries: 4, maxTokens: 1000 });
+    expect(out.choices[0]!.message.content).toBe("fallback");
+    expect(caps).toEqual([1000, 10000]);
+    expect(sleeps).toHaveLength(0);
+  });
+
+  it("thinking=false sends minimal effort on vertex and no effort elsewhere", () => {
+    const base = testLane("t");
+    expect(effectiveEffort({ ...base, protocol: "vertex-openai", reasoningEffort: "high", thinking: false } as Lane)).toBe("minimal");
+    expect(effectiveEffort({ ...base, protocol: "openai-compatible", reasoningEffort: "high", thinking: false } as Lane)).toBeNull();
+    expect(effectiveEffort({ ...base, protocol: "openai-compatible", reasoningEffort: "low", thinking: null } as Lane)).toBe("low");
+  });
+
+  it("clamps max_tokens to the model's maxOutputTokens", async () => {
+    const caps: number[] = [];
+    useVision([{ ...testLane("cap"), reasoningEffort: "high", protocol: "openai-compatible", maxOutputTokens: 9000 } as Lane]);
+    _setFetchForTests(async (_input, init) => {
+      caps.push(JSON.parse(String(init?.body ?? "{}")).max_tokens);
+      return http(200, okBody("ok"));
+    });
+    await call([{ role: "user", content: "x" }], { lane: "vision", retries: 1, maxTokens: 6000 });
+    expect(caps).toEqual([9000]);
+  });
+
+  it("parks a 403 lane so later calls skip it without a request", async () => {
+    let hits = 0;
+    useVision([testLane("forbid"), testLane("good")]);
+    _setFetchForTests(async (input) => {
+      if (String(input).includes("/forbid/")) {
+        hits += 1;
+        return http(403, '{"error":{"message":"request illegal"}}');
+      }
+      return http(200, okBody("ok"));
+    });
+    await call([{ role: "user", content: "x" }], { lane: "vision", retries: 3 });
+    await call([{ role: "user", content: "x" }], { lane: "vision", retries: 3 });
+    expect(hits).toBe(1);
+  });
+
+  it("retries a bare Vertex RESOURCE_EXHAUSTED 429 on the same lane instead of parking it", async () => {
+    const sleeps: number[] = [];
+    _setSleepForTests(async (ms) => {
+      sleeps.push(ms);
+    });
+    let n = 0;
+    useVision([testLane("vtx"), testLane("other")]);
+    const exhausted = '[{"error":{"code":429,"message":"Resource exhausted. Please try again later.","status":"RESOURCE_EXHAUSTED"}}]';
+    _setFetchForTests(async (input) => {
+      if (String(input).includes("/other/")) return http(403, "no");
+      n += 1;
+      return n < 3 ? http(429, exhausted) : http(200, okBody("argon"));
+    });
+    const out = await call([{ role: "user", content: "x" }], { lane: "vision", retries: 4 });
+    expect(out.choices[0]!.message.content).toBe("argon");
+    expect(n).toBe(3);
+    expect(sleeps).toHaveLength(2);
+    expect(sleeps[0]!).toBeGreaterThanOrEqual(15000);
+  });
+
+  it("waits for a rate-limited lane to cool instead of failing the chain instantly", async () => {
+    const sleeps: number[] = [];
+    const realNow = Date.now;
+    let clock = realNow();
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+    _setSleepForTests(async (ms) => {
+      sleeps.push(ms);
+      clock += ms;
+    });
+    let n = 0;
+    useVision([testLane("busy")]);
+    _setFetchForTests(async () => {
+      n += 1;
+      return n <= 2 ? http(429, "rate limited") : http(200, okBody("later"));
+    });
+    const out = await call([{ role: "user", content: "x" }], { lane: "vision", retries: 2 });
+    expect(out.choices[0]!.message.content).toBe("later");
+    expect(n).toBe(3);
+    expect(sleeps.some((ms) => ms >= 90_000)).toBe(true);
+  });
+
+  it("still parks on a stated quota reset", async () => {
+    let n = 0;
+    useVision([testLane("capped")]);
+    _setFetchForTests(async () => {
+      n += 1;
+      return http(429, "usage quota exceeded, resets in 3h");
+    });
+    await expect(call([{ role: "user", content: "x" }], { lane: "vision", retries: 4 })).rejects.toThrow(AllLanesFailed);
+    expect(n).toBe(1);
+  });
+
+  it("httpErrorNote extracts the upstream message and adds a fix hint", () => {
+    const note = httpErrorNote(403, '{"error":{"message":"request illegal","code":"x"}}');
+    expect(note).toContain("HTTP 403");
+    expect(note).toContain("request illegal");
+    expect(note).toContain("access denied");
+  });
+
+  it("emptyReason reports finish and usage and flags terminal finishes", () => {
+    const r = emptyReason({
+      choices: [{ message: { content: "" }, finish_reason: "SAFETY" }],
+      usage: { prompt_tokens: 10, completion_tokens: 0 },
+    });
+    expect(r.finish).toBe("safety");
+    expect(r.terminal).toBe(true);
+    expect(r.detail).toContain("prompt=10");
+    expect(emptyReason({ choices: [{ message: { content: "" }, finish_reason: "stop" }] }).terminal).toBe(false);
   });
 
   it("retries an empty 200 and skips 401 and 403 without sleeping", async () => {

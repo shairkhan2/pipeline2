@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { failureNote } from '../domain/failure.js';
 
 export type StageState =
   | 'running'
@@ -123,6 +124,14 @@ function event(message: string, kind = 'info'): void {
   if (!data) return;
   data.events.push({ at: now(), message, kind });
   data.events = data.events.slice(-60);
+}
+
+/** Public event hook (e.g. "all lanes busy, retrying in 90s") for the Status feed. */
+export function notice(message: string, kind = 'info'): void {
+  safe(() => {
+    event(message, kind);
+    write();
+  });
 }
 
 /** `/proc/self/stat` start ticks: `rsplit(')', 1)[1].split()[19]`. */
@@ -255,13 +264,10 @@ export function stageCurrent(
   });
 }
 
-export function failed(chapter: string, error: unknown): void {
+function failureStage(chapter: string, error: unknown, state: StageState, details: Record<string, unknown> = {}): void {
   safe(() => {
     if (!data) return;
     const ctx = context();
-    const errName =
-      (error as { constructor?: { name?: string } } | null | undefined)?.constructor?.name ??
-      typeof error;
     // Outside `run(...)` the trace context still points at the stage that ran
     // first (typically "audio"), which is already "done". Prefer the stage that
     // is actually in flight for this chapter so a render crash never rewrites
@@ -280,8 +286,16 @@ export function failed(chapter: string, error: unknown): void {
     const validCtxStage =
       ctxStage && !TERMINAL.has(String(chStages[ctxStage]?.state ?? '')) ? ctxStage : undefined;
     const targetStage = activeStage || validCtxStage || 'pipeline';
-    stage(chapter, targetStage, 'failed', { note: errName });
+    stage(chapter, targetStage, state, { ...details, note: failureNote(error) });
   });
+}
+
+export function failed(chapter: string, error: unknown): void {
+  failureStage(chapter, error, 'failed');
+}
+
+export function retrying(chapter: string, error: unknown, details: { retryAt: number; attempt: number; maxAttempts: number }): void {
+  failureStage(chapter, error, 'retrying', details);
 }
 
 /** Register/update ANY worker id. Future backends use the same function. */

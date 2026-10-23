@@ -510,26 +510,128 @@ export function _resetNodeRegistryForTests(): void {
  * Fresh-account provisioning & sandbox CLI auth
  * ------------------------------------------------------------------ */
 
+/** ANSI escape sequences (CSI, OSC and two-byte) that a TTY wraps around text. */
+const ANSI_ESCAPE_RE =
+  // eslint-disable-next-line no-control-regex
+  /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001B]*(?:\u0007|\u001B\\)|[@-_])/g;
+
+/** Strip terminal control codes so URLs and codes match plain text. */
+function stripTerminalEscapes(text: string): string {
+  return String(text ?? "").replace(ANSI_ESCAPE_RE, "").replace(/\r/g, "");
+}
+
+/** Hosts that are documentation, never a live sign-in page. */
+const SBX_DOC_HOSTS = /(^|\.)(docs?\.)?sbx\.dev$|(^|\.)docs\.docker\.com$/i;
+/** Paths on Docker hosts that are legal/help pages rather than sign-in. */
+const SBX_NON_LOGIN_PATH = /\/legal\/|\/terms\/|\/privacy\//i;
+
+/**
+ * Drop trailing `)`, `]` or `}` only while unbalanced, and a trailing unmatched
+ * opener (`(`, `[`, `{`) that never closes inside the URL.
+ */
+function trimUnbalancedBracket(candidate: string): string {
+  const pairs: Array<[string, string]> = [["(", ")"], ["[", "]"], ["{", "}"]];
+  let out = candidate;
+  for (;;) {
+    const last = out.slice(-1);
+    const closePair = pairs.find(([, close]) => close === last);
+    if (closePair) {
+      const [open, close] = closePair;
+      const opens = out.split(open).length - 1;
+      const closes = out.split(close).length - 1;
+      if (closes <= opens) return out;
+      out = out.slice(0, -1);
+      continue;
+    }
+    const openPair = pairs.find(([open]) => open === last);
+    if (!openPair) return out;
+    const [open, close] = openPair;
+    const opens = out.split(open).length - 1;
+    const closes = out.split(close).length - 1;
+    // A trailing opener with no closer is sentence noise, not a URL character.
+    if (opens <= closes) return out;
+    out = out.slice(0, -1);
+  }
+}
+
+/**
+ * Validate one candidate URL: http(s) only, no documentation or legal page, no
+ * trailing terminal punctuation, and nothing that is really a shell command.
+ */
+function normalizeLoginUrl(raw: string): string | null {
+  let candidate = stripTerminalEscapes(raw).trim();
+  if (!candidate) return null;
+  // Sentence punctuation after a URL is never part of it. Brackets are handled
+  // separately so a balanced one inside a query value survives.
+  candidate = candidate.replace(/[>"',;:.]+$/g, "");
+  candidate = trimUnbalancedBracket(candidate);
+  if (!/^https?:\/\//i.test(candidate)) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (!parsed.hostname.includes(".")) return null;
+  if (SBX_DOC_HOSTS.test(parsed.hostname) && !/\/device|\/activate/i.test(parsed.pathname)) {
+    return null;
+  }
+  if (SBX_NON_LOGIN_PATH.test(parsed.pathname)) return null;
+  return parsed.toString();
+}
+
+/** True when the URL is a real device/verification link rather than a homepage. */
+function isLoginCandidate(url: string): boolean {
+  return /device|activate|login|signin|sign-in|auth|[?&](?:user_)?code=/i.test(url);
+}
+
 export function parseSbxLoginOutput(text: string): {
   verificationUrl: string | null;
   userCode: string | null;
 } {
+  const clean = stripTerminalEscapes(text);
   const codeMatch =
-    /confirmation code is:\s*([A-Z0-9]{4,}-[A-Z0-9]{4,})/i.exec(text) ??
-    /[?&](?:user_)?code=([A-Za-z0-9-]+)/i.exec(text);
+    /confirmation code is:?\s*([A-Z0-9]{4,}-[A-Z0-9]{4,})/i.exec(clean) ??
+    /(?:enter|use)\s+(?:the\s+)?code:?\s*([A-Z0-9]{4,}-[A-Z0-9]{4,})/i.exec(clean) ??
+    /[?&](?:user_)?code=([A-Za-z0-9_-]{4,})/i.exec(clean);
   const userCode = codeMatch ? codeMatch[1]! : null;
 
-  const signInMatch = /Open this URL to sign in:\s*(https?:\/\/\S+)/i.exec(text);
-  if (signInMatch) {
-    return { verificationUrl: signInMatch[1]!, userCode };
+  // The CLI labels its sign-in link; prefer that over any other URL in the log.
+  const labelled = /(?:Open this URL to sign in|sign in (?:at|using|with)|verification URL|visit)\s*:?\s*(https?:\/\/[^\s"'<>]+)/i.exec(clean);
+  const labelledUrl = labelled ? normalizeLoginUrl(labelled[1]!) : null;
+  if (labelledUrl && isLoginCandidate(labelledUrl)) {
+    return { verificationUrl: labelledUrl, userCode };
   }
 
-  const urls = Array.from(text.matchAll(/https?:\/\/\S+/g), (m) => m[0]).filter(
-    (u) => !/docker\.com\/legal\//i.test(u),
-  );
-  const preferred = urls.find((u) => /activate|device|login|code=/i.test(u));
-  const verificationUrl = preferred ?? urls[0] ?? null;
+  const candidates: string[] = [];
+  for (const match of clean.matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
+    const normalized = normalizeLoginUrl(match[0]);
+    if (normalized) candidates.push(normalized);
+  }
+  const verificationUrl =
+    candidates.find((url) => isLoginCandidate(url)) ?? null;
   return { verificationUrl, userCode };
+}
+
+/**
+ * Human-readable next step for a login attempt. Never invents a link: when the
+ * CLI printed none, the user is told to run it in a terminal.
+ */
+function sbxLoginInstructions(
+  parsed: { verificationUrl: string | null; userCode: string | null },
+  started: boolean,
+): string {
+  if (!started) {
+    return "Could not start `sbx login`. Install the sbx CLI and run `sbx login` in a terminal, then retry.";
+  }
+  if (!parsed.verificationUrl) {
+    return "`sbx login` started but printed no sign-in link. Run `sbx login` in a terminal to finish the browser flow, then retry.";
+  }
+  if (parsed.userCode) {
+    return `Open ${parsed.verificationUrl} and enter code ${parsed.userCode} to finish \`sbx login\` in your browser.`;
+  }
+  return `Open ${parsed.verificationUrl} to finish \`sbx login\` in your browser.`;
 }
 
 let activeLoginSession: { pid: number; logFile: string; startedAt: number } | null = null;
@@ -737,9 +839,7 @@ export function sandboxAuthStart(token?: string): {
   if (!localRunnerIsCustom) {
     const login = startLoginDetached(4000);
     const parsed = parseSbxLoginOutput(login.text);
-    const instructions = parsed.userCode
-      ? `Open ${parsed.verificationUrl ?? "the verification URL"} and enter code ${parsed.userCode} to finish \`sbx login\` in your browser.`
-      : "Open the verification URL and finish the browser flow; `sbx login` keeps running in the background.";
+    const instructions = sbxLoginInstructions(parsed, login.started);
     return {
       ok: login.started,
       authenticated: false,
@@ -757,9 +857,7 @@ export function sandboxAuthStart(token?: string): {
   const start = runLocal(["sbx", "login"], 20);
   const text = `${start.stdout}\n${start.stderr}`.trim();
   const parsed = parseSbxLoginOutput(text);
-  const instructions = parsed.userCode
-    ? `Open ${parsed.verificationUrl ?? "the verification URL"} and enter code ${parsed.userCode} to finish \`sbx login\` in your browser.`
-    : "Run `sbx login` in a terminal and finish the browser flow, then retry.";
+  const instructions = sbxLoginInstructions(parsed, start.status !== null);
   return {
     ok: start.status === 0,
     authenticated: start.status === 0,

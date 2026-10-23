@@ -5,7 +5,7 @@
  * functions in-process (no Python subprocess). Google Drive downloads still enforce
  * HTTPS, host allowlists, and public-IP checks before any byte is read.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import fs from "node:fs";
@@ -13,8 +13,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { pyReprStr } from "../contracts/hashes.js";
-import { getStudioSettings } from "../config/studioConfig.js";
+import { failClass, failureNote, type FailClass } from "../domain/failure.js";
+import { defaultStudioSettings, getStudioSettings, type StudioSettings } from "../config/studioConfig.js";
 import { resolveOutDir } from "../config/secretStore.js";
+import { seriesStyleSchema, ttsStyleSchema, STYLE_CATALOG, validationMessage } from '../config/seriesStyle.js';
 import {
   VERTEX_TTS_VOICES,
   discoverVertexTtsVoices,
@@ -28,7 +30,6 @@ import {
   listGrokTtsVoices,
   readCachedGrokTtsVoices,
 } from "../llm/grokTts.js";
-import { getRegisteredNodes } from "../workers/nodeRegistry.js";
 import {
   BACKGROUNDS,
   DEFAULT_BACKGROUND,
@@ -45,6 +46,18 @@ import {
   ingest,
   parseChapterSpec,
 } from "./ingest.js";
+import {
+  describeRetainedSources,
+  hashFile,
+  hasRetainedSource,
+  isRetainedSourcePath,
+  listRetainedSources,
+  pathHasSymlink,
+  listRetainedSourceContents,
+  planRetainedExtraction,
+  retainSourceArchive,
+  seriesSourceDir,
+} from "./sourceArchive.js";
 import {
   RENDER_LANE_ENV,
   OVERRIDE_INHERIT,
@@ -121,9 +134,117 @@ export function normalizeRenderQuality(raw: unknown): RenderQuality | null {
 /** Global Studio render quality; the fallback for jobs that never chose one. */
 function studioRenderQuality(env?: Env): RenderQuality {
   try {
-    return getStudioSettings(resolveOutDir(env?.MANHWA_OUT_DIR)).renderQuality;
+    return getStudioSettings(studioOutDir(env)).renderQuality;
   } catch {
     return DEFAULT_RENDER_QUALITY;
+  }
+}
+
+/** Studio config directory for an explicit env object, else the ambient chain. */
+function studioOutDir(env?: Env): string {
+  const e = env ?? {};
+  const configured = String(e.MANHWA_OUT_DIR || e.PIPELINE_OUT_DIR || "").trim();
+  return resolveOutDir(configured || undefined);
+}
+
+/** Studio settings, or built-in defaults when the file is unreadable. */
+function studioSettingsOrDefaults(env?: Env): StudioSettings {
+  try {
+    return getStudioSettings(studioOutDir(env));
+  } catch {
+    return defaultStudioSettings();
+  }
+}
+
+function initialAutoRetry(env?: Env): { count: number; max: number; lastFailure: string | null } {
+  return { count: 0, max: studioSettingsOrDefaults(env).autoRetry.maxRetries, lastFailure: null };
+}
+
+function canAutoRetry(job: JobRecord, env?: Env): boolean {
+  const settings = studioSettingsOrDefaults(env).autoRetry;
+  return Boolean(job.autoRetry && typeof job.autoRetry === "object" && !Array.isArray(job.autoRetry)
+    && !job.stopRequested && settings.enabled && resolveEnv(env).MANHWA_AUTO_RETRY !== "0"
+    && Number.isInteger(job.autoRetry.count) && job.autoRetry.count >= 0
+    && job.autoRetry.count < settings.maxRetries);
+}
+
+function retryDelay(count: number, env?: Env): number {
+  const raw = resolveEnv(env).MANHWA_AUTO_RETRY_DELAYS_S;
+  const parsed = raw ? raw.split(",").map((v) => v.trim() === "" ? NaN : Number(v)) : [];
+  const delays = parsed.length && parsed.every((v) => Number.isFinite(v) && v >= 0)
+    ? parsed : [600, 1800, 3600];
+  return delays[Math.min(count, delays.length - 1)]!;
+}
+
+function autoResumeDelay(env?: Env): number {
+  const raw = resolveEnv(env).MANHWA_AUTO_RESUME_DELAY_S;
+  const value = raw === undefined || raw.trim() === "" ? 120 : Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : 120;
+}
+
+function queueAutoRetry(job: JobRecord, note: string, delay: number, env?: Env, resume = false): void {
+  const count = Number(job.autoRetry.count) + 1;
+  const max = studioSettingsOrDefaults(env).autoRetry.maxRetries;
+  job.autoRetry = { count, max, lastFailure: note };
+  job.status = "queued";
+  job.notBefore = Date.now() / 1000 + delay;
+  job.endedAt = null;
+  job.workerPid = null;
+  job.workerStartTicks = null;
+  job.runPid = null;
+  job.runStartTicks = null;
+  job.paused = false;
+  job.onlyUnrendered = true;
+  job.skipIngest = true;
+  job.statusNote = `${resume ? "Auto-resume" : "Auto-retry"} ${count} of ${max} · ${note}`;
+  appendJobLog(String(job.id), `${resume ? "AUTO-RESUME" : "AUTO-RETRY"} ${count}/${max} in ${delay}s: ${note}`, env);
+}
+
+/** Only reports written by this run can trigger a retry; stale failures are ignored. */
+function runFailures(sdir: string, chapters: string[], startedAt: number): Array<{ class: FailClass; error: unknown }> {
+  const failures: Array<{ class: FailClass; error: unknown }> = [];
+  for (const ch of chapters) {
+    try {
+      const reportPath = path.join(sdir, "out", ch, "report.json");
+      if (fs.statSync(reportPath).mtimeMs < startedAt * 1000) continue;
+      const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+      if (report.status !== "failed" && report.status !== "video-failed") continue;
+      const error = new Error(String(report.error ?? "Pipeline chapter failed"));
+      const classification = ["transient", "permanent", "unknown"].includes(report.class)
+        ? report.class as FailClass : failClass(error);
+      failures.push({ class: classification, error });
+    } catch {
+      // Missing or corrupt reports get the single unknown-failure retry below.
+    }
+  }
+  return failures;
+}
+
+/** Crash-safe completion check shared by extensions and retries. */
+function chapterFinished(sdir: string, ch: string, env?: Env): boolean {
+  try {
+    const out = path.join(sdir, "out", ch);
+    const video = path.join(out, "video", "video.mp4");
+    const stat = fs.statSync(video);
+    if (stat.size <= 0) return false;
+    let report: Record<string, unknown> = {};
+    const reportPath = path.join(out, "report.json");
+    if (fs.existsSync(reportPath)) report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+    if (report.status === "failed" || report.status === "video-failed") return false;
+    for (const script of ["script.md", "script_eleven.md", "script_voice.md"]) {
+      const scriptPath = path.join(out, script);
+      if (fs.existsSync(scriptPath) && stat.mtimeMs + 2000 < fs.statSync(scriptPath).mtimeMs) return false;
+    }
+    if (report.status === "ok") {
+      const probe = spawnSync("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", video], {
+        timeout: 3000, encoding: "utf8", env: childEnv(resolveEnv(env)), maxBuffer: 64 * 1024,
+      });
+      const duration = Number(probe.stdout?.trim());
+      if (probe.error || probe.status !== 0 || !Number.isFinite(duration) || duration <= 0) return false;
+    }
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -142,10 +263,12 @@ export const PUBLIC_STAGES = ["queued", "paused", "download", "extract", "pipeli
 export const DEFAULT_ORPHAN_MIN_AGE_S = 3600;
 export const DEFAULT_EXTERNAL_CATALOG_PATH = path.join(REPO_ROOT, "out", "config", "tts-providers.json");
 export const META_LOCK_FILENAME = "meta.lock";
+/** Voice discovery must never stall the catalog request this long. */
+export const CATALOG_DISCOVERY_TIMEOUT_MS = 2500;
 
 export const BUILTIN_EDGE_PROVIDER = {
   id: "edge",
-  label: "Edge TTS (Free, Default)",
+  label: "Edge",
   engine: "edge",
   provider: "edge-tts",
   revision: "1",
@@ -163,12 +286,11 @@ export const BUILTIN_EDGE_PROVIDER = {
 /** Google Vertex AI TTS: Chirp 3 HD + Gemini 3.8 Flash TTS voices. */
 export const BUILTIN_VERTEX_PROVIDER = {
   id: "vertex",
-  label: "Google Vertex AI TTS (Chirp 3 HD & Gemini 3.8)",
+  label: "Vertex",
   engine: "vertex",
   provider: "vertex-ai",
   revision: "1",
-  costNotice:
-    "Paid Google Cloud Vertex AI text-to-speech (Chirp 3 HD / Gemini 3.8 Flash TTS) plus LLM vision and writer quota.",
+  costNotice: "Paid narration billed to your Google Cloud project. Also uses LLM quota.",
   voices: VERTEX_TTS_VOICES.map((v) => ({
     id: v.id,
     label: v.label,
@@ -247,6 +369,10 @@ export interface TtsVoice {
   id: string;
   label: string;
   default: boolean;
+  /** Underlying model family id when the provider exposes one (Vertex). */
+  modelId?: string;
+  /** Human model name for grouped pickers. */
+  modelLabel?: string;
 }
 
 export interface RawTtsProvider {
@@ -276,11 +402,17 @@ export interface TtsSelection {
 }
 
 export interface PublicCatalog {
+  styleOptions: typeof STYLE_CATALOG;
+  ttsOptions: { speed: { min: number; max: number; step: number; description: string }; style: { description: string }; language: { description: string } };
   schemaVersion: number;
   defaultProvider: string;
   capabilities: Record<string, unknown>;
   providers: Array<Record<string, unknown>>;
   renderLanes: unknown;
+  /** Persisted Studio default quality for requests that omit it. */
+  defaultRenderQuality: RenderQuality;
+  /** Persisted Studio default lane for requests that omit it. */
+  defaultRenderLane: string;
   backgrounds: readonly string[];
   defaultBackground: string;
   motions: readonly string[];
@@ -311,6 +443,8 @@ export interface DownloadResult {
 }
 
 export interface EnqueueOptions {
+  style?: import('../config/seriesStyle.js').SeriesStyle;
+  tts?: import('zod').infer<typeof import('../config/seriesStyle.js').ttsStyleSchema>;
   title?: string | null;
   slug?: string | null;
   sourceType?: string | null;
@@ -344,6 +478,7 @@ export interface EnqueueOptions {
 
 export interface WorkerOptions {
   once?: boolean;
+  sleep?: (ms: number) => Promise<void>;
   repoRoot?: string;
   env?: Env;
   downloadFn?: (
@@ -516,6 +651,19 @@ function isDir(p: string): boolean {
 function isFile(p: string): boolean {
   try {
     return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A regular file that is not a symlink. Job metadata is untrusted: a crafted
+ * `stagedZipPath` must not make intake read an arbitrary host file through a link.
+ */
+function isPlainFilePath(p: string): boolean {
+  try {
+    const st = fs.lstatSync(p);
+    return st.isFile() && !st.isSymbolicLink();
   } catch {
     return false;
   }
@@ -816,6 +964,184 @@ export function existingChapterNumbers(sdir: string): number[] {
   return [...nums].sort((a, b) => a - b);
 }
 
+/** True when `target` is a job staging file (the only ZIPs cleanup may delete). */
+function isJobStagingPath(env: Env | undefined, target: string): boolean {
+  const uploads = path.resolve(path.join(jobsDir(env), "uploads"));
+  const resolved = path.resolve(target);
+  return path.dirname(resolved) === uploads;
+}
+
+/** A series' saved source that a later extension or retry can still read. */
+export interface RecoverableSeriesSource {
+  /** First archive; kept for callers that only need one file. */
+  zipPath: string | null;
+  /** Every archive to read, with the chapters each one supplies. */
+  sources: Array<{ path: string; chapters: number[] }>;
+  /** Requested chapters no saved source can supply. */
+  uncovered: number[];
+  /** Saved Drive file id that can be downloaded again. */
+  gdriveFileId: string | null;
+  jobId: string | null;
+  origin: "retained" | "job_staged" | "job_gdrive";
+  /** Union of the chapters the returned sources supply. */
+  chapters: number[];
+  sourceSummary: string;
+}
+
+/**
+ * Find saved sources for a series without touching the network.
+ *
+ * `chapters` is the set that is actually missing from disk (not the whole
+ * request): a series that already has ch1 must not be judged by whether its
+ * source also contains ch1. An empty list means "anything this series has".
+ *
+ * Order matters: a retained archive belongs to the series and survives job
+ * cleanup, so it wins over a per-job staging ZIP. A legacy job that still has a
+ * Drive file id is returned last; the caller downloads it (and may fail with an
+ * actionable re-upload request when the file is gone).
+ *
+ * A missing range may span several retained archives, so retained coverage is
+ * returned as a plan instead of one "best" file.
+ */
+export function findRecoverableSeriesSource(
+  slug: string,
+  chapters: number[] = [],
+  env?: Env,
+): RecoverableSeriesSource | null {
+  const wanted = [...new Set(chapters.map(Number).filter((n) => Number.isInteger(n) && n > 0))].sort((a, b) => a - b);
+  const sdir = path.join(seriesRoot(env), slug);
+  if (isDir(sdir)) {
+    // An empty request means "every chapter the series still has a source for".
+    const scope = wanted.length ? wanted : listRetainedSourceContents(sdir).flatMap((item) => item.chapters);
+    const plan = planRetainedExtraction(sdir, scope);
+    if (plan.steps.length) {
+      const primary = listRetainedSources(sdir).find((entry) => {
+        const step = plan.steps[0]!;
+        return path.join(seriesSourceDir(sdir), "archives", entry.file) === step.path;
+      });
+      const covered = [...new Set(plan.steps.flatMap((step) => step.chapters))].sort((a, b) => a - b);
+      return {
+        zipPath: plan.steps[0]!.path,
+        sources: plan.steps,
+        uncovered: plan.uncovered,
+        gdriveFileId: primary?.gdriveFileId ?? null,
+        jobId: primary?.jobId ?? null,
+        origin: "retained",
+        chapters: covered,
+        sourceSummary: primary?.sourceSummary || `Retained source ZIP (${plan.steps[0]!.path.split("/").pop()})`,
+      };
+    }
+  }
+  const jdir = jobsDir(env);
+  if (!isDir(jdir)) return null;
+  const jobs = loadPersistedJobs(jdir).filter((job) => String(job.slug) === slug);
+  for (const job of jobs) {
+    const staged = job.stagedZipPath ? String(job.stagedZipPath) : "";
+    // Job metadata is untrusted: refuse links in any component, not just the leaf.
+    if (!staged || pathHasSymlink(staged) || !isPlainFilePath(staged)) continue;
+    let nums: number[];
+    try {
+      nums = Object.keys(archiveIndex(staged, true)[1]).map(Number).sort((a, b) => a - b);
+    } catch {
+      continue;
+    }
+    if (wanted.length && !wanted.every((n) => nums.includes(n))) continue;
+    return {
+      zipPath: staged,
+      sources: [{ path: staged, chapters: nums }],
+      uncovered: [],
+      gdriveFileId: job.gdriveFileId ? String(job.gdriveFileId) : null,
+      jobId: String(job.id || ""),
+      origin: "job_staged",
+      chapters: nums,
+      sourceSummary: sanitizeLine(job.sourceSummary || `Staged ZIP (${path.basename(staged)})`),
+    };
+  }
+  for (const job of jobs) {
+    const fileId = job.gdriveFileId ? String(job.gdriveFileId) : "";
+    if (!GDRIVE_FILE_ID_RE.test(fileId)) continue;
+    return {
+      zipPath: null,
+      sources: [],
+      uncovered: wanted,
+      gdriveFileId: fileId,
+      jobId: String(job.id || ""),
+      origin: "job_gdrive",
+      chapters: [],
+      sourceSummary: sanitizeLine(job.sourceSummary || `Google Drive ZIP (file ID: ${fileId})`),
+    };
+  }
+  return null;
+}
+
+/**
+ * Delete a job's staging ZIP only after the series owns a verified copy of *this
+ * exact archive*.
+ *
+ * Coverage of the chapters ingested so far is not enough: importing ch1-5 into a
+ * series that already retained ch1-2 would otherwise delete the only copy of
+ * ch3-5 when the new retention failed. `retainedSha256` is the hash returned by
+ * the retention call that ran in this execution, and the durable file must still
+ * hash to it before the staging file is removed.
+ */
+function releaseStagingZip(
+  job: JobRecord,
+  zipPath: string | null,
+  sdir: string,
+  env: Env,
+  retainedSha256: string | null,
+): void {
+  if (!zipPath || !isFile(zipPath)) return;
+  if (!retainedSha256) return;
+  if (isRetainedSourcePath(sdir, zipPath)) return;
+  if (!isJobStagingPath(env, zipPath)) return;
+  if (!hasVerifiedRetainedCopy(sdir, retainedSha256)) return;
+  try {
+    fs.unlinkSync(zipPath);
+    job.stagedZipPath = null;
+  } catch {
+    // keep the path if unlink fails
+  }
+}
+
+/**
+ * Chapter numbers any saved *local* source can supply (retained archives and
+ * still-staged job ZIPs). Used to expand "all" without touching the network.
+ */
+function savedSourceChapters(slug: string, env?: Env): number[] {
+  const nums = new Set<number>();
+  const sdir = path.join(seriesRoot(env), slug);
+  if (isDir(sdir)) {
+    for (const item of listRetainedSourceContents(sdir)) for (const n of item.chapters) nums.add(n);
+  }
+  const jdir = jobsDir(env);
+  if (isDir(jdir)) {
+    for (const job of loadPersistedJobs(jdir)) {
+      if (String(job.slug) !== slug) continue;
+      const staged = job.stagedZipPath ? String(job.stagedZipPath) : "";
+      if (!staged || pathHasSymlink(staged) || !isPlainFilePath(staged)) continue;
+      try {
+        for (const key of Object.keys(archiveIndex(staged, true)[1])) nums.add(Number(key));
+      } catch {
+        // An unreadable staging ZIP contributes nothing.
+      }
+    }
+  }
+  return [...nums].sort((a, b) => a - b);
+}
+
+/** A retained archive whose bytes still hash to `sha256`, with its file present. */
+function hasVerifiedRetainedCopy(sdir: string, sha256: string): boolean {
+  const entry = listRetainedSources(sdir).find((item) => item.sha256 === sha256);
+  if (!entry) return false;
+  const file = path.join(seriesSourceDir(sdir), "archives", entry.file);
+  try {
+    return isFile(file) && fs.statSync(file).size === entry.bytes && hashFile(file) === sha256;
+  } catch {
+    return false;
+  }
+}
+
 function loadJobFile(filePath: string): JobRecord | null {
   try {
     const data = JSON.parse(fs.readFileSync(filePath, "utf8")) as JobRecord;
@@ -903,11 +1229,13 @@ function activeConflictFor(slug: string, excludeId: string | null, env?: Env): J
   return null;
 }
 
-function resetJobForRerun(job: JobRecord, note: string): JobRecord {
+function resetJobForRerun(job: JobRecord, note: string, env?: Env): JobRecord {
   const now = Date.now() / 1000;
   job.status = "queued";
   job.statusNote = note;
   job.error = null;
+  job.notBefore = null;
+  job.autoRetry = initialAutoRetry(env);
   job.endedAt = null;
   job.startedAt = null;
   job.workerPid = null;
@@ -960,7 +1288,8 @@ export function publicCapabilities(env?: Env): Record<string, unknown> {
       description:
         "Optional per-job render lane pin. 'inherit' follows the global render " +
         "policy. A pinned lane must be configured on this server and enabled by " +
-        "the global policy; it never falls back to another lane.",
+        "the global policy; it never falls back to another lane. An omitted value " +
+        "uses the Studio defaultRenderLane setting.",
     },
     progress: {
       stages: [...PUBLIC_STAGES],
@@ -1045,13 +1374,66 @@ export function renderLaneOptions(repoRoot = REPO_ROOT, env?: Env): unknown {
   return renderOverrideOptions(renderExecutionEnv(repoRoot, env));
 }
 
+/** Studio-wide default lane for requests that omit `renderLane`. */
+function studioDefaultRenderLane(env?: Env): string {
+  try {
+    const settings = getStudioSettings(studioOutDir(env));
+    return String(settings.defaultRenderLane || OVERRIDE_INHERIT);
+  } catch {
+    return OVERRIDE_INHERIT;
+  }
+}
+
+/**
+ * Resolve the lane a new job persists.
+ *
+ * An explicit request (including an explicit `inherit`) always wins. An omitted
+ * value uses the persisted Studio default and is validated like any other lane:
+ * if that lane is unavailable the request fails with an actionable error rather
+ * than silently dispatching to a different machine.
+ */
+export function resolveRequestedRenderLane(raw: unknown, env?: Env, repoRoot = REPO_ROOT): string {
+  const explicit = raw !== null && raw !== undefined && String(raw).trim() !== "";
+  if (explicit) return resolveRenderLane(raw, env, repoRoot);
+  const stored = studioDefaultRenderLane(env);
+  if (stored === OVERRIDE_INHERIT) return OVERRIDE_INHERIT;
+  try {
+    return resolveRenderLane(stored, env, repoRoot);
+  } catch (err) {
+    if (err instanceof IntakeError) {
+      throw new IntakeError(
+        `Studio default render lane ${pyReprStr(stored)} is not available: ${sanitizeLine(err.message)}. ` +
+          "Choose another lane for this job, or update the Studio default lane.",
+        409,
+      );
+    }
+    throw err;
+  }
+}
+
+/** Lane id grammar a saved job pin may carry (matches the Studio settings validation). */
+const SAVED_LANE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/**
+ * Canonical lane selector for a job.
+ *
+ * A syntactically valid saved pin is preserved even when its node is no longer
+ * registered. Demoting it to `inherit` here would let a pinned job silently
+ * dispatch to another machine, so availability is enforced separately by
+ * `renderLaneRecheck` before any run starts. Absent, legacy-empty or malformed
+ * values still inherit.
+ */
 export function renderLaneEnv(job: JobRecord | null | undefined, env?: Env): string {
   void env;
+  const raw = job?.renderLane;
   try {
-    return normalizeRenderLane(job?.renderLane);
+    return normalizeRenderLane(raw);
   } catch (err) {
-    if (err instanceof RenderOverrideError) return OVERRIDE_INHERIT;
-    throw err;
+    if (!(err instanceof RenderOverrideError)) throw err;
+    if (typeof raw !== "string") return OVERRIDE_INHERIT;
+    const saved = raw.trim().toLowerCase();
+    if (!saved || !SAVED_LANE_ID_RE.test(saved)) return OVERRIDE_INHERIT;
+    return saved;
   }
 }
 
@@ -1062,7 +1444,16 @@ function renderLaneRecheck(job: JobRecord, env?: Env, repoRoot = REPO_ROOT): [bo
     checkRenderLaneAvailable(selector, renderExecutionEnv(repoRoot, env));
     return [true, null];
   } catch (err) {
-    if (err instanceof RenderOverrideError) return [false, sanitizeLine(err)];
+    if (err instanceof RenderOverrideError) {
+      const detail = sanitizeLine(err.message);
+      // A saved pin whose node was removed or disabled fails during selector
+      // normalization, not the availability probe; say what the operator must fix.
+      const reason = /unknown render lane/i.test(detail)
+        ? `render lane ${pyReprStr(selector)} is no longer configured on this host ` +
+          "(its node was removed or disabled)"
+        : detail;
+      return [false, reason];
+    }
     throw err;
   }
 }
@@ -1280,6 +1671,10 @@ function titleCase(s: string): string {
 function resolveExternalCatalogPath(e: Env): { path: string | null; explicit: boolean } {
   const explicit = String(e.MANHWA_TTS_CATALOG || "").trim();
   if (explicit) return { path: explicit, explicit: true };
+  // Use the same directory resolution as Studio settings (including the ambient
+  // lane-config/jobs-dir fallback), so adapters and settings never disagree.
+  const configuredPath = path.join(studioOutDir(e), "config", "tts-providers.json");
+  if (isFile(configuredPath)) return { path: configuredPath, explicit: false };
   if (isFile(DEFAULT_EXTERNAL_CATALOG_PATH)) return { path: DEFAULT_EXTERNAL_CATALOG_PATH, explicit: false };
   return { path: null, explicit: false };
 }
@@ -1287,12 +1682,12 @@ function resolveExternalCatalogPath(e: Env): { path: string | null; explicit: bo
 /** Built-in provider entry for a Studio-connected Grok / xAI TTS account. */
 export const BUILTIN_GROK_PROVIDER = {
   id: "grok",
-  label: "xAI Grok TTS (Studio subscription)",
+  label: "Grok",
   engine: "grok",
   provider: "grok-subscription-tts",
   revision: "1",
   costNotice:
-    "Uses the connected xAI Grok subscription for narration plus LLM vision and writer quota.",
+    "Paid xAI Grok TTS billed to the connected subscription; LLM vision and writer quota also apply.",
   voices: [] as Array<{ id: string; label: string; default: boolean }>,
 } as const;
 
@@ -1316,6 +1711,8 @@ function vertexCatalogProvider(e: Env): RawTtsProvider {
     id: v.id,
     label: v.label,
     default: Boolean(v.default),
+    modelId: v.modelId,
+    modelLabel: v.modelLabel,
   }));
   if (voices.length > 0 && !voices.some((v) => v.default)) voices[0]!.default = true;
   return {
@@ -1360,10 +1757,14 @@ export function loadRawTtsProviders(env?: Env): RawTtsProvider[] {
           const vr = v as Record<string, unknown>;
           const id = String(vr.id || "").trim();
           if (!id) continue;
+          const modelId = String(vr.modelId || "").trim();
+          const modelLabel = String(vr.modelLabel || "").trim();
           voices.push({
             id,
             label: String(vr.label || id).trim(),
             default: Boolean(vr.default),
+            ...(modelId ? { modelId } : {}),
+            ...(modelLabel ? { modelLabel } : {}),
           });
         }
         if (voices.length === 0) continue;
@@ -1532,21 +1933,37 @@ export async function getCatalog(repoRoot = REPO_ROOT, env?: Env): Promise<Publi
   const e = resolveEnv(env);
   const envRec = e as NodeJS.ProcessEnv;
   // Refresh the Studio-discovered voice lists when they are not cached yet. A
-  // discovery failure (offline, missing scope) keeps the built-in catalog and
-  // never fails the request.
-  if (hasVertexTtsCredentials(envRec).available && readCachedVertexTtsVoices(envRec) === null) {
+  // discovery failure (offline, missing scope, slow API) keeps the built-in
+  // catalog and never fails or stalls the request: the static Chirp and Gemini
+  // voices are already in the list.
+  const refresh = async (task: () => Promise<unknown>) => {
+    let pending: Promise<unknown>;
     try {
-      await discoverVertexTtsVoices(envRec);
+      pending = task();
     } catch {
-      // keep the static Chirp list
+      return;
     }
+    // The losing promise must never surface as an unhandled rejection.
+    pending.catch(() => {});
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        pending,
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, CATALOG_DISCOVERY_TIMEOUT_MS);
+        }),
+      ]);
+    } catch {
+      // keep the static catalog
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  if (hasVertexTtsCredentials(envRec).available && readCachedVertexTtsVoices(envRec) === null) {
+    await refresh(() => discoverVertexTtsVoices(envRec));
   }
   if (hasGrokTtsCredentials(envRec) && readCachedGrokTtsVoices(envRec) === null) {
-    try {
-      await discoverGrokTtsVoices(envRec);
-    } catch {
-      // keep the fallback list
-    }
+    await refresh(() => discoverGrokTtsVoices(envRec));
   }
   const providers = loadRawTtsProviders(env);
   const publicProviders: Array<Record<string, unknown>> = [];
@@ -1564,16 +1981,26 @@ export async function getCatalog(repoRoot = REPO_ROOT, env?: Env): Promise<Publi
       voices: p.voices,
     });
   }
+  const settings = studioSettingsOrDefaults(env);
   return {
     schemaVersion: 1,
     defaultProvider: "edge",
     capabilities: publicCapabilities(env),
     providers: publicProviders,
     renderLanes: renderLaneOptions(repoRoot, env),
+    // New intake requests inherit these when they omit the field.
+    defaultRenderQuality: settings.renderQuality,
+    defaultRenderLane: settings.defaultRenderLane,
     backgrounds: [...BACKGROUNDS],
     defaultBackground: DEFAULT_BACKGROUND,
     motions: [...MOTIONS],
     defaultMotion: DEFAULT_MOTION,
+    styleOptions: STYLE_CATALOG,
+    ttsOptions: {
+      speed: { min: 0.5, max: 2, step: 0.05, description: 'Speaking rate; 1 is normal. Provider support varies.' },
+      style: { description: 'Voice direction for external TTS providers; ignored by engines without style support.' },
+      language: { description: 'TTS language code; provider support varies.' },
+    },
     limits: {
       maxZipBytes: MAX_ZIP_BYTES,
       maxUncompressedBytes: MAX_TOTAL_UNCOMPRESSED_BYTES,
@@ -2275,6 +2702,7 @@ function saveJob(job: JobRecord, env?: Env): JobRecord {
     }
     if (job.stopRequested) {
       job.status = "interrupted";
+      job.notBefore = null;
       job.paused = false;
       job.statusNote = "Stopped by user; completed chapters and caches are preserved";
     }
@@ -2288,6 +2716,7 @@ function saveJob(job: JobRecord, env?: Env): JobRecord {
 function availableActions(job: JobRecord): string[] {
   const st = job.status;
   const acts: string[] = [];
+  if (st === "queued" && Number(job.notBefore) > Date.now() / 1000) acts.push("retry", "pause", "stop", "cancel");
   if ((RECOVERABLE_JOB_STATES as readonly string[]).includes(st)) acts.push("retry");
   if ((CONTINUABLE_JOB_STATES as readonly string[]).includes(st)) acts.push("continue");
   // Live controls travel with the job so a client can render buttons from one field.
@@ -2332,6 +2761,9 @@ export function publicJobView(job: JobRecord, includeLogs = true, env?: Env): Re
     stage: job.paused ? "paused" : STAGE_BY_STATUS[job.status] || "unknown",
     progress: publicProgress(job),
     retryCount: Number(job.retryCount || 0),
+    notBefore: job.notBefore ?? null,
+    autoRetry: job.autoRetry ?? null,
+    failureDetail: job.failureDetail ? sanitizeLine(job.failureDetail, 500) : null,
     actions: availableActions(job),
     controlActions: job.status === "paused" || (job.status === "running" && job.paused)
       ? ["resume", "stop"] : ["queued", "running"].includes(job.status) ? ["pause", "stop"] : [],
@@ -2407,13 +2839,22 @@ function reconcileJobsLocked(jdir: string, env?: Env): JobRecord[] {
             `Job was in '${state}' state when its worker process terminated unexpectedly. ` +
             "Marked interrupted to prevent duplicate execution.";
         }
+        // Any reconcile, including a status poll or the server watchdog, requeues a
+        // run whose worker died: nothing else would, so it would stay stuck until the
+        // next restart. A live worker records the exit itself, so it is left alone.
+        if (state === "running" && !wAlive && canAutoRetry(job, env)) {
+          queueAutoRetry(job, "run stopped unexpectedly", autoResumeDelay(env), env, true);
+        }
         appendJobLog(
           String(job.id),
-          `RECONCILE: job marked interrupted (previous state=${state}, workerPid=${job.workerPid}, runPid=${job.runPid})`,
+          `RECONCILE: job ${job.status === "queued" ? "requeued for auto-resume" : "marked interrupted"} (previous state=${state}, workerPid=${job.workerPid}, runPid=${job.runPid})`,
           env,
         );
         const staged = job.stagedZipPath;
-        if (staged && (state === "downloading" || state === "ingesting") && isFile(String(staged))) {
+        // A partial Drive download is unusable and safe to drop. An interrupted
+        // ingest keeps its ZIP: it may be the only copy of chapters that were not
+        // selected, and retry still imports from it.
+        if (staged && state === "downloading" && isFile(String(staged))) {
           try {
             fs.unlinkSync(String(staged));
           } catch {
@@ -2488,7 +2929,7 @@ export function spawnWorkerIfNeeded(repoRoot = REPO_ROOT, env?: Env): boolean {
   const hasQueued = fs.readdirSync(jdir).some((name) => {
     if (!name.endsWith(".json")) return false;
     const job = loadJobFile(path.join(jdir, name));
-    return job?.status === "queued" && !laneBlocksJob(job, e);
+    return job?.status === "queued";
   });
   if (!hasQueued || isWorkerLockHeld(e)) return false;
   try {
@@ -2529,6 +2970,10 @@ function moveFile(src: string, dest: string): void {
 }
 
 export async function enqueueJob(opts: EnqueueOptions = {}): Promise<Record<string, unknown>> {
+  const parsedStyle = seriesStyleSchema.optional().safeParse(opts.style);
+  const parsedTts = ttsStyleSchema.optional().safeParse(opts.tts);
+  if (!parsedStyle.success) throw new IntakeError(validationMessage(parsedStyle.error));
+  if (!parsedTts.success) throw new IntakeError(validationMessage(parsedTts.error));
   const env = resolveEnv(opts.env);
   const repoRoot = opts.repoRoot || opts.repo_root || REPO_ROOT;
   const jdir = ensureDir(jobsDir(env));
@@ -2553,8 +2998,11 @@ export async function enqueueJob(opts: EnqueueOptions = {}): Promise<Record<stri
     throw new IntakeError(`Unknown motion preset ${pyReprStr(moNorm)} (allowed: ${MOTIONS.join(", ")})`);
   }
   const ttsResolved = await resolveTtsSelection(opts.provider || "edge", opts.voice, repoRoot, env, true);
-  const renderLaneNorm = resolveRenderLane(opts.renderLane ?? opts.render_lane ?? null, env, repoRoot);
-  // Persist only an explicit request; an absent value resolves from Studio settings at run time.
+  Object.assign(ttsResolved.metaTts, parsedTts.data);
+  const renderLaneNorm = resolveRequestedRenderLane(opts.renderLane ?? opts.render_lane ?? null, env, repoRoot);
+  // The lane is resolved now: an explicit request wins, an omitted one uses the
+  // Studio default, and the resulting id is what this job pins. Quality stays
+  // null unless requested, so a later Studio change still applies at run time.
   const rawRenderQuality = opts.renderQuality ?? opts.render_quality ?? null;
   const renderQualityNorm = rawRenderQuality === null || String(rawRenderQuality).trim() === ""
     ? null
@@ -2668,6 +3116,7 @@ export async function enqueueJob(opts: EnqueueOptions = {}): Promise<Record<stri
           metaTts: ttsResolved.metaTts,
         },
         visuals: { background: bgNorm, motion: moNorm },
+        ...(parsedStyle.data ? { style: parsedStyle.data } : {}),
         renderLane: renderLaneNorm,
         renderQuality: renderQualityNorm,
         outroConfig: opts.outroConfig ?? null,
@@ -2681,6 +3130,7 @@ export async function enqueueJob(opts: EnqueueOptions = {}): Promise<Record<stri
         runPid: null,
         runStartTicks: null,
         error: null,
+        autoRetry: initialAutoRetry(env),
         logTail: [],
       };
       appendJobLog(
@@ -2732,8 +3182,10 @@ export async function createJob(opts: EnqueueOptions = {}): Promise<Record<strin
     repoRoot,
     env,
   );
-  const renderLane = resolveRenderLane(opts.renderLane, env, repoRoot);
-  // Persist only an explicit request; an absent value resolves from Studio settings at run time.
+  const renderLane = resolveRequestedRenderLane(opts.renderLane, env, repoRoot);
+  // The lane is resolved now: an explicit request wins, an omitted one uses the
+  // Studio default. Quality stays null unless requested, so a later Studio
+  // change still applies when the run resolves its quality.
   const rawRenderQuality = opts.renderQuality ?? opts.render_quality ?? null;
   const renderQuality = rawRenderQuality === null || String(rawRenderQuality).trim() === ""
     ? null
@@ -2777,6 +3229,7 @@ export async function createJob(opts: EnqueueOptions = {}): Promise<Record<strin
       createdBy: opts.createdBy || "cli", createdAt: now, updatedAt: now, startedAt: null, endedAt: null,
       workerPid: null, workerStartTicks: null, runPid: null, runStartTicks: null, error: null, logTail: [],
       outroConfig: opts.outroConfig ?? null,
+      autoRetry: initialAutoRetry(env),
     };
     appendJobLog(current.id, `Extension queued: chapters=${spec}`, env);
     return saveJob(current, env);
@@ -2835,6 +3288,7 @@ export function stopJob(jobId: string, env?: Env): Record<string, unknown> {
       throw new ConflictError("Only queued, paused or running jobs can be stopped");
     }
     current.stopRequested = true;
+    current.notBefore = null;
     current.paused = false;
     current.controlRevision = Number(current.controlRevision || 0) + 1;
     current.status = "interrupted";
@@ -2845,58 +3299,35 @@ export function stopJob(jobId: string, env?: Env): Record<string, unknown> {
   return publicJobView(job, true, env);
 }
 
-function laneControlsFile(env?: Env, outDir?: string): string {
-  const e = resolveEnv(env);
-  return path.join(outDir || e.MANHWA_OUT_DIR || e.PIPELINE_OUT_DIR || (e.PIPELINE_LOG ? path.dirname(e.PIPELINE_LOG) : resolveOutDir()), "config", "lane-controls.json");
-}
-
-function readLaneControls(env?: Env, outDir?: string): Record<string, { paused: boolean; updatedAt: number }> {
-  try { return JSON.parse(fs.readFileSync(laneControlsFile(env, outDir), "utf8")).lanes || {}; }
-  catch { return {}; }
-}
-
-function laneBlocksJob(job: JobRecord, env?: Env): boolean {
-  const lanes = readLaneControls(env);
-  const selector = renderLaneEnv(job, env);
-  // An inherited run can dispatch to any enabled lane; hold it while any lane is paused.
-  return selector === "inherit" ? Object.values(lanes).some((l) => l.paused) : Boolean(lanes[selector]?.paused);
-}
-
-/** Controls queue dispatch and active intake-owned pipeline groups, not unrelated host processes. */
-export function controlRenderLane(laneId: string, action: "pause" | "resume" | "stop", env?: Env, outDir?: string) {
-  if (!getRegisteredNodes(outDir).some((n) => n.id === laneId) && !["local", "laptop", "cloud"].includes(laneId)) throw new IntakeError("Unknown render lane", 404);
-  return withJobMetaLock(env, () => {
-    const lanes = readLaneControls(env, outDir);
-    if (action !== "stop") {
-      lanes[laneId] = { paused: action === "pause", updatedAt: Date.now() / 1000 };
-      atomicWriteJson(laneControlsFile(env, outDir), { schemaVersion: 1, lanes });
-    }
-    const affectedJobs: string[] = [];
-    const errors: Array<{ jobId: string; error: string }> = [];
-    for (const job of reconcileJobs(env)) {
-      const selector = renderLaneEnv(job, env);
-      if (selector !== laneId && selector !== "inherit") continue;
-      try {
-        const pausedByLane: string[] = Array.isArray(job.pausedByLane) ? job.pausedByLane : [];
-        if (action === "pause" && ["queued", "paused", "running"].includes(job.status)) {
-          if (job.paused && !pausedByLane.length) continue; // Preserve a user's independent pause.
-          pauseJob(String(job.id), env);
-          const current = loadJob(job.id, env);
-          current.pausedByLane = [...new Set([...pausedByLane, laneId])];
-          saveJob(current, env);
-        } else if (action === "resume" && pausedByLane.includes(laneId)) {
-          job.pausedByLane = pausedByLane.filter((id) => id !== laneId);
-          saveJob(job, env);
-          if (!job.pausedByLane.length && job.paused) resumeJob(String(job.id), env);
-        } else if (action === "stop" && job.status === "running") stopJob(String(job.id), env);
-        else continue;
-        affectedJobs.push(String(job.id));
-      } catch (err) { errors.push({ jobId: String(job.id), error: sanitizeLine((err as Error).message) }); }
-    }
-    if (action === "resume") spawnWorkerIfNeeded(REPO_ROOT, env);
-    return { ok: errors.length === 0, laneId, action, paused: Boolean(lanes[laneId]?.paused), affectedJobs, errors,
-      scope: "Intake-owned pipeline process groups; inherited jobs are held conservatively" };
-  });
+/**
+ * Legacy lane-wide controls were retired: a lane selector is a placement hint,
+ * not a switchboard. Pausing/stopping a lane silently paused or killed every
+ * job that inherited it, including user-started runs, so the endpoint now
+ * refuses without touching any job. Per-run pause/resume/stop remain the only
+ * supported controls.
+ */
+export function controlRenderLane(
+  laneId: string,
+  action: "pause" | "resume" | "stop",
+  env?: Env,
+  outDir?: string,
+): Record<string, unknown> {
+  void env;
+  void outDir;
+  return {
+    ok: false,
+    supported: false,
+    statusCode: 409,
+    code: "lane_control_unsupported",
+    laneId: String(laneId || ""),
+    action,
+    paused: null,
+    affectedJobs: [],
+    errors: [],
+    error:
+      "Lane-wide pause/resume/stop is not supported. Control the run that is active: " +
+      "use /api/intake/jobs/<id>/pause, /resume or /stop. No job was changed.",
+  };
 }
 
 async function waitForExternalRuns(job: JobRecord, env?: Env, pollInterval = 2, maxWaitS: number | null = null): Promise<void> {
@@ -2982,14 +3413,25 @@ export async function executeSingleJob(
   job.workerPid = myPid;
   job.workerStartTicks = getProcStartTicks(myPid);
   job.startedAt = Date.now() / 1000;
+  job.notBefore = null;
+  job.failureDetail = null;
   job.error = null;
   let createdSeriesDir = false;
-  let zipToIngest: string | null = job.stagedZipPath ? String(job.stagedZipPath) : null;
+  const stagedFromJob = job.stagedZipPath ? String(job.stagedZipPath) : "";
+  let zipToIngest: string | null = stagedFromJob || null;
   const cleanupZipAfter = job.sourceType === "gdrive" || job.sourceType === "upload";
   const skipIngest = Boolean(job.skipIngest);
   let ingestedNames: string[] = [];
+  // Hash of the archive retained in this execution, if retention succeeded.
+  let retainedSha256: string | null = null;
 
   try {
+    // Job metadata is untrusted: never follow a symlinked staging path (or parent).
+    if (stagedFromJob && pathHasSymlink(stagedFromJob)) {
+      throw new IntakeError(
+        "This job's staging ZIP path contains a symbolic link; re-upload the archive to continue.",
+      );
+    }
     const [laneOk, laneWhy] = renderLaneRecheck(job, env, repoRoot);
     if (!laneOk) {
       throw new IntakeError(
@@ -3109,37 +3551,134 @@ export async function executeSingleJob(
         if (err instanceof ZipValidationError || err instanceof SystemExit) throw new IntakeError(String(err.message || err));
         throw err;
       }
-      const target = parseChapterSpec(String(job.chapters ?? "all"), idx);
+      // The pinned run set is authoritative: continue/retry already resolved it
+      // against every source, and `job.chapters` may still say "all" while the
+      // request only covers part of this archive.
+      const pinnedRun = Array.isArray(job.runChapters)
+        ? [...new Set((job.runChapters as unknown[]).map(Number))]
+          .filter((n) => Number.isInteger(n) && n > 0)
+          .sort((a, b) => a - b)
+        : [];
+      const target = pinnedRun.length ? pinnedRun : parseChapterSpec(String(job.chapters ?? "all"), idx);
+      const onDiskBefore = new Set(existingChapterNumbers(sdir));
       const valid = target.filter((c) => c in idx);
-      if (valid.length === 0) {
+      if (valid.length === 0 && !target.some((c) => onDiskBefore.has(c))) {
         const avail = Object.keys(idx).map(Number).sort((a, b) => a - b).map((c) => `ch${c}`).join(", ");
         throw new IntakeError(
           `No matching chapters found in archive for spec ${pyReprStr(String(job.chapters))} (archive has: ${avail})`,
         );
       }
       createdSeriesDir = !seriesPreExisted;
+      // Keep the complete archive inside the series before extracting a subset.
+      // The user may have selected ch1 of a ch1-5 ZIP; the other four chapters must
+      // still be importable by "Add chapters" later.
+      try {
+        const retained = retainSourceArchive(sdir, String(zipToIngest), {
+          sourceType: String(job.sourceType || "local_zip"),
+          sourceSummary: String(job.sourceSummary || ""),
+          gdriveFileId: job.gdriveFileId ? String(job.gdriveFileId) : null,
+          jobId,
+        });
+        retainedSha256 = retained.sha256;
+        job.sourceArchivePath = path.join(sdir, "out", "source", "archives", retained.file);
+        job.sourceChapters = retained.chapters;
+        appendJobLog(
+          jobId,
+          `STAGE source: retained ${retained.chapters.length} chapter(s) in out/source (${describeRetainedSources(sdir)})`,
+          env,
+        );
+      } catch (err) {
+        // Ingest can still finish from the staged ZIP, but the unselected chapters
+        // are only safe while that ZIP exists, so say so instead of failing silently.
+        appendJobLog(
+          jobId,
+          `STAGE source warning: could not retain the source archive (${sanitizeLine(err)}); ` +
+            "unselected chapters are not yet saved for a later extension",
+          env,
+        );
+      }
       const ttsMeta = (job.tts && job.tts.metaTts) || { engine: "edge" };
       const visuals = job.visuals || {};
-      let doneNums: number[];
+      // A missing range may span several retained archives. Extract the primary
+      // archive first, then every extra step recorded by retry/continue.
+      const plan: Array<{ path: string; chapters: number[] }> = [{ path: String(zipToIngest), chapters: target }];
+      const extra = Array.isArray(job.sourceArchives) ? job.sourceArchives : [];
+      for (const step of extra) {
+        if (!step || typeof step !== "object") continue;
+        const stepPath = String((step as Record<string, unknown>).path || "");
+        if (!stepPath || path.resolve(stepPath) === path.resolve(String(zipToIngest))) continue;
+        // These paths come from job metadata: refuse links in any component
+        // before the file is opened.
+        if (pathHasSymlink(stepPath)) {
+          throw new IntakeError("A source archive path contains a symbolic link; re-add the ZIP to continue.");
+        }
+        const wanted = Array.isArray((step as Record<string, unknown>).chapters)
+          ? ((step as Record<string, unknown>).chapters as unknown[]).map(Number).filter((n) => target.includes(n))
+          : [];
+        if (wanted.length) plan.push({ path: stepPath, chapters: wanted });
+      }
+      // Read every step's index before extracting: the whole request must be
+      // covered, or the run is refused instead of silently skipping chapters.
+      let steps: Array<{ path: string; chapters: number[]; idx: Record<number, unknown> }>;
       try {
-        doneNums = ingest(slug, {
-          chapters: valid,
-          force: false,
-          zipPath: zipToIngest,
-          engine: String(ttsMeta.engine || "edge"),
-          voiceId: ttsMeta.voice_id ? String(ttsMeta.voice_id) : null,
-          background: String(visuals.background || DEFAULT_BACKGROUND),
-          motion: String(visuals.motion || DEFAULT_MOTION),
-          interactive: false,
-          ttsConfig: ttsMeta,
-          title: job.title ? String(job.title) : null,
-          seriesRoot: sRoot,
-        });
+        steps = plan.map((step, i) => ({
+          ...step,
+          idx: i === 0 ? idx : (archiveIndex(step.path, true)[1] as Record<number, unknown>),
+        }));
       } catch (err) {
         if (err instanceof ZipValidationError || err instanceof SystemExit) throw new IntakeError(err.message);
         throw err;
       }
-      if (!doneNums.length) throw new IntakeError("Ingest extracted 0 chapters from ZIP archive");
+      const available = new Set<number>(onDiskBefore);
+      for (const step of steps) for (const key of Object.keys(step.idx)) available.add(Number(key));
+      const absent = target.filter((n) => !available.has(n));
+      if (absent.length) {
+        const shown = [...available].sort((a, b) => a - b).map((n) => `ch${n}`).join(", ") || "none";
+        throw new IntakeError(
+          `Chapter(s) ${absent.map((n) => `ch${n}`).join(", ")} are neither extracted under ${sdir} nor present in the ` +
+            `source archive(s) (available: ${shown}). Nothing was run; re-add them with the original ZIP.`,
+        );
+      }
+      const doneSet = new Set<number>();
+      for (const step of steps) {
+        try {
+          const onDiskNow = new Set(existingChapterNumbers(sdir));
+          const take = step.chapters.filter((n) => n in step.idx && !onDiskNow.has(n));
+          if (!take.length) continue;
+          for (const n of ingest(slug, {
+            chapters: take,
+            force: false,
+            zipPath: step.path,
+            engine: String(ttsMeta.engine || "edge"),
+            voiceId: ttsMeta.voice_id ? String(ttsMeta.voice_id) : null,
+            background: String(visuals.background || DEFAULT_BACKGROUND),
+            motion: String(visuals.motion || DEFAULT_MOTION),
+            interactive: false,
+            ttsConfig: ttsMeta,
+            style: job.style ? seriesStyleSchema.parse(job.style) : undefined,
+            title: job.title ? String(job.title) : null,
+            seriesRoot: sRoot,
+          })) doneSet.add(n);
+        } catch (err) {
+          if (err instanceof ZipValidationError || err instanceof SystemExit) throw new IntakeError(err.message);
+          throw err;
+        }
+      }
+      if (job.style) {
+        const metaPath = path.join(sdir, 'meta.json');
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        meta.style = { ...meta.style, ...seriesStyleSchema.parse(job.style) };
+        atomicWriteJson(metaPath, meta, sdir);
+      }
+      const doneNums = [...doneSet].sort((a, b) => a - b);
+      const afterIngest = new Set(existingChapterNumbers(sdir));
+      const stillMissing = target.filter((n) => !afterIngest.has(n));
+      if (stillMissing.length) {
+        throw new IntakeError(
+          `Ingest could not extract chapter(s) ${stillMissing.map((n) => `ch${n}`).join(", ")} from the source archive. Nothing was run.`,
+        );
+      }
+      if (!doneNums.length) appendJobLog(jobId, "STAGE ingest: every requested chapter was already extracted", env);
       chownTree(sdir, sRoot);
       const allNums = [...new Set([...existingChapterNumbers(sdir), ...doneNums])].sort((a, b) => a - b);
       ingestedNames = allNums.map((n) => `ch${n}`);
@@ -3150,12 +3689,7 @@ export async function executeSingleJob(
         env,
       );
       if (cleanupZipAfter && zipToIngest && isFile(zipToIngest)) {
-        try {
-          fs.unlinkSync(zipToIngest);
-          job.stagedZipPath = null;
-        } catch {
-          // keep the path if unlink fails
-        }
+        releaseStagingZip(job, zipToIngest, sdir, env, retainedSha256);
       }
     }
 
@@ -3216,10 +3750,7 @@ export async function executeSingleJob(
     }
     if (runNames.length === 0) throw new IntakeError("No chapters selected to run");
     if (job.onlyUnrendered) {
-      runNames = runNames.filter((ch) => {
-        try { return fs.statSync(path.join(sdir, "out", ch, "video", "video.mp4")).size === 0; }
-        catch { return true; }
-      });
+      runNames = runNames.filter((ch) => !chapterFinished(sdir, ch, env));
       if (!runNames.length) {
         job.status = "completed";
         job.statusNote = "All selected chapters already have videos; no chapters rerun";
@@ -3246,6 +3777,7 @@ export async function executeSingleJob(
 
     let lastSave = performance.now();
     let lastErr: string | null = null;
+    const runStartedAt = Date.now() / 1000;
     const proc = spawn(cmd[0]!, cmd.slice(1), {
       cwd: repoRoot,
       env: childEnv(pEnv),
@@ -3263,6 +3795,7 @@ export async function executeSingleJob(
       if (!clean) return;
       appendJobLog(jobId, clean, env);
       if (clean.includes("FAILED") || clean.includes("!!") || clean.includes("Error")) lastErr = clean;
+      if (/!!\s+ch\d+\s+FAILED\b/.test(clean)) job.failureDetail = clean;
       if (clean.startsWith("== ch")) {
         job.statusNote = clean;
         const mCh = /^== (ch\d+)/.exec(clean);
@@ -3295,6 +3828,10 @@ export async function executeSingleJob(
             nl = buf.indexOf("\n");
           }
         });
+        stream.on("end", () => {
+          if (buf) onLine(buf);
+          buf = "";
+        });
       };
       bind(proc.stdout);
       bind(proc.stderr);
@@ -3314,6 +3851,18 @@ export async function executeSingleJob(
       job.error = lastErr || `Pipeline run exited with code ${rc}`;
       job.statusNote = `Pipeline failed (exit code ${rc})`;
       appendJobLog(jobId, `STAGE failed: rc=${rc} error=${job.error}`, env);
+      // Re-read live controls before deciding: a stop must never queue another run.
+      job.stopRequested = Boolean(job.stopRequested || loadJob(jobId, env).stopRequested);
+      if (canAutoRetry(job, env)) {
+        const failures = runFailures(sdir, runNames, runStartedAt);
+        const transient = failures.find((f) => f.class === "transient");
+        const unknown = failures.find((f) => f.class === "unknown");
+        if (transient || ((!failures.length || unknown) && job.autoRetry.count < 1)) {
+          const triggering = transient ?? unknown;
+          queueAutoRetry(job, failureNote(triggering?.error ?? new Error(`Pipeline run exited with code ${rc}`)),
+            retryDelay(job.autoRetry.count, env), env);
+        }
+      }
     }
     saveJob(job, env);
     if (rc === 0 && job.outroConfig?.enabled && !loadJob(jobId, env).stopRequested) {
@@ -3326,16 +3875,14 @@ export async function executeSingleJob(
       }
     }
   } catch (err) {
-    if (cleanupZipAfter && zipToIngest && isFile(zipToIngest)) {
-      try {
-        fs.unlinkSync(zipToIngest);
-        job.stagedZipPath = null;
-      } catch {
-        // keep going
-      }
-    }
+    // A failed ingest keeps its staging ZIP: retry imports from it, and it may be
+    // the only copy of chapters outside the selection. Orphan reconcile keeps it
+    // too while the job references it, so nothing here deletes it.
     if (createdSeriesDir && (job.status === "downloading" || job.status === "ingesting") && isDir(sdir)) {
-      if (!lexists(path.join(sdir, "out"))) {
+      // Remove a partially created series only when it holds neither extracted
+      // chapters nor a retained source. A retained archive is the only copy of the
+      // user's unselected chapters, so it must never be a cleanup victim.
+      if (existingChapterNumbers(sdir).length === 0 && !hasRetainedSource(sdir)) {
         try {
           fs.rmSync(sdir, { recursive: true, force: true });
         } catch {
@@ -3350,6 +3897,17 @@ export async function executeSingleJob(
     job.error = sanitizeLine(err, 400);
     job.statusNote = `Failed: ${job.error}`;
     appendJobLog(jobId, `STAGE failed: ${job.error}`, env);
+    // A transient download or network error (Drive quota, timeout, 5xx) heals by
+    // waiting, like a failed pipeline run. Ingest is not skipped here: it never finished.
+    job.stopRequested = Boolean(job.stopRequested || loadJob(jobId, env).stopRequested);
+    if (canAutoRetry(job, env)) {
+      const cls = /quota exceeded|too many users/i.test(String(job.error)) ? "transient" : failClass(err);
+      if (cls === "transient") {
+        const skipIngest = job.skipIngest;
+        queueAutoRetry(job, failureNote(err), retryDelay(job.autoRetry.count, env), env);
+        job.skipIngest = skipIngest;
+      }
+    }
     saveJob(job, env);
   }
 }
@@ -3395,30 +3953,17 @@ export function retryJob(
   const job = withJobMetaLock(env, () => {
     reconcileJobs(env);
     const current = loadJob(jobId, env);
+    if (current.status === "queued" && Number(current.notBefore) > Date.now() / 1000) {
+      current.notBefore = null;
+      return saveJob(current, env);
+    }
     prepareRetryOrContinue(current, env, true, repoRoot);
     const sdir = path.join(seriesRoot(env), String(current.slug));
     const onDisk = existingChapterNumbers(sdir);
-    const staged = current.stagedZipPath ? String(current.stagedZipPath) : "";
-    const hasZip = Boolean(staged) && isFile(staged);
-    const hasSource = hasZip || Boolean(current.gdriveFileId);
-    if (onDisk.length === 0 && !hasSource) {
-      throw new IntakeError(
-        "This job cannot be retried: its source ZIP is gone and no chapter pages exist on disk. Start a new series instead.",
-      );
-    }
-    const archiveIdxCache: { idx?: Record<number, unknown> } = {};
-    const retainedArchiveIndex = (): Record<number, unknown> => {
-      if (!archiveIdxCache.idx) {
-        try {
-          archiveIdxCache.idx = archiveIndex(staged, true)[1] as Record<number, unknown>;
-        } catch (err) {
-          throw new IntakeError(
-            `Retry cannot resume: the retained source ZIP is unreadable (${sanitizeLine(err)}). Start a new series instead.`,
-          );
-        }
-      }
-      return archiveIdxCache.idx;
-    };
+    const onDiskSet = new Set(onDisk);
+
+    // 1. What did this job ask for? This is independent of any archive, so it can
+    //    be resolved before looking for a source.
     let requested: number[];
     const prevRun = current.runChapters;
     if (Array.isArray(prevRun) && prevRun.length) {
@@ -3432,49 +3977,76 @@ export function retryJob(
           `Retry cannot resume: this job has an unreadable chapter selection (${sanitizeLine(err)}). Start a new series instead.`,
         );
       }
-      if (spec === "all") {
-        requested = [...onDisk];
-        if (hasZip) {
-          requested = [...new Set([...requested, ...Object.keys(retainedArchiveIndex()).map(Number)])].sort((a, b) => a - b);
-        }
-      } else {
-        requested = parseChapterSpec(spec, onDisk);
-      }
+      // "all" means everything this series can still read: the extracted chapters
+      // plus whatever the saved archives still hold. A partially ingested "all"
+      // job must not silently skip the chapters it never extracted.
+      requested = spec === "all"
+        ? [...new Set([...onDisk, ...savedSourceChapters(String(current.slug), env)])].sort((a, b) => a - b)
+        : parseChapterSpec(spec, []);
     }
-    const onDiskSet = new Set(onDisk);
     const present = requested.filter((n) => onDiskSet.has(n));
     const missing = requested.filter((n) => !onDiskSet.has(n));
+
     let resumeNote: string;
     if (onDisk.length && missing.length === 0) {
+      // Everything is already extracted: never scan archives for this case.
       current.skipIngest = true;
+      current.sourceArchives = null;
       current.runChapters = present;
       current.ingestedChapters = onDisk.map((n) => `ch${n}`);
       resumeNote = `Retry queued: resuming ${present.length} of ${onDisk.length} extracted chapter(s) (no re-import)`;
     } else {
-      if (!hasSource) {
+      // 2. Only the chapters that are genuinely missing decide which source to use.
+      const saved = findRecoverableSeriesSource(String(current.slug), missing, env);
+      const sources = saved?.sources ?? [];
+      const staged = current.stagedZipPath ? String(current.stagedZipPath) : "";
+      const stagedUsable = Boolean(staged) && !pathHasSymlink(staged) && isPlainFilePath(staged);
+      const hasLocal = sources.length > 0 || stagedUsable;
+      const gdriveFileId = current.gdriveFileId ? String(current.gdriveFileId) : saved?.gdriveFileId;
+      if (!hasLocal && !gdriveFileId) {
         const shown = missing.map((n) => `ch${n}`).join(", ") || "none";
         throw new IntakeError(
-          `Retry cannot resume: the requested chapter(s) (${shown}) are not extracted under ${sdir} and the source ZIP is gone. Start a new series instead.`,
+          `Retry cannot resume: the requested chapter(s) (${shown}) are not extracted under ${sdir} and no saved source ` +
+            "archive or Drive file is left. Re-add them with the original ZIP, or start a new series.",
         );
       }
-      if (hasZip && missing.length) {
-        const idx = retainedArchiveIndex();
-        const unavailable = missing.filter((n) => !(n in idx));
-        if (unavailable.length) {
-          throw new IntakeError(
-            `Retry cannot resume: chapter(s) ${unavailable.map((n) => `ch${n}`).join(", ")} are neither extracted under ${sdir} nor present in the retained source ZIP. Start a new series instead.`,
-          );
-        }
+      // A range can span several retained archives. Refuse before queueing when no
+      // source can supply part of it, instead of failing mid-run.
+      const uncovered = saved?.uncovered?.length ? saved.uncovered : [];
+      if (uncovered.length && !gdriveFileId) {
+        throw new IntakeError(
+          `Retry cannot resume: chapter(s) ${uncovered.map((n) => `ch${n}`).join(", ")} are neither extracted under ` +
+            `${sdir} nor present in the saved source archives. Re-add them with the original ZIP.`,
+        );
       }
       current.skipIngest = false;
+      if (uncovered.length && gdriveFileId) {
+        // Part of the range only exists in the saved Drive ZIP: queue the download
+        // and keep the local archives as extra steps, so nothing is pretended.
+        current.sourceType = "gdrive";
+        current.stagedZipPath = null;
+        current.sourceArchives = sources.length ? sources : null;
+        current.gdriveFileId = gdriveFileId;
+      } else if (sources.length) {
+        // First archive drives the worker; the rest are extracted in the same run.
+        current.stagedZipPath = sources[0]!.path;
+        current.sourceArchives = sources.length > 1 ? sources : null;
+        current.sourceType = "local_zip";
+      } else if (stagedUsable) {
+        current.stagedZipPath = staged;
+      }
+      if (!current.gdriveFileId && saved?.gdriveFileId) current.gdriveFileId = saved.gdriveFileId;
       current.runChapters = requested.length ? requested : null;
       if (requested.length) current.chapters = requested.join(",");
-      if (onDisk.length) current.allowExistingSeries = true;
+      // A retry targets this job's own series: an existing directory is expected
+      // (it may hold only a retained source after an aborted first ingest).
+      if (onDisk.length || isDir(sdir)) current.allowExistingSeries = true;
       resumeNote = missing.length
         ? `Retry queued: re-extracting missing chapter(s) ${missing.map((n) => `ch${n}`).join(", ")} from source`
         : "Retry queued: re-downloading/re-extracting from source";
     }
-    resetJobForRerun(current, resumeNote);
+    resetJobForRerun(current, resumeNote, env);
+    current.onlyUnrendered = true;
     current.retryCount = Number(current.retryCount || 0) + 1;
     current.lastAction = "retry";
     appendJobLog(String(current.id), `RETRY #${current.retryCount}: ${resumeNote}`, env);
@@ -3507,43 +4079,46 @@ export function continueJob(
     if (onDisk.length === 0) {
       throw new IntakeError(`No extracted chapters found under ${sdir}; this job has not ingested yet. Use retry to resume it.`);
     }
-    const staged = current.stagedZipPath ? String(current.stagedZipPath) : "";
-    const hasZip = Boolean(staged) && isFile(staged);
-    let archiveNums: number[] = [];
-    if (hasZip) {
-      try {
-        archiveNums = Object.keys(archiveIndex(staged, true)[1]).map(Number).sort((a, b) => a - b);
-      } catch (err) {
-        throw new IntakeError(`Cannot read the staged source ZIP: ${sanitizeLine(err)}`);
+    const onDiskSet = new Set(onDisk);
+    // "all" covers everything this series can still read: extracted chapters plus
+    // whatever the saved archives hold. An explicit range is resolved on its own.
+    const wanted = spec === "all"
+      ? [...new Set([...onDisk, ...savedSourceChapters(String(current.slug), env)])].sort((a, b) => a - b)
+      : parseChapterSpec(spec, []);
+    if (wanted.length === 0) {
+      throw new IntakeError(`Chapter selection ${pyReprStr(spec)} matched no chapters. Available: ${onDisk.map((n) => `ch${n}`).join(", ")}`);
+    }
+    const missing = wanted.filter((n) => !onDiskSet.has(n));
+    let sources: Array<{ path: string; chapters: number[] }> = [];
+    if (missing.length) {
+      const saved = findRecoverableSeriesSource(String(current.slug), missing, env);
+      sources = saved?.sources ?? [];
+      const covered = new Set([...onDisk, ...sources.flatMap((source) => source.chapters)]);
+      const absent = wanted.filter((n) => !covered.has(n));
+      if (absent.length) {
+        const shown = [...covered].sort((a, b) => a - b).map((n) => `ch${n}`).join(", ") || "none";
+        throw new IntakeError(
+          `Chapter(s) ${absent.map((n) => `ch${n}`).join(", ")} are neither extracted under ${sdir} nor present in the ` +
+            `saved source archives (available: ${shown}). Re-add them with the original ZIP, or start a new series.`,
+        );
       }
     }
-    const available = [...new Set([...onDisk, ...archiveNums])].sort((a, b) => a - b);
-    const basis = archiveNums.length ? archiveNums : onDisk;
-    const wanted = spec === "all" ? [...basis] : parseChapterSpec(spec, basis);
-    if (wanted.length === 0) {
-      const shown = (archiveNums.length ? archiveNums : onDisk).map((n) => `ch${n}`).join(", ");
-      throw new IntakeError(`Chapter selection ${pyReprStr(spec)} matched no chapters. Available: ${shown}`);
-    }
-    const missingFromDisk = wanted.filter((n) => !onDisk.includes(n));
-    if (missingFromDisk.length && !hasZip) {
-      throw new IntakeError(
-        `Chapter(s) ${missingFromDisk.map((n) => `ch${n}`).join(", ")} are not extracted yet and the source ZIP is no longer available. Start a new series or retry from the original archive.`,
-      );
-    }
-    const absent = wanted.filter((n) => !available.includes(n));
-    if (absent.length) {
-      const shown = available.map((n) => `ch${n}`).join(", ") || "none";
-      throw new IntakeError(
-        `Chapter(s) ${absent.map((n) => `ch${n}`).join(", ")} are neither extracted under ${sdir} nor present in the source archive (available: ${shown}). Start a new series or retry from the original archive.`,
-      );
-    }
-    const newNums = wanted.filter((n) => !onDisk.includes(n));
-    current.chapters = spec;
+    // Canonicalize the selection to the chapters actually resolved, so the worker
+    // never re-derives a narrower set from a literal "all".
+    current.chapters = wanted.join(",");
     current.runChapters = wanted;
     current.allowExistingSeries = true;
-    current.skipIngest = !(newNums.length && hasZip);
-    const note = `Continue queued: chapters ${spec} (${newNums.length} new, ${wanted.length - newNums.length} already extracted)`;
-    resetJobForRerun(current, note);
+    current.skipIngest = missing.length === 0;
+    if (missing.length) {
+      current.stagedZipPath = sources[0]!.path;
+      current.sourceArchives = sources.length > 1 ? sources : null;
+      // The series' own archive is local: never re-enter the Drive branch.
+      current.sourceType = "local_zip";
+    } else {
+      current.sourceArchives = null;
+    }
+    const note = `Continue queued: chapters ${spec} (${missing.length} new, ${wanted.length - missing.length} already extracted)`;
+    resetJobForRerun(current, note, env);
     current.lastAction = "continue";
     appendJobLog(String(current.id), note, env);
     saveJob(current, env);
@@ -3629,14 +4204,22 @@ export async function runWorker(opts: WorkerOptions = {}): Promise<{ acquired: b
       for (const name of fs.readdirSync(jdir)) {
         if (!name.endsWith(".json")) continue;
         const j = loadJobFile(path.join(jdir, name));
-        if (j && j.status === "queued" && !laneBlocksJob(j, env)) queued.push(j);
+        if (j && j.status === "queued") queued.push(j);
       }
       queued.sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
       if (queued.length === 0) break;
-      const candidateId = String(queued[0]!.id);
+      const due = queued.find((job) => !(Number(job.notBefore) > Date.now() / 1000));
+      if (!due) {
+        if (opts.once) break;
+        const delay = Math.min(5000, Math.max(1, (Math.min(...queued.map((job) => Number(job.notBefore))) - Date.now() / 1000) * 1000));
+        await (opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(delay);
+        continue;
+      }
+      const candidateId = String(due.id);
       const claimed = withJobMetaLock(env, () => {
         const next = loadJobFile(path.join(jdir, `${candidateId}.json`));
-        if (!next || next.status !== "queued" || laneBlocksJob(next, env)) return null;
+        if (!next || next.status !== "queued" || Number(next.notBefore) > Date.now() / 1000) return null;
+        next.notBefore = null;
         next.workerPid = process.pid;
         next.workerStartTicks = getProcStartTicks(process.pid);
         next.startedAt = Date.now() / 1000;
@@ -3644,7 +4227,11 @@ export async function runWorker(opts: WorkerOptions = {}): Promise<{ acquired: b
         saveJob(next, env);
         return next;
       });
-      if (!claimed) continue;
+      if (!claimed) {
+        // Another worker or a control change took it: re-read after a short pause.
+        await (opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(250);
+        continue;
+      }
       await executeSingleJob(claimed, {
         repoRoot,
         env,

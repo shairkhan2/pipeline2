@@ -37,7 +37,15 @@ import {
   type ExternalTtsConfig,
 } from "../contracts/hashes.js";
 import { stageCurrent } from "../telemetry/telemetry.js";
-import { findVertexTtsVoice, synthesizeVertexTtsToFile } from "../llm/vertexTts.js";
+import { failureNote, httpStatusOf, retryableHttpStatus } from "../domain/failure.js";
+import {
+  findVertexTtsVoice,
+  GEMINI_LOCALE_REQUEST_REV,
+  isDefaultVertexLocale,
+  localizedSpeechText,
+  stripEmotionControls,
+  synthesizeVertexTtsToFile,
+} from "../llm/vertexTts.js";
 import { findGrokTtsVoice, synthesizeGrokTtsToFile } from "../llm/grokTts.js";
 
 export type { ExternalTtsConfig };
@@ -254,8 +262,29 @@ export function edgeRateFromSpeed(speed: unknown, fallback: string = RATE): stri
   return `${pct >= 0 ? "+" : "-"}${Math.abs(pct)}%`;
 }
 
-function edgeSaveOnce(text: string, outPath: string, voice: string = VOICE, rate: string = RATE): void {
-  const edge = resolveEdge();
+/**
+ * Edge rate for a LANGUAGE version at speed 1.
+ *
+ * The English pipeline's legacy default is `+6%` (RATE), which is an English
+ * pacing choice. A localized version must speak at the rate the Studio preview
+ * used for the same voice, and that preview maps speed 1 to `+0%`. Keeping the
+ * two identical means a preview sounds like the final render.
+ */
+export const LOCALE_EDGE_RATE = "+0%";
+
+/**
+ * Remove inline delivery controls (`[deadpan]`, `[whispers]`, ...) from text
+ * that is about to be spoken by a voice that cannot perform them.
+ *
+ * Edge and Vertex TTS read brackets literally, so a localized render must speak
+ * the prose only. The STORED script keeps its controls: this only shapes the
+ * synthesis input. The implementation lives beside the Vertex synthesizer so
+ * every engine shares one tag shape; it is re-exported here for the audio stage
+ * and its existing importers.
+ */
+export { stripEmotionControls };
+export { stripEmotionControls as _stripEmotionControls };
+function edgeSaveOnce(text: string, outPath: string, voice: string = VOICE, rate: string = RATE): void {  const edge = resolveEdge();
   if (edge.mode === "python") {
     const r = run([edge.bin, "-c", EDGE_PY], {
       timeout: 180_000,
@@ -972,6 +1001,58 @@ export async function ttsLinesExternal(
   return spans;
 }
 
+/** Retry only the unfinished provider line; callers commit its cache after validation. */
+async function synthesizeLineWithRetry(
+  engine: string, i: number, total: number, tmpOut: string, env: NodeJS.ProcessEnv,
+  synthesize: () => Promise<unknown>,
+): Promise<number> {
+  const override = env.MANHWA_TTS_RETRY_DELAYS_S;
+  const parsed = override?.split(",").map((s) => Number(s.trim()));
+  const delays = parsed?.length && parsed.every((n) => Number.isFinite(n) && n >= 0)
+    ? parsed : [10, 20, 40, 80, 150];
+  // Ops overrides may lower the waits but never to a zero-delay burst on a rate limit.
+  if (parsed?.length && delays === parsed && !process.env.VITEST) delays.forEach((d, k) => { delays[k] = Math.max(1, d); });
+  let invalidFailures = 0;
+  for (let attempt = 0; ; attempt++) {
+    let providerError: unknown;
+    if (existsSync(tmpOut)) unlinkSync(tmpOut);
+    stageCurrent("audio", "running", { completed: i, total, unit: "lines", note: "Synthesizing narration" });
+    try {
+      try { await synthesize(); }
+      catch (e) {
+        providerError = e;
+        throw new RuntimeError(`${engine} tts line ${i} failed: ${(e as Error).message || String(e)}`);
+      }
+      const duration = _probeDuration(tmpOut);
+      if (duration <= 0) throw new RuntimeError(
+        `${engine} tts line ${i} produced invalid audio (ffprobe duration=${pyFloatRepr(duration)})`,
+      );
+      return duration;
+    } catch (error) {
+      if (existsSync(tmpOut)) unlinkSync(tmpOut);
+      const text = `${(providerError as Error | undefined)?.name ?? ""}: ${String(error)}`;
+      const status = httpStatusOf(text);
+      if (status !== null && !retryableHttpStatus(status)) throw error;
+      const invalid = /missing inline audio data|returned empty audio|invalid audio.*ffprobe duration/i.test(text);
+      if (invalid) invalidFailures++;
+      const transient = status !== null ? retryableHttpStatus(status)
+        : /timeout|timed out|network|connection|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed/i.test(text);
+      if (attempt >= delays.length || (!transient && !invalid) || (invalid && invalidFailures > 2)) throw error;
+      const delay = delays[attempt]!;
+      const note = failureNote(providerError ?? error);
+      const maxAttempts = invalid
+        ? Math.min(delays.length + 1, attempt + 1 + (3 - invalidFailures))
+        : delays.length + 1;
+      stageCurrent("audio", "retrying", {
+        note, retryAt: Date.now() / 1000 + delay, attempt: attempt + 1,
+        maxAttempts,
+      });
+      console.log(`   audio: ${engine} line ${i} retry ${attempt + 1}/${maxAttempts} in ${delay}s: ${note}`);
+      await sleep(delay * 1000);
+    }
+  }
+}
+
 /**
  * Vertex AI TTS (Chirp 3 HD / Gemini 3.8 Flash TTS), one file per line.
  * Validates every file with ffprobe before committing the cache, like the
@@ -982,6 +1063,7 @@ export async function ttsLinesVertex(
   tmpdirPath: string,
   meta: unknown,
   env?: NodeJS.ProcessEnv,
+  localeHint?: string | null,
 ): Promise<Array<[number, number]>> {
   const m = meta !== null && typeof meta === "object" && !Array.isArray(meta)
     ? meta as Record<string, unknown>
@@ -991,7 +1073,17 @@ export async function ttsLinesVertex(
     throw new ValueError("meta.json says engine=vertex but voice_id is empty - shair sets the voice");
   }
   const runEnv = env ?? process.env;
-  if (!findVertexTtsVoice(voiceId, runEnv)) {
+  // Optional locale-scoped lookup: an English/unset language keeps the original
+  // catalog (and its cache file); a localized language sees only its own voices.
+  //
+  // The RUN locale (from timeline.main, already validated and used for the
+  // narration cache key) wins over `meta.language`, so the voice lookup, the
+  // per-line proof and the cache key can never disagree.
+  const hint = typeof localeHint === "string" ? localeHint.trim() : "";
+  const rawLanguage = hint || (typeof m.language === "string" ? m.language.trim() : "");
+  const locale = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(rawLanguage) ? rawLanguage : null;
+  const voice = findVertexTtsVoice(voiceId, runEnv, locale);
+  if (!voice) {
     throw new ValueError(`Voice '${voiceId}' is not a Vertex AI TTS voice`);
   }
   const rawSpeed = m.speed !== undefined && m.speed !== null ? m.speed : 1;
@@ -1003,37 +1095,54 @@ export async function ttsLinesVertex(
   const spans: Array<[number, number]> = [];
   let t = 0;
   for (let i = 0; i < lines.length; i++) {
-    const text = String(lines[i]![0]);
+    const raw = String(lines[i]![0]);
+    // A localized take speaks prose only: Vertex reads bracket controls
+    // literally. The stored script keeps its controls; only synthesis input
+    // changes, exactly like the locale Edge path.
+    const text = locale ? localizedSpeechText(raw) : raw;
+    // English keeps the historical proof byte-for-byte. A localized proof also
+    // carries the locale and the resolved model, so a Hindi take can never prove
+    // an English line (or another model's line) even for a shared voice id.
+    // A localized Gemini line additionally carries the request revision: takes
+    // cached while the request still held an instruction wrapper are re-synthesized.
+    // English (`en`/`en-US`, which a plain English series stores in meta.language)
+    // never carried the wrapper, so its proof must stay byte-identical.
+    const geminiRev = locale && !isDefaultVertexLocale(locale) && voice.engine === "gemini"
+      ? GEMINI_LOCALE_REQUEST_REV
+      : null;
     const proof = pyJsonDumps(
-      { text, tts: { engine: "vertex", voice: voiceId, speed: pyFloat(pyRound(speed, 4)) } },
+      locale
+        ? {
+          text: raw,
+          tts: {
+            engine: "vertex",
+            voice: voiceId,
+            speed: pyFloat(pyRound(speed, 4)),
+            language: locale,
+            model: voice.modelId,
+            ...(geminiRev === null ? {} : { request_rev: geminiRev }),
+          },
+        }
+        : { text, tts: { engine: "vertex", voice: voiceId, speed: pyFloat(pyRound(speed, 4)) } },
       { sortKeys: true },
     );
-    const [f, side] = _lineFile(tmpdirPath, i, text, proof);
+    const [f, side] = _lineFile(tmpdirPath, i, raw, proof);
     let d = existsSync(f) ? _probeDuration(f) : 0;
     if (d <= 0) {
       if (existsSync(f)) unlinkSync(f);
       if (existsSync(side)) unlinkSync(side);
       const tmpOut = join(tmpdirPath, `.line_${String(i).padStart(3, "0")}.${process.pid}.tmp.mp3`);
       if (existsSync(tmpOut)) unlinkSync(tmpOut);
-      try {
+      d = await synthesizeLineWithRetry("vertex", i, lines.length, tmpOut, runEnv, async () => {
         await synthesizeVertexTtsToFile({
           text,
           voiceId,
           destPath: tmpOut,
           speed,
           env: runEnv,
+          ...(locale ? { locale } : {}),
         });
-      } catch (e) {
-        if (existsSync(tmpOut)) unlinkSync(tmpOut);
-        throw new RuntimeError(`vertex tts line ${i} failed: ${(e as Error).message || "Error"}`);
-      }
-      d = _probeDuration(tmpOut);
-      if (d <= 0) {
-        if (existsSync(tmpOut)) unlinkSync(tmpOut);
-        throw new RuntimeError(
-          `vertex tts line ${i} produced invalid audio (ffprobe duration=${pyFloatRepr(d)})`,
-        );
-      }
+      });
       renameSync(tmpOut, f);
       writeFileSync(side, proof, "utf8");
     }
@@ -1087,7 +1196,7 @@ export async function ttsLinesGrok(
       if (existsSync(side)) unlinkSync(side);
       const tmpOut = join(tmpdirPath, `.line_${String(i).padStart(3, "0")}.${process.pid}.tmp.mp3`);
       if (existsSync(tmpOut)) unlinkSync(tmpOut);
-      try {
+      d = await synthesizeLineWithRetry("grok", i, lines.length, tmpOut, runEnv, async () => {
         await synthesizeGrokTtsToFile({
           text,
           voiceId,
@@ -1095,17 +1204,7 @@ export async function ttsLinesGrok(
           speed,
           env: runEnv,
         });
-      } catch (e) {
-        if (existsSync(tmpOut)) unlinkSync(tmpOut);
-        throw new RuntimeError(`grok tts line ${i} failed: ${(e as Error).message || "Error"}`);
-      }
-      d = _probeDuration(tmpOut);
-      if (d <= 0) {
-        if (existsSync(tmpOut)) unlinkSync(tmpOut);
-        throw new RuntimeError(
-          `grok tts line ${i} produced invalid audio (ffprobe duration=${pyFloatRepr(d)})`,
-        );
-      }
+      });
       renameSync(tmpOut, f);
       writeFileSync(side, proof, "utf8");
     }
@@ -1116,24 +1215,36 @@ export async function ttsLinesGrok(
   return spans;
 }
 
-/** edge-tts, one file per line. Returns [spans, concatListPath, totalSeconds]. */
+/**
+ * edge-tts, one file per line. Returns [spans, concatListPath, totalSeconds].
+ *
+ * With `locale` set this is a language-version render: inline delivery controls
+ * (`[deadpan]`, ...) are stripped from the SPOKEN text, because Edge reads
+ * brackets literally. The stored script keeps its controls; only the synthesis
+ * input changes. English (no locale) is untouched.
+ */
 export async function ttsLines(
   lines: ReadonlyArray<readonly [string, unknown]>,
   tmpdirPath: string,
-  opts?: { voice?: string; rate?: string },
+  opts?: { voice?: string; rate?: string; locale?: string | null },
 ): Promise<[Array<[number, number]>, string, number]> {
   mkdirSync(tmpdirPath, { recursive: true });
   const voice = opts?.voice || VOICE;
   const rate = opts?.rate || RATE;
+  // A locale tag scopes the per-line proof: a Hindi take can never prove an
+  // English line (and vice versa) even if the same voice id were reused. Absent
+  // locale keeps the original proof string byte-for-byte.
+  const localeTag = opts?.locale ? `${opts.locale}|strip-v1|` : "";
   const spans: Array<[number, number]> = [];
   const files: string[] = [];
   let t = 0;
   for (let i = 0; i < lines.length; i++) {
-    const text = String(lines[i]![0]);
+    const raw = String(lines[i]![0]);
+    const text = opts?.locale ? localizedSpeechText(raw) : raw;
     // The sidecar proves the exact text AND voice/rate: a cached line from a
     // previous voice must not be reused after the series voice changes.
-    const proof = `${voice}|${rate}|${text}`;
-    const [f, side] = _lineFile(tmpdirPath, i, text, proof);
+    const proof = `${localeTag}${voice}|${rate}|${raw}`;
+    const [f, side] = _lineFile(tmpdirPath, i, raw, proof);
     if (!(existsSync(f) && statSync(f).size > 500)) {
       await _edgeLine(text, f, 3, voice, rate);
       writeFileSync(side, proof, "utf8");

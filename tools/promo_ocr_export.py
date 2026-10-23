@@ -1,107 +1,100 @@
 #!/usr/bin/env python3
-"""promo_ocr_export.py - OCR-export adapter over the installed manga-image-
-translator Python API (no vendor edits).
+"""promo_ocr_export.py - promo OCR export over PanelCleaner's text detector.
 
-Why this exists (B2a live finding, 2026-10-10): the installed MIT CLI's
-``--save-text-file`` / ``--save-text`` flags do NOT produce a usable region
-export for our config:
-
-  * ``mode/local.py:286-293`` gates ``_save_text_to_file`` on ``self.text_regions``,
-    a param the CLI never sets (no ``--text-regions`` arg) -> the batch export
-    branch never fires.
-  * ``manga_translator.py:1104-1110`` dumps only the *translated strings* (not
-    the region polygons) to ``<stem>_translations.txt`` and then ``exit(-1)``
-    (observed exit 255, "Don't continue if --save-text is used").
-
-So instead of mutating the vendor or globbing its shared ``result/`` output, we
-drive the same installed Python API directly with the SAME config
-(ComicTextDetector + Model48pxOCR + translator=none) and serialize the returned
-``ctx.text_regions`` to a controlled JSON. The tool's inpainted/rendered image
-is discarded by the caller; only OCR polygons are used.
+Finds text regions with PanelCleaner's ComicTextDetector (CPU: OpenCV DNN +
+ONNX) and reads each region with Tesseract. Only polygons and text are
+exported; the caller blurs matched promo regions itself (promoMask.ts), so no
+inpainting or image output happens here.
 
 Output JSON (single object)::
 
-    {"tool": "mit-api", "schema": "promo-ocr-1",
+    {"tool": "pcleaner-ctd", "schema": "promo-ocr-1",
      "panels": {"<panel_id>": [ {"text": str, "lines": [[8 numbers], ...]} ]}}
 
 Coordinates are in the INPUT image's pixel space; the caller handles any crop
 offset / scale applied before handing images in.
 
-Run with the MIT venv, cwd = MIT_DIR::
+Run with the PanelCleaner venv::
 
-    /opt/mit-venv312/bin/python pipeline/tools/promo_ocr_export.py \
-        --config <cfg.json> --output <out.json> <img1> [img2 ...]
+    /opt/panelcleaner/venv/bin/python tools/promo_ocr_export.py \
+        --model <comictextdetector.pt.onnx> --output <out.json> <img1> [img2 ...]
 """
 import argparse
-import asyncio
 import json
 import os
 import sys
 
 
-def _load_mit():
-    mit_dir = os.environ.get("MANHWA_MIT_DIR", "/opt/manga-image-translator")
-    if mit_dir not in sys.path:
-        sys.path.insert(0, mit_dir)
-    from manga_translator import Config                      # noqa: E402
-    from manga_translator.mode.local import MangaTranslatorLocal  # noqa: E402
-    return Config, MangaTranslatorLocal
-
-
-def _region_lines(region):
-    """8-number polygons for a TextBlock's ``.lines`` (numpy or nested lists)."""
+def _block_lines(blk):
+    """8-number polygons for a TextBlock's ``.lines``."""
     out = []
-    raw = getattr(region, "lines", None)
-    if raw is None:
-        return out
-    try:
-        import numpy as np
-        arr = np.asarray(raw)
-    except Exception:
-        arr = raw
-    try:
-        for line in arr:
-            flat = list(line.ravel()) if hasattr(line, "ravel") else list(line)
-            flat = [float(v) for v in flat]
-            if len(flat) == 8:
-                out.append(flat)
-    except Exception:
-        pass
+    for line in getattr(blk, "lines", None) or []:
+        try:
+            flat = [float(v) for pt in line for v in pt]
+        except TypeError:
+            flat = [float(v) for v in line]
+        if len(flat) == 8:
+            out.append(flat)
     return out
 
 
-async def _export(cfg_path, images, out_path):
+def _ocr(img, xyxy, lang):
+    import pytesseract
+
+    w, h = img.size
+    x0, y0, x1, y1 = (int(v) for v in xyxy)
+    pad = 4
+    box = (max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad))
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return ""
+    crop = img.crop(box)
+    text = ""
+    try:
+        text = pytesseract.image_to_string(crop, lang=lang)
+    except Exception:
+        text = ""
+    if not text.strip():
+        try:
+            d = pytesseract.image_to_data(
+                crop, lang=lang, config="--psm 11", output_type=pytesseract.Output.DICT
+            )
+            text = " ".join(t for t in d.get("text", ()) if t)
+        except Exception:
+            text = ""
+    return " ".join(text.split())
+
+
+def export(model_path, images, out_path, lang="eng"):
+    import cv2
+    import numpy as np
     from PIL import Image
-    Config, MangaTranslatorLocal = _load_mit()
-    with open(cfg_path, encoding="utf-8") as fh:
-        cfg = Config(**json.load(fh))
-    params = {
-        "kernel_size": 3,
-        "use_gpu": False,
-        "input": list(images),
-        "ignore_errors": True,
-        "batch_size": 1,
-    }
-    tr = MangaTranslatorLocal(params)
+    from pcleaner.comic_text_detector.inference import TextDetector
+    from pcleaner.comic_text_detector.utils.textmask import REFINEMASK_ANNOTATION
+
+    cv2.setNumThreads(int(os.environ.get("OMP_NUM_THREADS", "4")))
+    model = TextDetector(model_path=str(model_path), input_size=1024, device="cpu")
     panels = {}
     for img_path in images:
         pid = os.path.splitext(os.path.basename(img_path))[0]
         try:
-            img = Image.open(img_path).convert("RGB")
-            ctx = await tr.translate(img, cfg)
+            arr = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if arr is None:
+                raise ValueError("unreadable image")
+            _mask, _refined, blk_list = model(
+                arr, refine_mode=REFINEMASK_ANNOTATION, keep_undetected_mask=False
+            )
+            pil = Image.open(img_path).convert("RGB")
+            regs = []
+            for blk in blk_list:
+                lines = _block_lines(blk)
+                text = _ocr(pil, blk.xyxy, lang)
+                if text or lines:
+                    regs.append({"text": text, "lines": lines})
+            panels[pid] = regs
         except Exception as e:
-            print(f"[promo_ocr_export] {pid}: {type(e).__name__}: {e}",
-                  file=sys.stderr)
+            print(f"[promo_ocr_export] {pid}: {type(e).__name__}: {e}", file=sys.stderr)
             panels[pid] = []
-            continue
-        regs = []
-        for region in (getattr(ctx, "text_regions", None) or []):
-            text = getattr(region, "text", "") or ""
-            lines = _region_lines(region)
-            if text or lines:
-                regs.append({"text": text, "lines": lines})
-        panels[pid] = regs
-    payload = {"tool": "mit-api", "schema": "promo-ocr-1", "panels": panels}
+    payload = {"tool": "pcleaner-ctd", "schema": "promo-ocr-1", "panels": panels}
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False)
     return payload
@@ -109,11 +102,12 @@ async def _export(cfg_path, images, out_path):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--config", required=True, help="MIT Config JSON")
+    ap.add_argument("--model", required=True, help="comictextdetector.pt.onnx path")
     ap.add_argument("--output", required=True, help="destination JSON")
+    ap.add_argument("--lang", default="eng", help="Tesseract language")
     ap.add_argument("images", nargs="+", help="input image(s)")
     args = ap.parse_args(argv)
-    payload = asyncio.run(_export(args.config, args.images, args.output))
+    payload = export(args.model, args.images, args.output, args.lang)
     n = sum(len(v) for v in payload["panels"].values())
     print(f"[promo_ocr_export] wrote {args.output}: {n} regions across "
           f"{len(payload['panels'])} panel(s)")

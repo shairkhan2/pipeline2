@@ -32,6 +32,7 @@ import zlib from "node:zlib";
 import AdmZip from "adm-zip";
 
 import { pyFloatRepr, pyReprStr } from "../contracts/hashes.js";
+import { seriesStyleSchema } from '../config/seriesStyle.js';
 
 // Keep in sync with remotion-studio/src/backgrounds/index.tsx BACKGROUNDS keys.
 export const BACKGROUNDS = ["starfield", "storm-valley", "mist-pines"] as const;
@@ -192,6 +193,7 @@ export interface TtsConfig {
 }
 
 export interface IngestOptions {
+  style?: import('../config/seriesStyle.js').SeriesStyle;
   chapters?: number[] | null;
   force?: boolean;
   zipPath?: string | null;
@@ -1108,6 +1110,7 @@ function countImages(dir: string): number {
 }
 
 export function ingest(series: string, options: IngestOptions = {}): number[] {
+  const style = seriesStyleSchema.optional().parse(options.style);
   const zipExplicit = defined(options.zipPath, options.zip_path);
   const downloads = options.downloads ?? roots.downloads;
   const zipPath = findZip(series, zipExplicit, downloads);
@@ -1243,6 +1246,7 @@ export function ingest(series: string, options: IngestOptions = {}): number[] {
       tts: ttsBlock,
       visuals: { background, motion },
       title: detected || series,
+      ...(style ? { style } : {}),
     };
     writeFileSync(mp, dumpMeta(meta), { encoding: "utf8" });
     console.log(
