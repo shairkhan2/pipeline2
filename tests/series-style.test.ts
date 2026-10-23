@@ -20,11 +20,11 @@ describe('series style contract', () => {
     const env = { WRITER_MODE: 'story', MATCH_MODE: 'visual', EMOTION_TAGS: 'on', PACING: 'slow' };
     expect(resolveSeriesStyle({}, env)).toMatchObject({ writerMode: 'story', matchMode: 'visual', emotionTags: 'on', pacing: PACING.slow });
     expect(resolveSeriesStyle({ writerMode: 'legacy', matchMode: 'auto', emotionTags: 'auto', pacing: 'normal' }, env)).toMatchObject({ writerMode: 'legacy', matchMode: 'auto', emotionTags: 'auto', pacing: PACING.normal });
-    expect(resolveSeriesStyle({}, {})).toMatchObject({ writerMode: 'legacy', matchMode: 'auto', emotionTags: 'auto', pacing: PACING.normal });
+    expect(resolveSeriesStyle({}, {})).toMatchObject({ writerMode: 'story', matchMode: 'auto', emotionTags: 'auto', pacing: PACING.normal });
   });
-  it('keeps normal pacing and legacy narration hashes unchanged', () => {
+  it('keeps normal pacing (1.5 s floor) and legacy narration hashes unchanged', () => {
     expect(PACING.normal).toEqual({ SHOT_S, RUN_S, SHOT_MIN_S, JAB_GAP, MAX_RUN });
-    expect(PACING.normal).toEqual({ SHOT_S: 2.5, RUN_S: 1.25, SHOT_MIN_S: 0.8, JAB_GAP: 4, MAX_RUN: 6 });
+    expect(PACING.normal).toEqual({ SHOT_S: 2.5, RUN_S: 1.25, SHOT_MIN_S: 1.5, JAB_GAP: 4, MAX_RUN: 6 });
     expect(narrationCacheKey([['Hello', ['p0001_1']]], 'edge', 'voice')).toBe(narrationCacheKey([['Hello', ['p0001_1']]], 'edge', 'voice', undefined, 1));
   });
 });

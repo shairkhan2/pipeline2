@@ -34,6 +34,10 @@ export const SLICER_REV = 3;
 /** cleaner.py: bump when the promo-mask algorithm/config changes. */
 export const PROMO_ALGO_VERSION = 'pmask-v4';
 
+/** writer story mode: bump when STORY_PLAN/STORY/STORY_REVIEW prompts change meaning.
+ *  Stamped into out/series_synopsis.json; a mismatch discards plan-derived entries. */
+export const STORY_PROMPT_VERSION = 2;
+
 /** cleaner.py: crop padding as a fraction of the ROI bbox. */
 export const PROMO_ROI_PAD_FRAC = 0.5;
 

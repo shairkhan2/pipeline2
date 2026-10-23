@@ -139,7 +139,10 @@ export {
   isChain as _chain,
 };
 
-export const MIN_PANEL_S = 0.8;
+/** Shortest on-screen time per panel when a line splits across several panels. */
+export const MIN_PANEL_S = 1.5;
+/** v1 Python floor (timeline.py MIN_PANEL_S); golden parity runs pass it explicitly. */
+export const LEGACY_MIN_PANEL_S = 0.8;
 export const ART_MIN = 0.5;
 export const SWAP_FLOOR = 0.6;
 
@@ -643,6 +646,7 @@ export function buildShots(
   panelsDir: string,
   block: Block | null = null,
   hookFirst = false,
+  minPanelS: number = MIN_PANEL_S,
 ): TimelineShot[] {
   const byId: Record<string, Record<string, unknown>> = {};
   for (const p of obs.panels) byId[String(p.id)] = p;
@@ -681,7 +685,7 @@ export function buildShots(
   for (let li = 0; li < n; li++) {
     const [text, rawTags] = lines[li]!;
     const [s, e] = spans[li]!;
-    const dur = Math.max(e - s, MIN_PANEL_S);
+    const dur = Math.max(e - s, minPanelS);
     if (rawTags.includes("@hold")) {
       if (shots.length) shots[shots.length - 1]!.end_s = pyRound(e, 2);
       continue;
@@ -741,8 +745,8 @@ export function buildShots(
       runOverlap += spent.length;
     }
     let per = dur / panels.length;
-    if (per < MIN_PANEL_S && panels.length > 1) {
-      const keepN = Math.max(1, pyFloorDiv(dur, MIN_PANEL_S));
+    if (per < minPanelS && panels.length > 1) {
+      const keepN = Math.max(1, pyFloorDiv(dur, minPanelS));
       const ranked = panels.map((_, idx) => idx).sort((a, b) => {
         const wa = numGet(byId[panels[a]!], "weight", 2);
         const wb = numGet(byId[panels[b]!], "weight", 2);
@@ -1214,7 +1218,7 @@ export async function main(
   }
   const visuals = pyGet(fullMeta, "visuals", {});
   const background = String(pyGet(visuals, "background", pyGet(fullMeta, "background", "starfield")));
-  const motion = String(pyGet(visuals, "motion", pyGet(fullMeta, "motion", "cut")));
+  const motion = String(pyGet(visuals, "motion", pyGet(fullMeta, "motion", "window")));
   let extCfg: ExternalTtsConfig | undefined;
   if (engine === "eleven" && !voiceId) {
     throw new SystemExit("meta.json says engine=eleven but voice_id is empty - shair sets the voice");

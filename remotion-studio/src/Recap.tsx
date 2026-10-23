@@ -1,7 +1,8 @@
 /* Recap.tsx — clean-cut style (motion v5, user-tuned 2026-09-08).
  * Contract: docs/remotion-renderer.md in the pipeline repo.
  * A panel is a physical card with NATIVE aspect. Motion is plug-and-play:
- * src/motions/ (default cut). Background is plug-and-play: src/backgrounds/.
+ * src/motions/ (default window). Background is plug-and-play: src/backgrounds/,
+ * drawn only behind motions that do not paint their own backdrop.
  * Sharp corners, hairline edge.
  */
 import React from 'react';
@@ -12,7 +13,7 @@ import {
   type CalculateMetadataFunction,
 } from 'remotion';
 import {Background, backgroundGlow, type BackgroundId} from './backgrounds';
-import {MotionLayout, type MotionId} from './motions';
+import {MotionLayout, motionOwnsBackdrop, type MotionId} from './motions';
 import {W, H} from './motions/tunables';
 
 export type {Shot, ShotBox} from './motions/types';
@@ -30,7 +31,7 @@ export const Recap: React.FC<RecapProps> = ({shots, audio, volume, background, m
   const glowRgb = backgroundGlow(background);
   return (
     <AbsoluteFill>
-      <Background id={background} />
+      {motionOwnsBackdrop(motion) ? <AbsoluteFill style={{background: '#000'}} /> : <Background id={background} />}
       <MotionLayout id={motion} shots={shots} glowRgb={glowRgb} />
       {audio ? <Audio src={staticFile(audio)} volume={volume ?? 1} /> : null}
     </AbsoluteFill>

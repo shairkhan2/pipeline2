@@ -51,6 +51,8 @@ import {
 import {
   castContext,
   _stepsToScript,
+  JAB_MAX_WORDS,
+  planStory,
   UNIT_MAX_WORDS,
   validateDraft,
   validatePlan,
@@ -75,7 +77,14 @@ import {
   _orderKey,
   HOOK_BEATS,
   panelTranscript,
+  planSummary,
   previousWindow,
+  recordSynopsis,
+  storySoFar,
+  SYNOPSIS_CAP,
+  SYNOPSIS_FILE,
+  upcomingBlock,
+  UPCOMING_HEADER,
   writerDialogueLookup,
   type PanelRec,
 } from '../src/stages/writer.js';
@@ -651,8 +660,18 @@ describe('storyWriter.ts / validatePlan', () => {
     expect(validatePlan(plan(), 2).premise).toContain('knight');
   });
 
-  it('rejects a plan that does not account for every source event', () => {
-    expect(() => validatePlan(plan(), 3)).toThrow(StoryReviewError);
+  it('allows selection: unreferenced events need no omission reason', () => {
+    expect(validatePlan(plan(), 9).moments).toHaveLength(1);
+    const p = plan();
+    delete p.omitted_events;
+    const out = validatePlan(p, 9);
+    expect(out.omitted_events).toEqual([]);
+    expect(validatePlan(plan({ omitted_events: [{ event: 2, reason: '' }] }), 9)).toBeTruthy();
+  });
+
+  it('rejects a reference to a source event that does not exist', () => {
+    expect(() => validatePlan(plan(), 1)).toThrow(/does not exist/);
+    expect(() => validatePlan(plan({ omitted_events: 'x' }), 2)).toThrow(StoryReviewError);
   });
 
   it('rejects an event both covered and omitted', () => {
@@ -709,13 +728,34 @@ describe('storyWriter.ts / validateDraft', () => {
     expect(validateDraft(draft())).toBeTruthy();
   });
 
+  it('allows a draft that skips planned scenes (selection)', () => {
+    expect(() =>
+      validateDraft({ outline: draft().outline, steps: [{ beat: 'b', line: 'ok', jab: '', scene: 2 }] }, moments),
+    ).not.toThrow();
+  });
+
   it('enforces the scene reference when moments are supplied', () => {
     expect(() =>
-      validateDraft({ outline: draft().outline, steps: [{ beat: 'b', line: 'ok', jab: '', scene: 1 }] }, moments),
-    ).toThrow(/draft skips planned scenes/);
+      validateDraft({ outline: draft().outline, steps: [{ beat: 'b', line: 'ok', jab: '' }] }, moments),
+    ).toThrow(/needs an existing scene reference/);
     expect(() =>
       validateDraft({ outline: draft().outline, steps: [{ beat: 'b', line: 'ok', jab: '', scene: 5 }] }, moments),
     ).toThrow(/needs an existing scene reference/);
+  });
+
+  it('uses a 32-word unit cap and keeps the 12-word jab cap', () => {
+    expect(UNIT_MAX_WORDS).toBe(32);
+    expect(JAB_MAX_WORDS).toBe(12);
+    const line32 = new Array(32).fill('word').join(' ');
+    expect(() =>
+      validateDraft({ outline: draft().outline, steps: [{ beat: 'b', line: line32, jab: '', scene: 1 }] }, [{}]),
+    ).not.toThrow();
+    expect(() =>
+      validateDraft(
+        { outline: draft().outline, steps: [{ beat: 'b', line: `${line32} more`, jab: '', scene: 1 }] },
+        [{}],
+      ),
+    ).toThrow(/33 words, max 32/);
   });
 
   it('caps a spoken unit at UNIT_MAX_WORDS', () => {
@@ -1189,6 +1229,130 @@ describe('writer.ts / _hookMoves', () => {
 
   it('honours an explicit count', () => {
     expect(_hookMoves('## BEAT b01_one\n## BEAT b02_two\n', 1)).toEqual(['two']);
+  });
+});
+
+describe('writer.ts / series memory (story mode)', () => {
+  const writeObs = (outDir: string, ch: string, events: string[], wrapped = false): void => {
+    const body = { characters: [], events };
+    fsSync.writeFileSync(
+      path.join(outDir, `obs_${ch}.json`),
+      JSON.stringify(wrapped ? { data: body } : body),
+    );
+  };
+
+  it('look-ahead block is present only when later obs exist', () => {
+    const outDir = makeTemp('upcoming');
+    expect(upcomingBlock(outDir, 'ch3')).toBe('');
+    writeObs(outDir, 'ch4', ['the gardener is revealed as the hero'], true);
+    writeObs(outDir, 'ch6', ['too far ahead']);
+    const block = upcomingBlock(outDir, 'ch3');
+    expect(block.startsWith(UPCOMING_HEADER)).toBe(true);
+    expect(block).toContain('ch4:\n- the gardener is revealed as the hero');
+    expect(block).not.toContain('too far ahead');
+    expect(upcomingBlock(outDir, 'ch5')).toContain('too far ahead');
+    expect(upcomingBlock(outDir, 'ch6')).toBe('');
+  });
+
+  it('synopsis grows per chapter and only covers earlier chapters', () => {
+    const outDir = makeTemp('synopsis');
+    expect(storySoFar(outDir, 'ch1')).toBe('');
+    recordSynopsis(outDir, 'ch1', planSummary({
+      premise: 'A gardener humiliates a combat class',
+      moments: [{ event: 'the berserker kneels' }],
+    }));
+    expect(storySoFar(outDir, 'ch2')).toBe(
+      'ch1: A gardener humiliates a combat class. the berserker kneels.\n',
+    );
+    recordSynopsis(outDir, 'ch2', 'He was summoned from Earth years ago.');
+    const two = storySoFar(outDir, 'ch3');
+    expect(two).toContain('ch1: ');
+    expect(two).toContain('ch2: He was summoned from Earth years ago.');
+    expect(storySoFar(outDir, 'ch2')).not.toContain('ch2:');
+    const saved = JSON.parse(fsSync.readFileSync(path.join(outDir, SYNOPSIS_FILE), 'utf8'));
+    expect(Object.keys(saved.chapters)).toEqual(['ch1', 'ch2']);
+  });
+
+  it('falls back to obs events for chapters without a recorded plan', () => {
+    const outDir = makeTemp('synopsis-obs');
+    writeObs(outDir, 'ch1', ['Kim wakes in another world', 'a slime attacks', 'he runs', 'extra']);
+    const so = storySoFar(outDir, 'ch2');
+    expect(so).toContain('ch1: Kim wakes in another world. a slime attacks. he runs.');
+    expect(so).not.toContain('extra');
+  });
+
+  it('caps the synopsis: old chapters shrink to first sentence, recent stay full', () => {
+    const outDir = makeTemp('synopsis-cap');
+    const long = (i: number) =>
+      `Chapter ${i} opening sentence. ` + new Array(60).fill(`detail${i}`).join(' ') + '.';
+    for (let i = 1; i <= 8; i++) recordSynopsis(outDir, `ch${i}`, long(i));
+    const so = storySoFar(outDir, 'ch9');
+    expect(Array.from(so.trimEnd()).length).toBeLessThanOrEqual(SYNOPSIS_CAP);
+    expect(so).toContain('ch1: Chapter 1 opening sentence.\n');
+    expect(so).not.toContain('detail1');
+    expect(so).toContain(long(8));
+    expect(so).toContain(long(7));
+    // deterministic
+    expect(storySoFar(outDir, 'ch9')).toBe(so);
+  });
+});
+
+describe('briefs.ts / story prompts select, not walk', () => {
+  it('drops coverage mandates and carries the recap style rules', async () => {
+    const { STORY_PLAN_TASK, STORY_TASK, STORY_REVIEW_TASK } = await import('../src/contracts/briefs.js');
+    const all = STORY_PLAN_TASK + STORY_TASK + STORY_REVIEW_TASK;
+    for (const gone of [
+      'SCENE COVERAGE IS REQUIRED',
+      'Every numbered source event must be referenced',
+      'Cover EVERY scene',
+      'full scene-by-scene STORY',
+      'A technically causal synopsis is NOT sufficient',
+      'Reject skipping a first appearance',
+      '24 words',
+    ]) expect(all).not.toContain(gone);
+    expect(STORY_PLAN_TASK).toContain('{upcoming}');
+    expect(STORY_PLAN_TASK).toContain('{so_far}');
+    expect(STORY_TASK).toContain('{so_far}');
+    expect(STORY_TASK).toContain('HARD MAXIMUM 32 words');
+    expect(STORY_TASK).toMatch(/our guy/);
+    expect(STORY_TASK).toMatch(/Cold open/);
+    expect(STORY_REVIEW_TASK).toContain('storyboard walk');
+  });
+});
+
+describe('storyWriter.ts / planStory prompt memory', () => {
+  const okPlan = {
+    premise: 'p',
+    turns: [{ want: 'w' }],
+    moments: [{ event: 'e', source_events: [1], evidence_type: 'visible', detail: 'd' }],
+  };
+  const reply = (content: string) =>
+    ({ choices: [{ message: { content } }] }) as unknown as Awaited<ReturnType<typeof call>>;
+
+  it('carries STORY SO FAR and the UPCOMING block only when given', async () => {
+    const prompts: string[] = [];
+    mockedCall.mockImplementation(async (msgs: unknown) => {
+      prompts.push((msgs as Array<{ content: string }>)[0]!.content);
+      return reply(JSON.stringify(okPlan));
+    });
+    try {
+      const seen: unknown[] = [];
+      await planStory({ events: ['a', 'b', 'c'] }, {}, 't', {
+        soFar: 'ch1: earlier.\n',
+        upcoming: UPCOMING_HEADER + 'ch3:\n- later\n',
+        onPlan: (p) => seen.push(p),
+      });
+      await planStory({ events: ['a'] }, {}, 't', {});
+      expect(prompts[0]).toContain('ch1: earlier.');
+      expect(prompts[0]).toContain(UPCOMING_HEADER + 'ch3:\n- later');
+      expect(prompts[1]).not.toContain('UPCOMING (');
+      expect(prompts[1]).toContain('(none yet)');
+      expect(seen).toHaveLength(1);
+    } finally {
+      mockedCall.mockImplementation(async () => {
+        throw new Error('mock matcher offline');
+      });
+    }
   });
 });
 

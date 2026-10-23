@@ -29,6 +29,7 @@ import {existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync} 
 import * as path from "node:path";
 import sharp from "sharp";
 import {normBox, type NormBox} from "../contracts/schemas.js";
+import {detectBubbleBoxes, type BubbleBox} from "./cleaner.js";
 
 // ---------------------------------------------------------------------------
 // Python-compatible primitives
@@ -746,6 +747,289 @@ export async function _continuation(
 }
 
 // ---------------------------------------------------------------------------
+// bubble boxes: CTD detector -> white-blob heuristic -> reader bubble_at
+// ---------------------------------------------------------------------------
+
+/** Pixel rect [x0, y0, x1, y1] of one speech bubble (or text block) in the image. */
+export type BubbleRect = [number, number, number, number];
+
+export type BubbleSource = "ctd" | "heuristic" | "bubble_at" | "none";
+
+export interface BubbleSet {
+  source: BubbleSource;
+  rects: BubbleRect[];
+}
+
+/**
+ * CTD returns TEXT blocks; the balloon outline sits a margin outside them.
+ * Grow each block by a fraction of its short side and of the strip width.
+ */
+export function _bubbleFromText(b: BubbleBox, w: number, h: number): BubbleRect {
+  const [x0, y0, x1, y1] = b;
+  const m = Math.max(0.03 * w, 0.3 * Math.min(x1 - x0, y1 - y0));
+  return [Math.max(0, x0 - m), Math.max(0, y0 - m), Math.min(w, x1 + m), Math.min(h, y1 + m)];
+}
+
+/**
+ * Deterministic fallback: near-white connected blobs of bubble size that hold
+ * dark lettering. White backgrounds/gutters (spanning the strip width) and
+ * blank fields (no dark strokes) are rejected. Returns source-pixel rects.
+ */
+export function _heuristicBubbles(img: Rgb): BubbleRect[] {
+  const small = _pilThumbnail(img, 240, 2400);
+  const sw = small.w;
+  const sh = small.h;
+  const white = _whiteMask(small);
+  const label = new Int32Array(sw * sh).fill(-1);
+  const out: BubbleRect[] = [];
+  const stack: number[] = [];
+  const scaleX = img.w / sw;
+  const scaleY = img.h / sh;
+  const minArea = 0.01 * sw * sw;
+  const maxArea = 0.6 * sw * sw;
+  let next = 0;
+  for (let start = 0; start < sw * sh; start++) {
+    if (!white[start] || label[start] !== -1) continue;
+    const id = next++;
+    label[start] = id;
+    stack.push(start);
+    let count = 0;
+    let minX = sw;
+    let minY = sh;
+    let maxX = -1;
+    let maxY = -1;
+    while (stack.length) {
+      const p = stack.pop()!;
+      count++;
+      const x = p % sw;
+      const y = (p - x) / sw;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (x > 0 && white[p - 1] && label[p - 1] === -1) (label[p - 1] = id), stack.push(p - 1);
+      if (x < sw - 1 && white[p + 1] && label[p + 1] === -1) (label[p + 1] = id), stack.push(p + 1);
+      if (y > 0 && white[p - sw] && label[p - sw] === -1) (label[p - sw] = id), stack.push(p - sw);
+      if (y < sh - 1 && white[p + sw] && label[p + sw] === -1) (label[p + sw] = id), stack.push(p + sw);
+    }
+    const bw = maxX - minX + 1;
+    const bh = maxY - minY + 1;
+    const area = bw * bh;
+    if (count < 0.4 * minArea || area < minArea || area > maxArea) continue;
+    if (bw > 0.92 * sw || (minX === 0 && maxX === sw - 1)) continue;
+    if (count / area < 0.45) continue;
+    let dark = 0;
+    for (let y = minY; y <= maxY; y++) {
+      for (let x = minX; x <= maxX; x++) {
+        const i = (y * sw + x) * 3;
+        const l = (small.data[i] * 299 + small.data[i + 1] * 587 + small.data[i + 2] * 114) / 1000;
+        if (l < 110 && label[y * sw + x] !== id) dark++;
+      }
+    }
+    const df = dark / area;
+    if (df < 0.004 || df > 0.35) continue;
+    out.push([
+      Math.max(0, Math.floor(minX * scaleX)),
+      Math.max(0, Math.floor(minY * scaleY)),
+      Math.min(img.w, Math.ceil((maxX + 1) * scaleX)),
+      Math.min(img.h, Math.ceil((maxY + 1) * scaleY)),
+    ]);
+  }
+  return out;
+}
+
+/** Reader-only fallback: an edge band from the existing white-mask scan. */
+export function _bubbleAtRects(img: Rgb, location: unknown): BubbleRect[] {
+  const [top, bottom] = _speechEdges(img, location);
+  if (top > 0) return [[0, 0, img.w, top]];
+  if (bottom < img.h) return [[0, bottom, img.w, img.h]];
+  return [];
+}
+
+/**
+ * Pick the bubble set for one panel. `ctd` is the detector result for this
+ * image: an array (possibly empty) is trusted, null means unavailable.
+ * Never throws: a failing stage drops to the next one.
+ */
+export function bubbleSet(img: Rgb, ctd: BubbleBox[] | null | undefined, bubbleAt: unknown): BubbleSet {
+  if (Array.isArray(ctd)) {
+    const rects = ctd.map((b) => _bubbleFromText(b, img.w, img.h));
+    if (rects.length) return {source: "ctd", rects};
+    // CTD saw no lettering, but the reader placed an edge bubble: trust a
+    // white-mask band there (lettering CTD misses, e.g. huge display type).
+    try {
+      const band = _bubbleAtRects(img, bubbleAt);
+      if (band.length) return {source: "bubble_at", rects: band};
+    } catch {
+      // keep the empty CTD answer
+    }
+    return {source: "ctd", rects: []};
+  }
+  try {
+    const rects = _heuristicBubbles(img);
+    if (rects.length) return {source: "heuristic", rects};
+  } catch {
+    // fall through to the reader's hint
+  }
+  try {
+    const rects = _bubbleAtRects(img, bubbleAt);
+    if (rects.length) return {source: "bubble_at", rects};
+  } catch {
+    // no bubble information at all
+  }
+  return {source: "none", rects: []};
+}
+
+// ---------------------------------------------------------------------------
+// window picker (recap-channel framing)
+// ---------------------------------------------------------------------------
+
+/** "window": full-width sliding window (default). "fit": legacy cropWindow. */
+export type FramingMode = "window" | "fit";
+export const DEFAULT_FRAMING_MODE: FramingMode = "window";
+/** Window aspect (w/h) bounds: tall full-body strip .. wide close-up. */
+export const WINDOW_MIN_ASPECT = 0.42;
+export const WINDOW_MAX_ASPECT = 1.9;
+/** Context padding per side, as a fraction of the subject height, by weight. */
+export const WINDOW_PAD: Record<number, number> = {1: 0.1, 2: 0.16, 3: 0.28};
+
+export function framingMode(): FramingMode {
+  const v = (process.env.MANHWA_FRAMING_MODE || "").toLowerCase();
+  return v === "fit" ? "fit" : v === "window" ? "window" : DEFAULT_FRAMING_MODE;
+}
+
+/**
+ * A reader box often swallows the bubble at its top or bottom. Cut the box
+ * back to the bubble's far edge when the bubble sits in that end of the box,
+ * keeping at least 55% of the original subject height.
+ */
+export function _trimSubject(box: Rect, bubbles: readonly BubbleRect[]): Rect {
+  let [x0, y0, x1, y1] = box;
+  const h0 = y1 - y0;
+  const sorted = [...bubbles].sort((a, b) => a[1] - b[1]);
+  for (const b of sorted) {
+    const ix = Math.min(x1, b[2]) - Math.max(x0, b[0]);
+    if (ix <= 0 || b[3] <= y0 || b[1] >= y1) continue;
+    const cy = (b[1] + b[3]) / 2;
+    if (cy < y0 + 0.35 * (y1 - y0) && y1 - b[3] >= 0.55 * h0) y0 = Math.max(y0, b[3]);
+  }
+  for (const b of sorted.reverse()) {
+    const ix = Math.min(x1, b[2]) - Math.max(x0, b[0]);
+    if (ix <= 0 || b[3] <= y0 || b[1] >= y1) continue;
+    const cy = (b[1] + b[3]) / 2;
+    if (cy > y1 - 0.35 * (y1 - y0) && b[1] - y0 >= 0.55 * h0) y1 = Math.min(y1, b[1]);
+  }
+  return [x0, y0, x1, y1];
+}
+
+export interface WindowInput {
+  w: number;
+  h: number;
+  /** Subject rect in pixels. */
+  subject: Rect;
+  bubbles: readonly BubbleRect[];
+  weight?: number;
+  /** Anchor row (pixels) used when the subject is taller than the window. */
+  focusY?: number;
+}
+
+/**
+ * Choose a full-width window [0, top, w, bottom].
+ * Height = subject height + weight-scaled context, bounded by the aspect
+ * limits and the image. Candidate windows (several heights from the
+ * tight fit up to the target, every vertical offset that keeps the subject
+ * inside) are scored on bubble pixels inside, then subject centring, then
+ * lost context. A subject taller than the tallest window keeps focusY inside.
+ */
+export function pickWindow(inp: WindowInput): Rect {
+  const {w, h, bubbles} = inp;
+  const [, sy0r, , sy1r] = inp.subject;
+  const sy0 = Math.max(0, Math.min(h, sy0r));
+  const sy1 = Math.max(sy0 + 1, Math.min(h, sy1r));
+  const subjH = sy1 - sy0;
+  const pad = WINDOW_PAD[Math.round(inp.weight ?? 2)] ?? WINDOW_PAD[2]!;
+  const minH = Math.min(h, Math.ceil(w / WINDOW_MAX_ASPECT));
+  const maxH = Math.min(h, Math.floor(w / WINDOW_MIN_ASPECT));
+  const clampH = (v: number) => Math.max(minH, Math.min(maxH, Math.round(v)));
+  const target = clampH(subjH * (1 + 2 * pad) + 0.04 * w);
+  const tight = clampH(subjH * (1 + 2 * Math.min(0.05, pad)));
+  // Bubble coverage per row (summed widths, capped at the strip width).
+  const rows = new Float64Array(h);
+  for (const b of bubbles) {
+    const bx = Math.max(0, Math.min(w, b[2]) - Math.max(0, b[0]));
+    if (bx <= 0) continue;
+    for (let y = Math.max(0, Math.floor(b[1])); y < Math.min(h, Math.ceil(b[3])); y++) rows[y] += bx;
+  }
+  const pre = new Float64Array(h + 1);
+  for (let y = 0; y < h; y++) pre[y + 1] = pre[y] + Math.min(w, rows[y]);
+  const anchor = subjH > maxH && inp.focusY !== undefined ? inp.focusY : (sy0 + sy1) / 2;
+  const heights = new Set<number>();
+  const steps = 8;
+  for (let i = 0; i <= steps; i++) heights.add(Math.round(tight + ((target - tight) * i) / steps));
+  let best: [number, number] = [Math.max(0, Math.min(h - target, Math.round(anchor - target / 2))), target];
+  let bestScore = Infinity;
+  for (const wh of heights) {
+    let lo: number;
+    let hi: number;
+    if (wh >= subjH) {
+      lo = Math.max(0, sy1 - wh);
+      hi = Math.min(h - wh, sy0);
+    } else {
+      // Subject does not fit: stay within it and keep the anchor inside.
+      lo = Math.max(sy0, Math.ceil(anchor - wh * 0.85));
+      hi = Math.min(sy1 - wh, Math.floor(anchor - wh * 0.15));
+      if (lo > hi) {
+        lo = sy0;
+        hi = Math.max(sy0, sy1 - wh);
+      }
+      lo = Math.max(0, Math.min(h - wh, lo));
+      hi = Math.max(lo, Math.min(h - wh, hi));
+    }
+    if (lo > hi) continue;
+    const step = Math.max(1, Math.floor((hi - lo) / 160));
+    for (let t = lo; ; t = Math.min(hi, t + step)) {
+      const bubble = (pre[t + wh] - pre[t]) / (w * wh);
+      const centre = Math.abs(t + wh / 2 - anchor) / wh;
+      const lost = 1 - wh / target;
+      const score = 4 * bubble + 0.5 * centre + 0.6 * lost;
+      if (score < bestScore - 1e-9) {
+        bestScore = score;
+        best = [t, wh];
+      }
+      if (t >= hi) break;
+    }
+  }
+  const [top, wh] = best;
+  return [0, Math.max(0, top), w, Math.min(h, top + wh)];
+}
+
+/** Trim uniform white/black side columns outside the subject, at most 12% per side. */
+export function _trimBlankColumns(img: Rgb, rect: Rect, subject: Rect): Rect {
+  let [left, top, right, bottom] = rect;
+  const height = bottom - top;
+  if (height <= 0) return rect;
+  const blank = (col: number): boolean => {
+    let white = 0;
+    let black = 0;
+    for (let y = top; y < bottom; y++) {
+      const i = (y * img.w + col) * 3;
+      const r = img.data[i];
+      const g = img.data[i + 1];
+      const b = img.data[i + 2];
+      if (r > 242 && g > 242 && b > 242) white++;
+      if (r < 12 && g < 12 && b < 12) black++;
+    }
+    return white / height > 0.97 || black / height > 0.98;
+  };
+  const maxCut = Math.floor(0.12 * img.w);
+  const leftLimit = Math.min(Math.floor(subject[0]), left + maxCut);
+  const rightLimit = Math.max(Math.ceil(subject[2]), right - maxCut);
+  while (left < leftLimit && blank(left)) left++;
+  while (right > rightLimit && blank(right - 1)) right--;
+  return [left, top, right, bottom];
+}
+
+// ---------------------------------------------------------------------------
 // frame_shots
 // ---------------------------------------------------------------------------
 
@@ -753,6 +1037,17 @@ export interface FramingStats {
   cropped: number;
   continued: number;
   unchanged: number;
+  /** Window mode: how many framed panels got bubbles from each source. */
+  bubbles?: Partial<Record<BubbleSource, number>>;
+}
+
+export interface FrameOptions {
+  /** Default: MANHWA_FRAMING_MODE, else DEFAULT_FRAMING_MODE. */
+  mode?: FramingMode;
+  /** On-disk cache for detector boxes. Default: <cropsDir>/.bubbles */
+  bubbleCacheDir?: string;
+  /** Detector override (tests). Default: cleaner.detectBubbleBoxes (CTD). */
+  detect?: (images: readonly string[], cacheDir: string) => Promise<Record<string, BubbleBox[] | null>>;
 }
 
 export type FrameShot = Rec;
@@ -780,6 +1075,7 @@ export async function frameShots(
   obs: FrameObs,
   panelsDir: string,
   cropsDir: string,
+  opts: FrameOptions = {},
 ): Promise<FramingStats> {
   const byId = new Map<string, Rec>();
   const panels = Array.isArray(obs?.panels) ? obs.panels : [];
@@ -804,32 +1100,71 @@ export async function frameShots(
     const nxt = i + 1 < recs.length && isRec(recs[i + 1]) ? recs[i + 1] : null;
     records.set(pyStem(r["panel"]), [r, nxt]);
   }
-  const stats: FramingStats = {cropped: 0, continued: 0, unchanged: 0};
+  const stats: FramingStats = {cropped: 0, continued: 0, unchanged: 0, bubbles: {}};
+  const mode = opts.mode ?? framingMode();
+  const sourceOf = (shot: Rec, pid: string): string =>
+    pyGetOr(shot, "_src", path.join(panelsDir, pid + ".jpg")) as string;
+  // One detector call for every image this chapter frames (cached per image hash).
+  let ctd: Record<string, BubbleBox[] | null> = {};
+  if (mode === "window") {
+    const wanted: string[] = [];
+    for (const shot of shots) {
+      if (!isRec(shot) || pyTruthy(shot["framed"])) continue;
+      const pid = pyStem(String(pyGet(shot, "source_panel", shot["panel"]) ?? ""));
+      const pg = byId.get(pid) ?? {};
+      if (!normBox(pyGet(shot, "box", pg["box"])) || Number(pg["art"] ?? 0) < 0.5) continue;
+      const src = sourceOf(shot, pid);
+      if (existsSync(src)) wanted.push(src);
+    }
+    try {
+      ctd = await (opts.detect ?? detectBubbleBoxes)(wanted, opts.bubbleCacheDir ?? path.join(cropsDir, ".bubbles"));
+    } catch {
+      ctd = {};
+    }
+  }
   for (const shot of shots) {
     if (!isRec(shot)) continue;
     const pid = pyStem(String(pyGet(shot, "source_panel", shot["panel"]) ?? ""));
     const pg = byId.get(pid) ?? {};
     let box = normBox(pyGet(shot, "box", pg["box"]));
+    const fullBox = !!box && (box.x1 - box.x0) * (box.y1 - box.y0) > 0.95;
     if (
       pyTruthy(shot["framed"]) ||
       !box ||
       Number(pg["art"] ?? 0) < 0.5 ||
-      (box.x1 - box.x0) * (box.y1 - box.y0) > 0.95
+      (mode === "fit" && fullBox)
     ) {
       stats.unchanged += 1;
       continue;
     }
-    const source = pyGetOr(shot, "_src", path.join(panelsDir, pid + ".jpg")) as string;
+    const source = sourceOf(shot, pid);
     let image = await loadRgb(source);
     const w = image.w;
     const originalH = image.h;
-    const [speechTop, speechBottom] = _speechEdges(image, pg["bubble_at"]);
-    box = {
-      x0: box.x0,
-      y0: Math.max(box.y0, speechTop / originalH),
-      x1: box.x1,
-      y1: Math.min(box.y1, speechBottom / originalH),
-    };
+    let speechTop = 0;
+    let speechBottom = originalH;
+    let bubbles: BubbleRect[] = [];
+    if (mode === "window") {
+      const set = bubbleSet(image, ctd[source], pg["bubble_at"]);
+      bubbles = set.rects;
+      stats.bubbles![set.source] = (stats.bubbles![set.source] ?? 0) + 1;
+      // A whole-panel subject that already fits the frame, with no bubble to
+      // dodge, is shown as it is; a huge tall strip is still windowed.
+      if (fullBox && originalH <= w / WINDOW_MIN_ASPECT && bubbles.length === 0) {
+        stats.unchanged += 1;
+        continue;
+      }
+      const [, ty0, , ty1] = _trimSubject([box.x0 * w, box.y0 * originalH, box.x1 * w, box.y1 * originalH], bubbles);
+      box = {x0: box.x0, y0: ty0 / originalH, x1: box.x1, y1: ty1 / originalH};
+    } else {
+      [speechTop, speechBottom] = _speechEdges(image, pg["bubble_at"]);
+      box = {
+        x0: box.x0,
+        y0: Math.max(box.y0, speechTop / originalH),
+        x1: box.x1,
+        y1: Math.min(box.y1, speechBottom / originalH),
+      };
+    }
     if (box.y1 <= box.y0) {
       stats.unchanged += 1;
       continue;
@@ -853,9 +1188,35 @@ export async function frameShots(
       sources.push(nextId);
       stats.continued += 1;
     }
-    let rect = _trimBlankPadding(image, cropWindow({w: image.w, h: image.h}, box), box);
-    if (!continuation) {
-      rect = [rect[0], Math.max(rect[1], speechTop), rect[2], Math.min(rect[3], speechBottom)];
+    let rect: Rect;
+    if (mode === "window") {
+      const subjectPx: Rect = [box.x0 * image.w, box.y0 * image.h, box.x1 * image.w, box.y1 * image.h];
+      rect = pickWindow({
+        w: image.w,
+        h: image.h,
+        subject: subjectPx,
+        bubbles,
+        weight: Number(pyGet(shot, "weight", pg["weight"] ?? 2)),
+        focusY: fy,
+      });
+      // Blank-trim may only eat rows of the window that lie outside the subject.
+      const keep: NormBox = {
+        x0: box.x0,
+        x1: box.x1,
+        y0: Math.max(box.y0, rect[1] / image.h),
+        y1: Math.min(box.y1, rect[3] / image.h),
+      };
+      rect = _trimBlankPadding(image, rect, keep);
+      rect = _trimBlankColumns(image, rect, subjectPx);
+      if (rect[3] - rect[1] < 2 || rect[2] - rect[0] < 2) {
+        stats.unchanged += 1;
+        continue;
+      }
+    } else {
+      rect = _trimBlankPadding(image, cropWindow({w: image.w, h: image.h}, box), box);
+      if (!continuation) {
+        rect = [rect[0], Math.max(rect[1], speechTop), rect[2], Math.min(rect[3], speechBottom)];
+      }
     }
     const [left, top, right, bottom] = rect;
     const cropW = right - left;
@@ -877,7 +1238,7 @@ export async function frameShots(
     // guard (which could have welded an unverified promo donor into a composite)
     // can never be reused; the digest is the sole crop-cache key.
     const digest = createHash("sha256")
-      .update(Buffer.from("render-crop-v2"))
+      .update(Buffer.from(mode === "window" ? "render-crop-v3-window" : "render-crop-v2"))
       .update(Buffer.from(strRect(rect)))
       .update(Buffer.from(crop))
       .digest("hex")

@@ -28,5 +28,18 @@ export const DUO_MAX_CROP = 0.55;   // each panel keeps >= 55% visible, else it 
 export const DUO_MIN_AREA = 0.45;   // a pair must cover >= 45% of the frame, else solo
 export const PAN_SPAN = 0.7;        // how much of the cropped axis the pan travels
 
+// Window preset (2026-10-23): recap-channel layout, measured on 130 reference shots.
+export const WINDOW_MIN_AR = 0.42;        // taller strips are cropped on y to this card aspect
+export const WINDOW_ZOOM = [0.045, 0.06, 0.08];  // push-in by weight 1/2/3 (1.045..1.08)
+export const WINDOW_ZOOM_RATE = 0.02;     // max push-in per second; caps short shots' speed
+export const WINDOW_BOX_ZOOM_FLOOR = 1.02; // framed shots never zoom past their reader box below this
+export const WINDOW_BG_BLUR = 48;         // px at full frame size
+export const WINDOW_BG_BRIGHTNESS = 0.65;
+export const WINDOW_BG_SATURATE = 1.1;
+export const WINDOW_BG_OVERSCALE = 1.2;   // hides the blur's soft edge
+export const WINDOW_BG_DOWNSCALE = 4;     // blur is painted at 1/4 size, then scaled up
+export const WINDOW_SHADOW = '0 0 36px rgba(0,0,0,0.45)';
+export const WINDOW_PREMOUNT_S = 1;
+
 export const W = 1280;
 export const H = 720;

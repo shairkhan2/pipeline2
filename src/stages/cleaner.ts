@@ -85,6 +85,11 @@ export const PROMO_BOXES_SUFFIX = ".promo_boxes.json";
  */
 export const PROMO_ADAPTER = path.resolve(HERE, "../../tools/promo_ocr_export.py");
 export const PROMO_ADAPTER_TIMEOUT = 900;
+/** Boxes-only CTD export used by framing to keep speech bubbles out of the shot. */
+export const BUBBLE_ADAPTER = path.resolve(HERE, "../../tools/bubble_boxes_export.py");
+/** Fixed start-up allowance plus a per-image budget (CPU, tiled tall strips). */
+export const BUBBLE_ADAPTER_BASE_TIMEOUT = 90;
+export const BUBBLE_ADAPTER_PER_IMAGE_TIMEOUT = 45;
 // PROMO_ROI_PAD_FRAC re-exported from hashes.ts (0.5).
 
 export interface PromoBlockLike {
@@ -119,6 +124,8 @@ export interface CleanerHooks {
   promoGone: typeof promoGone;
   /** Not in the required six, but `_runOcrExport` calls it so scale-back is testable. */
   _runAdapter: typeof _runAdapter;
+  /** CTD boxes-only export for framing; replace to mock the detector. */
+  _runBubbleAdapter: typeof _runBubbleAdapter;
 }
 
 // Assigned after the implementations. Call sites use this object, so a test
@@ -808,6 +815,129 @@ export async function _runAdapter(srcd: string, outJson: string): Promise<boolea
   }
 }
 
+// --------------------------------------------------------------------------- //
+// bubble boxes (framing): CTD text blocks per image, cached by image hash
+// --------------------------------------------------------------------------- //
+
+/** [x0, y0, x1, y1, conf] in source-image pixels. */
+export type BubbleBox = [number, number, number, number, number];
+
+export const BUBBLE_CACHE_SUFFIX = ".bubbles.json";
+export const BUBBLE_SCHEMA = "bubble-boxes-1";
+
+function bubbleCachePath(cacheDir: string, sha: string): string {
+  return path.join(cacheDir, `${sha}${BUBBLE_CACHE_SUFFIX}`);
+}
+
+function validBubbleBoxes(v: unknown): BubbleBox[] | null {
+  if (!Array.isArray(v)) return null;
+  const out: BubbleBox[] = [];
+  for (const b of v) {
+    if (!Array.isArray(b) || b.length < 4) return null;
+    const n = b.slice(0, 5).map(Number);
+    if (n.some((x) => !Number.isFinite(x))) return null;
+    if (!(n[2]! > n[0]! && n[3]! > n[1]!)) continue;
+    out.push([n[0]!, n[1]!, n[2]!, n[3]!, n.length > 4 ? n[4]! : 1]);
+  }
+  return out;
+}
+
+function readBubbleCache(file: string): BubbleBox[] | null {
+  try {
+    const d = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    if (d.schema !== BUBBLE_SCHEMA || d.detector !== PCLEANER_DETECTOR) return null;
+    return validBubbleBoxes(d.boxes);
+  } catch {
+    return null;
+  }
+}
+
+/** One CLI call for every uncached image. null = the detector did not run. */
+export async function _runBubbleAdapter(images: readonly string[]): Promise<Record<string, BubbleBox[] | null> | null> {
+  if (!images.length) return {};
+  if (!pcleanerInstalled() || !fs.existsSync(BUBBLE_ADAPTER)) return null;
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "pcleaner_bubbles_"));
+  try {
+    const outJson = path.join(scratch, "boxes.json");
+    const cmd = [pcleanerPy(), BUBBLE_ADAPTER, "--model", pcleanerModel(), "--output", outJson, ...images];
+    const timeout = (BUBBLE_ADAPTER_BASE_TIMEOUT + BUBBLE_ADAPTER_PER_IMAGE_TIMEOUT * images.length) * 1000;
+    const env = pcleanerEnv(scratch);
+    // Detection only: no LaMa, so let OpenCV use the cores it has.
+    const threads = String(Math.max(1, os.cpus().length));
+    env.OMP_NUM_THREADS = threads;
+    const r = await lappy.withHeavy(() =>
+      spawnSync(cmd[0]!, cmd.slice(1), { cwd: scratch, encoding: "utf8", timeout, env, maxBuffer: 32 * 1024 * 1024 }),
+    );
+    if (r.error || r.status !== 0 || !fs.existsSync(outJson)) {
+      elog(`  bubbles: CTD export rc=${r.status ?? r.signal ?? errMsg(r.error)}: ${(r.stderr ?? "").slice(-300)}`);
+      return null;
+    }
+    const payload = JSON.parse(fs.readFileSync(outJson, "utf8")) as Record<string, unknown>;
+    if (payload.schema !== BUBBLE_SCHEMA || !isMapping(payload.images)) return null;
+    const out: Record<string, BubbleBox[] | null> = {};
+    for (const p of images) {
+      const rec = payload.images[p];
+      out[p] = isMapping(rec) ? validBubbleBoxes(rec.boxes) : null;
+    }
+    return out;
+  } catch (e) {
+    elog(`  bubbles: CTD export failed (${errName(e)}: ${errMsg(e)})`);
+    return null;
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/**
+ * CTD text-block boxes for each image, cached on disk by image sha1. A value of
+ * null means "no detector result" (tool missing, failed, or disabled by
+ * MANHWA_BUBBLE_DETECTOR=off|heuristic); callers fall back to a heuristic.
+ * Never throws.
+ */
+export async function detectBubbleBoxes(
+  images: readonly string[],
+  cacheDir: string,
+): Promise<Record<string, BubbleBox[] | null>> {
+  const out: Record<string, BubbleBox[] | null> = {};
+  const mode = (process.env.MANHWA_BUBBLE_DETECTOR || "ctd").toLowerCase();
+  const todo: { p: string; sha: string }[] = [];
+  for (const p of new Set(images)) {
+    out[p] = null;
+    const sha = sourceSha1(p);
+    if (!sha) continue;
+    const hit = readBubbleCache(bubbleCachePath(cacheDir, sha));
+    if (hit) out[p] = hit;
+    else todo.push({ p, sha });
+  }
+  if (!todo.length || mode === "off" || mode === "heuristic") return out;
+  let got: Record<string, BubbleBox[] | null> | null = null;
+  try {
+    got = await _hooks._runBubbleAdapter(todo.map((t) => t.p));
+  } catch (e) {
+    elog(`  bubbles: detector failed (${errName(e)}: ${errMsg(e)})`);
+  }
+  if (!got) return out;
+  try {
+    fs.mkdirSync(cacheDir, { recursive: true });
+  } catch {
+    // caching is best-effort
+  }
+  for (const { p, sha } of todo) {
+    const boxes = got[p] ?? null;
+    out[p] = boxes;
+    if (!boxes) continue;
+    const file = bubbleCachePath(cacheDir, sha);
+    const tmp = `${file}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify({ schema: BUBBLE_SCHEMA, detector: PCLEANER_DETECTOR, boxes }));
+      fs.renameSync(tmp, file);
+    } catch {
+      removeStale(tmp);
+    }
+  }
+  return out;
+}
+
 function offsetLines(lines: number[][], ox: number, oy: number, scale: number): number[][] {
   let shifted = lines.map((poly) => poly.map((v, k) => v + (k % 2 === 0 ? ox : oy)));
   if (scale && scale !== 1) shifted = shifted.map((poly) => poly.map((v) => v / scale));
@@ -1325,6 +1455,7 @@ _hooks._runPanelCleaner = _runPanelCleaner;
 _hooks.residualOverlay = residualOverlay;
 _hooks.promoGone = promoGone;
 _hooks._runAdapter = _runAdapter;
+_hooks._runBubbleAdapter = _runBubbleAdapter;
 
 // snake_case aliases (cleaner.py names)
 export const has_world_text = hasWorldText;

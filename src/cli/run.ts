@@ -873,6 +873,26 @@ export async function _runLocked(
         const panelsList = Array.isArray(obs.panels) ? obs.panels : [];
         _hooks.telemetry.stage(ch, "reader", "done", { panels: panelsList.length });
 
+        // Look-ahead: read the next chapters now (cached obs, no bible merge) so the
+        // story writer can weigh setup against filler. Best-effort: never blocks this chapter.
+        const readAhead = Math.max(0, Number.parseInt(process.env.READ_AHEAD ?? "2", 10) || 0);
+        if (attempt === 0 && readAhead > 0) {
+          const aheadCast = (() => {
+            try { return castBlock(bible); } catch { return _cast; }
+          })();
+          for (const next of chs.slice(chs.indexOf(ch) + 1, chs.indexOf(ch) + 1 + readAhead)) {
+            const nextDir = path.join(sdir, next);
+            if (!isDirectory(nextDir)) continue;
+            try {
+              await _hooks.readChapter(nextDir, out, false, keepStale, aheadCast, cv);
+              console.log(`   read-ahead: ${next} ready for the writer's look-ahead`);
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              process.stderr.write(`   read-ahead: ${next} skipped (${msg.slice(0, 160)})\n`);
+            }
+          }
+        }
+
         const charsObj = isRecord(bible.characters) ? bible.characters : {};
         const linksArr = Array.isArray(bible.links) ? bible.links : [];
         const covArr = Array.isArray(bible.covered) ? (bible.covered as string[]) : [];

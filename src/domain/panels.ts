@@ -7,7 +7,7 @@
  * not by panel id. Pass adjKeys(keymap(...)) into isAdj / isChain.
  */
 
-export const SHOT_MIN_S = 0.8;
+export const SHOT_MIN_S = 1.5;
 
 /** Unparseable id sorts last. reader.panel_order_key / timeline._FAR. */
 export const FAR_KEY: readonly [number, number] = Object.freeze([1 << 30, 1 << 30]);

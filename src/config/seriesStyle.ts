@@ -15,16 +15,16 @@ export const ttsStyleSchema = z.object({
 }).strict();
 
 export const PACING = {
-  fast: { SHOT_S: 2, RUN_S: 1, SHOT_MIN_S: 0.8, JAB_GAP: 5, MAX_RUN: 8 },
-  normal: { SHOT_S: 2.5, RUN_S: 1.25, SHOT_MIN_S: 0.8, JAB_GAP: 4, MAX_RUN: 6 },
-  slow: { SHOT_S: 3.25, RUN_S: 1.75, SHOT_MIN_S: 1, JAB_GAP: 3, MAX_RUN: 4 },
+  fast: { SHOT_S: 2, RUN_S: 1, SHOT_MIN_S: 1.5, JAB_GAP: 5, MAX_RUN: 8 },
+  normal: { SHOT_S: 2.5, RUN_S: 1.25, SHOT_MIN_S: 1.5, JAB_GAP: 4, MAX_RUN: 6 },
+  slow: { SHOT_S: 3.25, RUN_S: 1.75, SHOT_MIN_S: 1.75, JAB_GAP: 3, MAX_RUN: 4 },
 } as const;
 
 export function resolveSeriesStyle(style: SeriesStyle = {}, env: NodeJS.ProcessEnv = process.env) {
   const pacing = style.pacing ?? env.PACING ?? 'normal';
   const emotionTags = style.emotionTags ?? env.EMOTION_TAGS ?? 'auto';
   return {
-    writerMode: style.writerMode ?? env.WRITER_MODE ?? 'legacy',
+    writerMode: style.writerMode ?? env.WRITER_MODE ?? 'story',
     matchMode: style.matchMode ?? env.MATCH_MODE ?? 'auto',
     emotionTags,
     pacing: PACING[pacing as keyof typeof PACING] ?? PACING.normal,

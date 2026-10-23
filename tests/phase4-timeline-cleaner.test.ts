@@ -16,7 +16,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import sharp from "sharp";
 
 import {
@@ -62,6 +62,8 @@ import {
 import {
   _borrowRun,
   buildShots,
+  LEGACY_MIN_PANEL_S,
+  MIN_PANEL_S,
   parseScript,
   pickPanels,
   type TimelineShot,
@@ -644,6 +646,15 @@ describe("cleaner.cleanPromoMask", () => {
 // ---------------------------------------------------------------------------
 
 describe("framing", () => {
+  // Deterministic: these fixtures test geometry, not the CTD model.
+  const prevDetector = process.env.MANHWA_BUBBLE_DETECTOR;
+  beforeAll(() => {
+    process.env.MANHWA_BUBBLE_DETECTOR = "heuristic";
+  });
+  afterAll(() => {
+    if (prevDetector === undefined) delete process.env.MANHWA_BUBBLE_DETECTOR;
+    else process.env.MANHWA_BUBBLE_DETECTOR = prevDetector;
+  });
   it("cropWindow never cuts the interest box, and does not borrow opposite-edge padding", () => {
     for (const box of [
       { x0: 0, y0: 0.7, x1: 1, y1: 1 },
@@ -1317,6 +1328,7 @@ print("ok", len(rows))
         path.join(V1_SERIES, "reality-quest", "out", "panels", row.ch),
         block,
         row.hook,
+        LEGACY_MIN_PANEL_S,
       );
       if (shots.length !== row.shots.length) {
         mismatches.push(`${row.ch} length ${shots.length} != ${row.shots.length}`);

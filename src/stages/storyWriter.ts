@@ -260,13 +260,20 @@ export interface StoryCallOptions {
   previous?: string;
   /** Already spoken opening (episode 1 hook); never repeated by the draft. */
   opening?: string;
+  /** Running series synopsis ("STORY SO FAR"), continuity only. */
+  soFar?: string;
+  /** Look-ahead block of later chapters' events; planner only, never narrated. */
+  upcoming?: string;
+  /** Receives the validated plan (series memory records it). */
+  onPlan?: (plan: StoryPlan) => void;
   /** ElevenLabs v3 inline delivery tags on the drafting call. */
   emotion?: boolean;
   /** Directory for prompt/response diagnostics; null disables every write. */
   diagnosticsDir?: string | null;
 }
 
-export const UNIT_MAX_WORDS = 24;
+export const UNIT_MAX_WORDS = 32;
+export const JAB_MAX_WORDS = 12;
 export const JAB_GAP = 4;
 
 const OUTLINE_FIELDS = ["want", "obstacle", "choice", "change"] as const;
@@ -349,7 +356,10 @@ export const cast_context = castContext;
 // story_writer.validate_draft / validate_plan / validate_review
 // ---------------------------------------------------------------------------
 
-/** `moments` null/undefined -> skip timing, per-scene and coverage checks. */
+/**
+ * `moments` null/undefined -> skip scene-reference and unit-size checks. Selection is
+ * the point of story mode: a draft may skip planned scenes, so there is no coverage check.
+ */
 export function validateDraft(data: unknown, moments?: unknown[] | null): Draft {
   if (!isRecord(data) || !exactKeys(data, ["outline", "steps"])) {
     throw new StoryReviewError("draft must contain outline and steps only");
@@ -402,28 +412,26 @@ export function validateDraft(data: unknown, moments?: unknown[] | null): Draft 
           `step ${n} is an oversized spoken unit (${words.length} words, max ${UNIT_MAX_WORDS})`,
         );
       }
-      if (pySplit(raw.jab as string).length > 12) {
+      if (pySplit(raw.jab as string).length > JAB_MAX_WORDS) {
         throw new StoryReviewError(`step ${n} has an oversized reaction`);
       }
     }
   });
-  if (moments != null) {
-    const covered = new Set(steps.map((row) => (row as Step).scene));
-    const missing: number[] = [];
-    for (let s = 1; s <= moments.length; s++) if (!covered.has(s)) missing.push(s);
-    if (missing.length) {
-      throw new StoryReviewError(`draft skips planned scenes: [${missing.join(", ")}]`);
-    }
-  }
   return data as unknown as Draft;
 }
 
 export const validate_draft = validateDraft;
 
+/**
+ * Structural plan contract. The plan SELECTS: it need not account for every source
+ * event, and omitted_events is optional. `nEvents` only bounds references so a moment
+ * cannot cite an event that does not exist.
+ */
 export function validatePlan(data: unknown, nEvents?: number | null): StoryPlan {
   if (
     !isRecord(data) ||
-    !exactKeys(data, ["premise", "turns", "moments", "omitted_events"]) ||
+    !(exactKeys(data, ["premise", "turns", "moments", "omitted_events"]) ||
+      exactKeys(data, ["premise", "turns", "moments"])) ||
     typeof data.premise !== "string" ||
     !pyStrip(data.premise)
   ) {
@@ -466,8 +474,9 @@ export function validatePlan(data: unknown, nEvents?: number | null): StoryPlan 
     }
     for (const i of refs) accounted.add(i as number);
   }
+  if (!hasOwn(data, "omitted_events")) data.omitted_events = [];
   if (!Array.isArray(data.omitted_events)) {
-    throw new StoryReviewError("omitted_events must explicitly explain source exclusions");
+    throw new StoryReviewError("omitted_events must be a list when given");
   }
   for (const raw of data.omitted_events) {
     if (
@@ -476,23 +485,15 @@ export function validatePlan(data: unknown, nEvents?: number | null): StoryPlan 
       typeof raw.event !== "number" ||
       !Number.isInteger(raw.event) ||
       raw.event < 1 ||
-      typeof raw.reason !== "string" ||
-      !pyStrip(raw.reason)
+      typeof raw.reason !== "string"
     ) {
       throw new StoryReviewError("invalid omitted event");
     }
     if (accounted.has(raw.event)) throw new StoryReviewError("covered event also marked omitted");
     accounted.add(raw.event);
   }
-  if (nEvents) {
-    const want = new Set<number>();
-    for (let i = 1; i <= nEvents; i++) want.add(i);
-    const same = accounted.size === want.size && [...want].every((i) => accounted.has(i));
-    if (!same) {
-      throw new StoryReviewError(
-        "plan must account for every original event, with no invented references",
-      );
-    }
+  if (nEvents && [...accounted].some((i) => i > nEvents)) {
+    throw new StoryReviewError("plan references a source event that does not exist");
   }
   return data as unknown as StoryPlan;
 }
@@ -632,6 +633,8 @@ export async function planStory(
     transcript,
     previous,
     opening,
+    so_far: opts.soFar || "(none yet)",
+    upcoming: opts.upcoming ? opts.upcoming.replace(/\n*$/, "\n") : "",
   });
   writeDiag(opts.diagnosticsDir, "plan-prompt.txt", planPrompt);
   const planned = await call([{ role: "user", content: planPrompt }], {
@@ -645,7 +648,9 @@ export async function planStory(
   writeDiag(opts.diagnosticsDir, "plan-response.json", jsonIndent1(planned));
   try {
     const events = Array.isArray(obs?.events) ? obs.events : [];
-    return validatePlan(parseJson(completionContent(planned)), events.length);
+    const plan = validatePlan(parseJson(completionContent(planned)), events.length);
+    opts.onPlan?.(plan);
+    return plan;
   } catch (e) {
     throw new StoryReviewError(`story plan contract: ${errMessage(e)}`);
   }
@@ -681,6 +686,7 @@ export async function draftStory(
   const prompt = pyStrFormat(STORY_TASK, {
     source: narrativeSource,
     transcript: "Original facts are checked independently after drafting.",
+    so_far: opts.soFar || "(none yet)",
     previous,
     opening,
     delivery,
@@ -730,6 +736,7 @@ export async function reviewStory(
   const reviewPrompt = pyStrFormat(STORY_REVIEW_TASK, {
     source,
     transcript,
+    so_far: opts.soFar || "(none yet)",
     previous,
     opening,
     draft: pyJsonDumps(numbered, { ensureAscii: false }),
@@ -776,31 +783,31 @@ export async function writeStoryScript(
   try {
     validateDraft(draft, plan.moments);
   } catch (e) {
-    // Timing/coverage is repairable within the SAME single-correction budget.
+    // Unit size / scene reference is repairable within the SAME single-correction budget.
     // This is a structural diagnostic, not a fabricated LLM semantic verdict.
     structural = {
       verdict: "reject",
       structural_error: errMessage(e),
       instruction:
-        "Check ALL units and cover ALL scene references; split, do not delete story facts.",
+        `Every step needs an existing scene reference; split any line over ${UNIT_MAX_WORDS} words or any jab over ${JAB_MAX_WORDS}.`,
     } as unknown as StoryReview;
     writeDiag(diag, "draft-structure-error.json", jsonIndent1(structural));
   }
   verdict = structural ?? (await reviewStory(draft, plan, obs, bible, transcript, opts));
   if (verdict.verdict !== "accept") {
-    // One content correction, not reroll-until-accept. Keep all original evidence.
-    // A missed exchange may not be represented in the reader's events; original
-    // dialogue is needed here, not an instruction to merely obey a fallible judge.
+    // One content correction, not reroll-until-accept. Keep all original evidence:
+    // original dialogue is needed here, not an instruction to merely obey a fallible judge.
     const repairPrompt =
       prompt +
       "\n\nSOURCE-BACKED CORRECTION (one attempt):\n" +
-      "Revise the supplied draft using the original facts. Preserve correct " +
-      "scenes and chronology. Address genuine omissions or unsupported claims. " +
+      "Revise the supplied draft using the original facts. Fix only the flagged " +
+      "problems: unsupported claims, false intervals or knowledge, caption-tour or " +
+      "'then'-chain lines, factual jabs, and a missing pivotal cause or payoff. " +
       "The review is fallible: if a claim is already paraphrased, do not duplicate " +
-      "it or invent facts to appease the reviewer. Give distinct spoken units " +
-      "to questions, consequential responses and reveals. Remove decorative " +
-      "caption-tour wording while keeping substantive exchanges. Same strict " +
-      "JSON contract, all scene references, 24-word unit maximum.\n" +
+      "it or invent facts to appease the reviewer. Stay selective: do not add " +
+      "scenes, reactions or exchanges back just to cover the source. Keep the cold " +
+      "open, causal glue and closing hook. Same strict JSON contract, every step " +
+      `with an existing scene reference, ${UNIT_MAX_WORDS}-word unit maximum.\n` +
       "ORIGINAL SOURCE:\n" +
       transcript +
       "\nORIGINAL EVENTS:\n" +

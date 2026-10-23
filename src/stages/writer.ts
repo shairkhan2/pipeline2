@@ -39,7 +39,7 @@ import {
   WRITER_TASK,
   WRITER_V2_TASK,
 } from "../contracts/briefs.js";
-import { pyFloatRepr } from "../contracts/hashes.js";
+import { STORY_PROMPT_VERSION, pyFloatRepr } from "../contracts/hashes.js";
 import { FAR_KEY, panelOrderKey, type OrderKey } from "../domain/panels.js";
 import { FilterBlocked, RuntimeError, call, pageBlocks, parseJson } from "../llm/client.js";
 
@@ -649,6 +649,161 @@ export function previousWindow(
 }
 
 // ---------------------------------------------------------------------------
+// Series memory (story mode): running synopsis + look-ahead
+// ---------------------------------------------------------------------------
+
+export const SYNOPSIS_FILE = "series_synopsis.json";
+export const SYNOPSIS_CAP = 2500;          // chars of STORY SO FAR fed to planner/draft
+export const SYNOPSIS_RECENT = 2;          // newest chapters kept in full
+export const SYNOPSIS_ENTRY_CAP = 700;     // one chapter's stored summary
+export const UPCOMING_CHAPTERS = 2;
+export const UPCOMING_CAP = 1800;
+export const UPCOMING_HEADER =
+  "UPCOMING (for selection only — never narrate, foreshadow or reveal):\n";
+
+interface SynopsisFile {
+  version: number;
+  chapters: Record<string, string>;
+}
+
+function chNum(ch: string): number {
+  const m = /\d+/.exec(ch);
+  return m ? Number.parseInt(m[0], 10) : 0;
+}
+
+function clip(s: string, cap: number): string {
+  const a = Array.from(s);
+  return a.length <= cap ? s : a.slice(0, cap - 1).join("").replace(/\s+\S*$/, "") + "…";
+}
+
+function eventText(e: unknown): string {
+  if (typeof e === "string") return pyStrip(e);
+  if (e && typeof e === "object" && typeof (e as { event?: unknown }).event === "string") {
+    return pyStrip((e as { event: string }).event);
+  }
+  return "";
+}
+
+/** obs_<ch>.json events (bare or {data:{...}} wrapped); [] when absent/unreadable. */
+export function _obsEvents(outDir: string, ch: string): string[] {
+  const p = path.join(outDir, `obs_${ch}.json`);
+  if (!fs.existsSync(p)) return [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(p, "utf8")) as Record<string, unknown>;
+    const d = (raw && typeof raw.data === "object" && raw.data !== null ? raw.data : raw) as {
+      events?: unknown;
+    };
+    return Array.isArray(d.events) ? d.events.map(eventText).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function readSynopsis(outDir: string): SynopsisFile {
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(outDir, SYNOPSIS_FILE), "utf8")) as SynopsisFile;
+    if (d && d.version === STORY_PROMPT_VERSION && d.chapters && typeof d.chapters === "object") {
+      return { version: d.version, chapters: { ...d.chapters } };
+    }
+  } catch {
+    // missing or corrupt: start fresh
+  }
+  return { version: STORY_PROMPT_VERSION, chapters: {} };
+}
+
+/** One chapter's compact summary from its accepted story plan. */
+export function planSummary(plan: { premise?: unknown; moments?: unknown }): string {
+  const premise = typeof plan.premise === "string" ? pyStrip(plan.premise) : "";
+  const moments = Array.isArray(plan.moments) ? plan.moments : [];
+  const events = moments
+    .map((m) => (m && typeof m === "object" ? eventText((m as { event?: unknown }).event) : ""))
+    .filter(Boolean);
+  const sentence = (s: string) => (/[.!?…]$/.test(s) ? s : s + ".");
+  const body = [premise, ...events].filter(Boolean).map(sentence).join(" ");
+  return clip(body, SYNOPSIS_ENTRY_CAP);
+}
+
+/** Persist this chapter's summary (atomic replace). Older/newer entries are kept. */
+export function recordSynopsis(outDir: string, ch: string, summary: string): void {
+  if (!pyStrip(summary)) return;
+  const d = readSynopsis(outDir);
+  d.chapters[ch] = summary;
+  const sorted: Record<string, string> = {};
+  for (const k of Object.keys(d.chapters).sort((a, b) => chNum(a) - chNum(b))) {
+    sorted[k] = d.chapters[k] as string;
+  }
+  d.chapters = sorted;
+  const dest = path.join(outDir, SYNOPSIS_FILE);
+  const tmp = path.join(outDir, `.synopsis-${randomUUID()}`);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(d, null, 1));
+    fs.renameSync(tmp, dest);
+  } finally {
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+  }
+}
+
+function firstSentence(s: string): string {
+  const m = /^.*?[.!?…](?=\s|$)/.exec(s);
+  return m ? m[0] : s;
+}
+
+/**
+ * STORY SO FAR for chapter `ch`: every earlier chapter's synopsis (falling back to
+ * its first obs events when no story plan was recorded), deterministically compacted
+ * to `cap` chars. The newest SYNOPSIS_RECENT chapters stay full; older ones shrink to
+ * their first sentence, oldest first; if that is still too long, the oldest are
+ * dropped. "" when there is nothing before `ch`.
+ */
+export function storySoFar(outDir: string, ch: string, cap: number = SYNOPSIS_CAP): string {
+  const n = chNum(ch);
+  const stored = readSynopsis(outDir).chapters;
+  const names = new Set<string>(Object.keys(stored).filter((c) => chNum(c) < n));
+  if (fs.existsSync(outDir)) {
+    for (const f of fs.readdirSync(outDir)) {
+      const m = /^obs_(ch\d+)\.json$/.exec(f);
+      if (m && chNum(m[1] as string) < n) names.add(m[1] as string);
+    }
+  }
+  const order = [...names].sort((a, b) => chNum(a) - chNum(b));
+  const rows: Array<[string, string]> = [];
+  for (const c of order) {
+    let text = stored[c] ?? "";
+    if (!text) {
+      const ev = _obsEvents(outDir, c).slice(0, 3);
+      text = ev.length ? clip(ev.map((e) => (/[.!?…]$/.test(e) ? e : e + ".")).join(" "), SYNOPSIS_ENTRY_CAP) : "";
+    }
+    if (text) rows.push([c, text]);
+  }
+  if (!rows.length) return "";
+  const render = () => rows.map(([c, t]) => `${c}: ${t}`).join("\n");
+  const size = () => Array.from(render()).length;
+  for (let i = 0; i < rows.length - SYNOPSIS_RECENT && size() > cap; i++) {
+    rows[i] = [rows[i]![0], firstSentence(rows[i]![1])];
+  }
+  while (rows.length > 1 && size() > cap) rows.shift();
+  let out = render();
+  if (Array.from(out).length > cap) out = clip(out, cap);
+  return out + "\n";
+}
+
+/**
+ * Look-ahead for the planner: events of the next UPCOMING_CHAPTERS chapters whose obs
+ * already exist on disk. "" when none exist (the prompt then carries no block at all).
+ */
+export function upcomingBlock(outDir: string, ch: string, chapters: number = UPCOMING_CHAPTERS): string {
+  const n = chNum(ch);
+  const parts: string[] = [];
+  for (let i = n + 1; i <= n + chapters; i++) {
+    const ev = _obsEvents(outDir, `ch${i}`);
+    if (!ev.length) continue;
+    parts.push(`ch${i}:\n` + ev.map((e) => `- ${e}`).join("\n"));
+  }
+  if (!parts.length) return "";
+  return UPCOMING_HEADER + clip(parts.join("\n"), UPCOMING_CAP) + "\n";
+}
+
+// ---------------------------------------------------------------------------
 // Pacing constants
 // ---------------------------------------------------------------------------
 
@@ -661,7 +816,7 @@ export const SHOT_S = 2.5;
 export const RUN_S = 1.25;
 /** Physical floor: a picture cannot be on screen for less than this or
  *  timeline.build_shots drops the tag (its MIN_PANEL_S). MIRRORS timeline.MIN_PANEL_S. */
-export const SHOT_MIN_S = 0.8;
+export const SHOT_MIN_S = 1.5;
 /** Word budget of the last writeScript call (run.py reports it). */
 export let LAST_BUDGET = 0;
 /** Module default: run.py imports it even when writer is SKIPPED (I-13). */
@@ -740,12 +895,19 @@ async function writeScriptWithStyle(
     if (typeof generate !== "function") {
       throw new RuntimeError("storyWriter.ts exports neither generate nor writeStoryScript");
     }
+    const storyCh = path.basename(panelsDir.replace(/\/+$/, ""));
+    let acceptedPlan: { premise?: unknown; moments?: unknown } | null = null;
     const draft = await generate(obs, bible, panelTranscript(obs, block), {
       previous: LAST_WINDOW,
       opening,
       emotion,
       diagnosticsDir,
       diagnostics_dir: diagnosticsDir,
+      soFar: outDir ? storySoFar(outDir, storyCh) : "",
+      upcoming: outDir ? upcomingBlock(outDir, storyCh) : "",
+      onPlan: (plan: { premise?: unknown; moments?: unknown }) => {
+        acceptedPlan = plan;
+      },
     });
     let [script, ns] = stepsToScript(pyJson(draft));
     if (script === null || !ns) {
@@ -771,6 +933,13 @@ async function writeScriptWithStyle(
       fs.renameSync(tmp, outPath);
     } finally {
       if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    }
+    if (outDir && acceptedPlan) {
+      try {
+        recordSynopsis(outDir, storyCh, planSummary(acceptedPlan));
+      } catch (e) {
+        process.stderr.write(`   synopsis: WARN not recorded (${e instanceof Error ? e.message : String(e)})\n`);
+      }
     }
     return script;
   }
@@ -1823,7 +1992,7 @@ export function _overlap(ws: Set<string>, visual: unknown): number {
  *   - `run_panel` = words per CUT inside one line = RUN_S * voice speed (RUN_S = 1.25s).
  *     This is EDITORIAL: how finely the line's own seconds may be cut. It does NOT feed
  *     the chapter word budget, so raising it buys cuts without buying length.
- *   - `SHOT_MIN_S` (0.8s) = the PHYSICAL floor, mirrored from timeline.MIN_PANEL_S. Below
+ *   - `SHOT_MIN_S` (1.5s) = the PHYSICAL floor, mirrored from timeline.MIN_PANEL_S. Below
  *     it, timeline.build_shots drops the overflow tag - so a cap computed only from words
  *     will promise cuts the render cannot deliver.
  *
