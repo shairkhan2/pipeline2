@@ -17,7 +17,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { pyRound, pyRoundFixed } from "./factCheck.js";
@@ -79,6 +79,7 @@ import {
   validateLocale,
 } from "../config/languages.js";
 import { stage } from "../telemetry/telemetry.js";
+import { resolveMusicBed } from "./music.js";
 
 export {
   gsk,
@@ -1560,6 +1561,17 @@ export async function main(
   }
   copyFileSync(mp3, join(pub, "narration.mp3"));
   const quality = resolveRenderQuality();
+  // Music bed: disabled unless the series opts in (meta.music) or MUSIC_BED=on.
+  const music = await resolveMusicBed(fullMeta, seriesDir);
+  let musicProp: { src: string; volume: number } | null = null;
+  if (music.bed) {
+    const name = `music${extname(music.bed.file) || ".mp3"}`;
+    copyFileSync(music.bed.file, join(pub, name));
+    musicProp = { src: `${proj}/${name}`, volume: music.bed.volume };
+    console.log(`music bed: ${basename(music.bed.file)} at volume ${music.bed.volume}`);
+  } else if (music.reason !== "music disabled") {
+    console.log(`music bed: off (${music.reason})`);
+  }
   const props = {
     shots: shots.map(dumpShot),
     audio: `${proj}/narration.mp3`,
@@ -1567,6 +1579,7 @@ export async function main(
     background,
     motion,
     quality,
+    ...(musicProp ? { music: musicProp } : {}),
   };
   const propsPath = join(outDir, "shots.json");
   writeFileSync(propsPath, pyJsonPretty(props));

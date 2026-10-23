@@ -8,7 +8,7 @@ cut into overlapping tiles first: the detector letterboxes to a square, and a
 
 Output JSON (single object)::
 
-    {"tool": "pcleaner-ctd", "schema": "bubble-boxes-1",
+    {"tool": "pcleaner-ctd", "schema": "bubble-boxes-2",
      "images": {"<input path>": {"w": int, "h": int,
                                  "boxes": [[x0, y0, x1, y1, conf], ...]}}}
 
@@ -31,9 +31,9 @@ TILE_OVERLAP = 0.15
 def _tiles(h, w):
     """Vertical [y0, y1) tiles of at most TILE_ASPECT * w rows, overlapping."""
     th = int(w * TILE_ASPECT)
-    if h <= th * 1.35:
+    if th <= 0 or h <= th * 1.35:
         return [(0, h)]
-    step = int(th * (1 - TILE_OVERLAP))
+    step = max(1, int(th * (1 - TILE_OVERLAP)))
     out = []
     y = 0
     while True:
@@ -92,7 +92,10 @@ def export(model_path, images, out_path):
                     tile, input_size=size, device="cpu", half=False, to_tensor=False
                 )
                 blks, _mask, _lines = det.net(img_in)
-                rr = (tw / (size[0] - dw), th / (size[1] - dh))
+                aw, ah = size[0] - dw, size[1] - dh
+                if aw <= 0 or ah <= 0:
+                    continue
+                rr = (tw / aw, th / ah)
                 xyxy, _cls, conf = postprocess_yolo(blks, det.conf_thresh, det.nms_thresh, rr)
                 for b, c in zip(xyxy, conf):
                     bx0, by0, bx1, by1 = (float(v) for v in b[:4])
@@ -104,7 +107,7 @@ def export(model_path, images, out_path):
         except Exception as e:
             print(f"[bubble_boxes_export] {img_path}: {type(e).__name__}: {e}", file=sys.stderr)
             result[img_path] = None
-    payload = {"tool": "pcleaner-ctd", "schema": "bubble-boxes-1", "images": result}
+    payload = {"tool": "pcleaner-ctd", "schema": "bubble-boxes-2", "images": result}
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     return payload

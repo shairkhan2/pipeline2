@@ -67,8 +67,8 @@ export function windowGeometry(s: Shot) {
   const top = clamp(h / 2 - fy * ih, h - ih, 0);
 
   // Push-in origin: the subject point, expressed in card pixels.
-  const ox = clamp(left + fx * iw, 0, w);
-  const oy = clamp(top + fy * ih, 0, h);
+  const ox = clamp(left + fx * iw, Math.max(0, left), Math.min(w, left + iw));
+  const oy = clamp(top + fy * ih, Math.max(0, top), Math.min(h, top + ih));
 
   // Largest zoom that still keeps the reader box inside the card.
   let boxLimit = Infinity;

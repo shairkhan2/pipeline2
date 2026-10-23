@@ -52,8 +52,14 @@ import {
   castContext,
   _stepsToScript,
   JAB_MAX_WORDS,
+  normalizeUnits,
+  splitLongLine,
+  UNIT_HARD_MAX,
   planStory,
   UNIT_MAX_WORDS,
+  writeStoryScript,
+  applyPatches,
+  flaggedSteps,
   validateDraft,
   validatePlan,
   validateReview,
@@ -674,9 +680,10 @@ describe('storyWriter.ts / validatePlan', () => {
     expect(() => validatePlan(plan({ omitted_events: 'x' }), 2)).toThrow(StoryReviewError);
   });
 
-  it('rejects an event both covered and omitted', () => {
-    const p = plan({ omitted_events: [{ event: 1, reason: 'nope' }] });
-    expect(() => validatePlan(p, 1)).toThrow(/covered event also marked omitted/);
+  it('drops an omission that a moment already covers instead of failing the plan', () => {
+    const p = plan({ omitted_events: [{ event: 1, reason: 'nope' }, { event: 2, reason: 'filler' }] });
+    const out = validatePlan(p, 2) as unknown as { omitted_events: Array<{ event: number }> };
+    expect(out.omitted_events.map((o) => o.event)).toEqual([2]);
   });
 
   it('rejects panel-selection hints in the plan', () => {
@@ -743,30 +750,20 @@ describe('storyWriter.ts / validateDraft', () => {
     ).toThrow(/needs an existing scene reference/);
   });
 
-  it('uses a 32-word unit cap and keeps the 12-word jab cap', () => {
+  it('targets 32-word units, validates up to UNIT_HARD_MAX and keeps the 12-word jab cap', () => {
     expect(UNIT_MAX_WORDS).toBe(32);
+    expect(UNIT_HARD_MAX).toBe(40);
     expect(JAB_MAX_WORDS).toBe(12);
-    const line32 = new Array(32).fill('word').join(' ');
-    expect(() =>
-      validateDraft({ outline: draft().outline, steps: [{ beat: 'b', line: line32, jab: '', scene: 1 }] }, [{}]),
-    ).not.toThrow();
-    expect(() =>
-      validateDraft(
-        { outline: draft().outline, steps: [{ beat: 'b', line: `${line32} more`, jab: '', scene: 1 }] },
-        [{}],
-      ),
-    ).toThrow(/33 words, max 32/);
-  });
-
-  it('caps a spoken unit at UNIT_MAX_WORDS', () => {
-    const long = new Array(UNIT_MAX_WORDS + 1).fill('word').join(' ');
-    expect(() =>
-      validateDraft({ outline: draft().outline, steps: [{ beat: 'b', line: long, jab: '', scene: 1 }] }, [{}]),
-    ).toThrow(/oversized spoken unit/);
-    const exact = new Array(UNIT_MAX_WORDS).fill('word').join(' ');
+    const exact = new Array(UNIT_HARD_MAX).fill('word').join(' ');
     expect(() =>
       validateDraft({ outline: draft().outline, steps: [{ beat: 'b', line: exact, jab: '', scene: 1 }] }, [{}]),
     ).not.toThrow();
+    expect(() =>
+      validateDraft(
+        { outline: draft().outline, steps: [{ beat: 'b', line: `${exact} more`, jab: '', scene: 1 }] },
+        [{}],
+      ),
+    ).toThrow(/41 words, max 40/);
   });
 
   it('does not count emotion tags toward the word cap', () => {
@@ -1315,8 +1312,12 @@ describe('briefs.ts / story prompts select, not walk', () => {
     expect(STORY_TASK).toContain('{so_far}');
     expect(STORY_TASK).toContain('HARD MAXIMUM 32 words');
     expect(STORY_TASK).toMatch(/our guy/);
-    expect(STORY_TASK).toMatch(/Cold open/);
+    expect(STORY_TASK).toContain('{shape_draft}');
+    expect(STORY_PLAN_TASK).toContain('{shape_plan}');
+    expect(STORY_REVIEW_TASK).toContain('{shape_review}');
     expect(STORY_REVIEW_TASK).toContain('storyboard walk');
+    const { SHAPE_EPISODE } = await import('../src/contracts/briefs.js');
+    expect(SHAPE_EPISODE.draft).toMatch(/Cold open/);
   });
 });
 
@@ -1498,5 +1499,163 @@ describe('writer.ts / matchPanels @hold fallback', () => {
     expect(lines[2]).toContain('she quietly waits');
     expect(lines[2]).toContain('@hold');
     expect(mockedCall).toHaveBeenCalled();
+  });
+});
+
+describe('unit cap stays in sync', () => {
+  it('matcher cap mirrors the story writer cap', async () => {
+    const vm = await import('../src/stages/visualMatcher.js');
+    expect(vm.STORY_UNIT_MAX_WORDS).toBe(UNIT_HARD_MAX);
+  });
+});
+
+describe('writeStoryScript repair loop', () => {
+  const plan = {
+    premise: 'p',
+    turns: [{ want: 'w' }],
+    moments: [
+      { event: 'e1', source_events: [1], evidence_type: 'visible', detail: 'd' },
+      { event: 'e2', source_events: [2], evidence_type: 'visible', detail: 'd' },
+    ],
+  };
+  const draft = {
+    outline: [{ want: 'w' }],
+    steps: [
+      { beat: 'a', line: 'Our guy is cornered at home.', jab: '', scene: 1 },
+      { beat: 'b', line: 'She walks home and teleports in.', jab: '', scene: 2 },
+    ],
+  };
+  const reply = (o: unknown) =>
+    ({ choices: [{ message: { content: JSON.stringify(o) } }] }) as unknown as Awaited<ReturnType<typeof call>>;
+  const reject = (kind: string, step = 2) => ({
+    verdict: 'reject',
+    assessment: 'a',
+    issues: [{ step, kind, quote: step === 2 ? 'She walks home and teleports in.' : 'Our guy is cornered at home.', reason: 'r' }],
+  });
+  const accept = { verdict: 'accept', assessment: 'ok', issues: [] };
+
+  async function run(
+    review: (n: number) => unknown,
+    correction: (prompt: string, n: number) => unknown,
+  ): Promise<{ result?: { steps: Array<{ line: string }> }; error?: unknown; prompts: string[] }> {
+    const prompts: string[] = [];
+    let reviews = 0;
+    let fixes = 0;
+    mockedCall.mockImplementation(async (m: unknown, o?: unknown) => {
+      const tag = String((o as { tag?: string })?.tag);
+      const content = (m as Array<{ content: string }>)[0]!.content;
+      if (tag === 'story plan') return reply(plan);
+      if (tag.includes('review')) return reply(review(++reviews));
+      if (tag === 'story correction') {
+        prompts.push(content);
+        return reply(correction(content, ++fixes));
+      }
+      return reply(draft);
+    });
+    try {
+      return { result: (await writeStoryScript({ events: ['a', 'b'] }, {}, 't', {})) as never, prompts };
+    } catch (error) {
+      return { error, prompts };
+    } finally {
+      mockedCall.mockImplementation(async () => {
+        throw new Error('mock matcher offline');
+      });
+    }
+  }
+
+  it('continuity issues block after the budget (never shipped as soft)', async () => {
+    const r = await run(() => reject('continuity'), () => draft);
+    expect(r.error).toBeInstanceOf(StoryReviewError);
+  });
+
+  it('invented facts block after the budget', async () => {
+    const r = await run(() => reject('unsupported_fact'), () => draft);
+    expect(r.error).toBeInstanceOf(StoryReviewError);
+  });
+
+  it('a lone caption-tour note may ship after the budget', async () => {
+    const r = await run(
+      () => reject('caption_tour'),
+      (_p, n) => (n === 1 ? draft : { patches: [{ step: 2, steps: [{ beat: 'b', line: 'She teleports in.', jab: '', scene: 2 }] }] }),
+    );
+    expect(r.error).toBeUndefined();
+  });
+
+  it('later rounds patch only the flagged step and keep accepted lines verbatim', async () => {
+    const fixed = 'Later that night, back at his place, she teleports straight in.';
+    const r = await run(
+      (n) => (n <= 2 ? reject('continuity', 2) : accept),
+      (_p, n) =>
+        n === 1
+          ? draft
+          : { patches: [{ step: 2, steps: [{ beat: 'b', line: fixed, jab: '', scene: 2 }] }, { step: 1, steps: [] }] },
+    );
+    expect(r.error).toBeUndefined();
+    expect(r.prompts[1]).toContain('PATCH MODE');
+    expect(r.prompts[1]).toContain('FLAGGED STEPS: 2');
+    expect(r.result!.steps.map((s) => s.line)).toEqual(['Our guy is cornered at home.', fixed]);
+  });
+});
+
+describe('applyPatches / flaggedSteps', () => {
+  const d = { outline: [{ want: 'w' }], steps: [
+    { beat: 'a', line: 'one', jab: '' },
+    { beat: 'b', line: 'two', jab: '' },
+    { beat: 'c', line: 'three', jab: '' },
+  ] } as never;
+  it('replaces, splits and cuts only flagged steps', () => {
+    const out = applyPatches(d, { patches: [
+      { step: 2, steps: [{ beat: 'b', line: 'two a', jab: '' }, { beat: 'b', line: 'two b', jab: '' }] },
+      { step: 3, steps: [] },
+    ] }, [2, 3]);
+    expect(out.steps.map((s) => s.line)).toEqual(['one', 'two a', 'two b']);
+  });
+  it('whole-draft issues (step 0) disable patch mode', () => {
+    expect(flaggedSteps({ verdict: 'reject', assessment: '', issues: [{ step: 0, kind: 'continuity', quote: '', reason: '' }] } as never, 3)).toBeNull();
+    expect(flaggedSteps({ verdict: 'reject', assessment: '', issues: [{ step: 3, kind: 'continuity', quote: '', reason: '' }, { step: 1, kind: 'x', quote: '', reason: '' }] } as never, 3)).toEqual([1, 3]);
+  });
+});
+
+describe('story unit repair (clean splits only)', () => {
+  const twoSentences =
+    'Seeing his mother break down, he comforts her and enlists in the army the very next day. He sends his entire pay straight to her out of pity and guilt for occupying her real son body.';
+
+  it('splits at a sentence end into units under the cap', () => {
+    expect(splitLongLine(twoSentences)).toEqual([
+      'Seeing his mother break down, he comforts her and enlists in the army the very next day.',
+      'He sends his entire pay straight to her out of pity and guilt for occupying her real son body.',
+    ]);
+  });
+
+  it('splits before a clause-opening but/so, never inside a comma list', () => {
+    const parts = splitLongLine(
+      'Setting out soju, food, and her portrait, the poor guy weeps over the mysterious, unreadable skill he got the day he awakened, but he still cannot decipher a single word of it after a year.',
+    );
+    expect(parts).toHaveLength(2);
+    expect(parts[0]).toMatch(/awakened\.$/);
+    expect(parts[1]).toMatch(/^But he still/);
+    expect(parts.join(' ')).toContain('mysterious, unreadable skill');
+  });
+
+  it('leaves a long line whole when no clean break exists', () => {
+    const line =
+      'Setting out soju, food, and Sia portrait, the poor guy weeps over the mysterious, unreadable EX-rank skill he got the day he became a full-fledged hunter, wondering if deciphering it would have changed anything.';
+    expect(splitLongLine(line)).toEqual([line]);
+  });
+
+  it('normalizes a draft so validation passes; beat/scene shared, jab only on the last unit', () => {
+    const fixed = validateDraft(
+      normalizeUnits({ outline: [{ want: 'w' }], steps: [{ beat: 'enlist', line: twoSentences, jab: 'Brutal.', scene: 1 }] }),
+      [{}],
+    );
+    expect(fixed.steps).toHaveLength(2);
+    expect(fixed.steps.every((s) => s.beat === 'enlist' && (s as { scene?: number }).scene === 1)).toBe(true);
+    expect(fixed.steps[0]!.jab).toBe('');
+    expect(fixed.steps[1]!.jab).toBe('Brutal.');
+  });
+
+  it('splits embedded newlines into separate units', () => {
+    const d = normalizeUnits({ outline: [{ want: 'w' }], steps: [{ beat: 'b', line: 'One thing.\nAnother thing.', jab: '', scene: 1 }] }) as { steps: unknown[] };
+    expect(d.steps).toHaveLength(2);
   });
 });

@@ -766,6 +766,7 @@ export interface BubbleSet {
  */
 export function _bubbleFromText(b: BubbleBox, w: number, h: number): BubbleRect {
   const [x0, y0, x1, y1] = b;
+  if (![x0, y0, x1, y1].every(Number.isFinite) || x1 <= x0 || y1 <= y0) return [0, 0, 0, 0];
   const m = Math.max(0.03 * w, 0.3 * Math.min(x1 - x0, y1 - y0));
   return [Math.max(0, x0 - m), Math.max(0, y0 - m), Math.min(w, x1 + m), Math.min(h, y1 + m)];
 }
@@ -853,7 +854,9 @@ export function _bubbleAtRects(img: Rgb, location: unknown): BubbleRect[] {
  */
 export function bubbleSet(img: Rgb, ctd: BubbleBox[] | null | undefined, bubbleAt: unknown): BubbleSet {
   if (Array.isArray(ctd)) {
-    const rects = ctd.map((b) => _bubbleFromText(b, img.w, img.h));
+    const rects = ctd
+      .map((b) => _bubbleFromText(b, img.w, img.h))
+      .filter((r) => r[2] > r[0] && r[3] > r[1]);
     if (rects.length) return {source: "ctd", rects};
     // CTD saw no lettering, but the reader placed an edge bubble: trust a
     // white-mask band there (lettering CTD misses, e.g. huge display type).
@@ -892,6 +895,8 @@ export const WINDOW_MIN_ASPECT = 0.42;
 export const WINDOW_MAX_ASPECT = 1.9;
 /** Context padding per side, as a fraction of the subject height, by weight. */
 export const WINDOW_PAD: Record<number, number> = {1: 0.1, 2: 0.16, 3: 0.28};
+/** Folded into the crop-cache key so tuning the window picker never reuses stale crops. */
+const WINDOW_SIGNATURE = JSON.stringify([WINDOW_MIN_ASPECT, WINDOW_MAX_ASPECT, WINDOW_PAD, 1]);
 
 export function framingMode(): FramingMode {
   const v = (process.env.MANHWA_FRAMING_MODE || "").toLowerCase();
@@ -1005,9 +1010,12 @@ export function pickWindow(inp: WindowInput): Rect {
 
 /** Trim uniform white/black side columns outside the subject, at most 12% per side. */
 export function _trimBlankColumns(img: Rgb, rect: Rect, subject: Rect): Rect {
-  let [left, top, right, bottom] = rect;
+  const top = Math.max(0, Math.min(img.h, Math.floor(rect[1])));
+  const bottom = Math.max(top, Math.min(img.h, Math.ceil(rect[3])));
+  let left = Math.max(0, Math.min(img.w, Math.floor(rect[0])));
+  let right = Math.max(left, Math.min(img.w, Math.ceil(rect[2])));
   const height = bottom - top;
-  if (height <= 0) return rect;
+  if (height <= 0 || right <= left) return [left, top, right, bottom];
   const blank = (col: number): boolean => {
     let white = 0;
     let black = 0;
@@ -1115,6 +1123,12 @@ export async function frameShots(
       if (!normBox(pyGet(shot, "box", pg["box"])) || Number(pg["art"] ?? 0) < 0.5) continue;
       const src = sourceOf(shot, pid);
       if (existsSync(src)) wanted.push(src);
+      // a seam weld may pull in the next panel; detect it in the same batch
+      const nextRec = records.get(pid)?.[1];
+      if (nextRec) {
+        const nsrc = sourceOf({}, pyStem(String(nextRec["panel"])));
+        if (existsSync(nsrc) && !wanted.includes(nsrc)) wanted.push(nsrc);
+      }
     }
     try {
       ctd = await (opts.detect ?? detectBubbleBoxes)(wanted, opts.bubbleCacheDir ?? path.join(cropsDir, ".bubbles"));
@@ -1138,6 +1152,10 @@ export async function frameShots(
       continue;
     }
     const source = sourceOf(shot, pid);
+    if (!existsSync(source)) {
+      stats.unchanged += 1;
+      continue;
+    }
     let image = await loadRgb(source);
     const w = image.w;
     const originalH = image.h;
@@ -1187,6 +1205,16 @@ export async function frameShots(
       image = joined;
       sources.push(nextId);
       stats.continued += 1;
+      if (mode === "window") {
+        // Bubbles of the welded panel, shifted below the seam, so the window
+        // also dodges text in the continuation.
+        const nextSrc = sourceOf({}, nextId);
+        const nextPg = byId.get(nextId) ?? {};
+        const more = bubbleSet(other, ctd[nextSrc], nextPg["bubble_at"]).rects;
+        bubbles = bubbles.concat(
+          more.map((r): BubbleRect => [r[0], r[1] + originalH, r[2], r[3] + originalH]),
+        );
+      }
     }
     let rect: Rect;
     if (mode === "window") {
@@ -1238,7 +1266,7 @@ export async function frameShots(
     // guard (which could have welded an unverified promo donor into a composite)
     // can never be reused; the digest is the sole crop-cache key.
     const digest = createHash("sha256")
-      .update(Buffer.from(mode === "window" ? "render-crop-v3-window" : "render-crop-v2"))
+      .update(Buffer.from(mode === "window" ? `render-crop-v3-window:${WINDOW_SIGNATURE}` : "render-crop-v2"))
       .update(Buffer.from(strRect(rect)))
       .update(Buffer.from(crop))
       .digest("hex")

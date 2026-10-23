@@ -9,7 +9,9 @@ import React from 'react';
 import {
   AbsoluteFill,
   Audio,
+  Loop,
   staticFile,
+  useVideoConfig,
   type CalculateMetadataFunction,
 } from 'remotion';
 import {Background, backgroundGlow, type BackgroundId} from './backgrounds';
@@ -25,15 +27,27 @@ export type RecapProps = {
   volume?: number;
   background?: BackgroundId | string;
   motion?: MotionId | string;
+  /** Optional music bed (off unless the pipeline sets it). Loops under the narration. */
+  music?: {src: string; volume?: number; loopS?: number} | null;
 };
 
-export const Recap: React.FC<RecapProps> = ({shots, audio, volume, background, motion}) => {
+const MusicBed: React.FC<{src: string; volume: number; loopS?: number}> = ({src, volume, loopS}) => {
+  const {fps, durationInFrames} = useVideoConfig();
+  const fade = Math.round(fps * 1.5);
+  const vol = (f: number) =>
+    volume * Math.min(1, f / fade, (durationInFrames - f) / fade);
+  const audio = <Audio src={staticFile(src)} volume={vol} />;
+  return loopS && loopS > 0 ? <Loop durationInFrames={Math.round(loopS * fps)}>{audio}</Loop> : audio;
+};
+
+export const Recap: React.FC<RecapProps> = ({shots, audio, volume, background, motion, music}) => {
   const glowRgb = backgroundGlow(background);
   return (
     <AbsoluteFill>
       {motionOwnsBackdrop(motion) ? <AbsoluteFill style={{background: '#000'}} /> : <Background id={background} />}
       <MotionLayout id={motion} shots={shots} glowRgb={glowRgb} />
       {audio ? <Audio src={staticFile(audio)} volume={volume ?? 1} /> : null}
+      {music?.src ? <MusicBed src={music.src} volume={music.volume ?? 0.12} loopS={music.loopS} /> : null}
     </AbsoluteFill>
   );
 };

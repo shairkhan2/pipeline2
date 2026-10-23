@@ -405,3 +405,14 @@ describe("pacing floor", () => {
     expect(three).toHaveLength(3);
   });
 });
+
+describe('bubble export schema stays in sync', () => {
+  it('python CTD export writes the schema cleaner.ts accepts', async () => {
+    const fs = await import('node:fs');
+    const { BUBBLE_SCHEMA } = await import('../src/stages/cleaner.js');
+    const py = fs.readFileSync(new URL('../tools/bubble_boxes_export.py', import.meta.url), 'utf8');
+    const found = [...py.matchAll(/"schema":\s*"([^"]+)"/g)].map((m) => m[1]);
+    expect(found.length).toBeGreaterThan(0);
+    for (const s of found) expect(s).toBe(BUBBLE_SCHEMA);
+  });
+});

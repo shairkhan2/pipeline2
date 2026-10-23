@@ -823,7 +823,7 @@ export async function _runAdapter(srcd: string, outJson: string): Promise<boolea
 export type BubbleBox = [number, number, number, number, number];
 
 export const BUBBLE_CACHE_SUFFIX = ".bubbles.json";
-export const BUBBLE_SCHEMA = "bubble-boxes-1";
+export const BUBBLE_SCHEMA = "bubble-boxes-2"; // bump when tools/bubble_boxes_export.py tiling/model changes
 
 function bubbleCachePath(cacheDir: string, sha: string): string {
   return path.join(cacheDir, `${sha}${BUBBLE_CACHE_SUFFIX}`);
@@ -862,9 +862,12 @@ export async function _runBubbleAdapter(images: readonly string[]): Promise<Reco
     const cmd = [pcleanerPy(), BUBBLE_ADAPTER, "--model", pcleanerModel(), "--output", outJson, ...images];
     const timeout = (BUBBLE_ADAPTER_BASE_TIMEOUT + BUBBLE_ADAPTER_PER_IMAGE_TIMEOUT * images.length) * 1000;
     const env = pcleanerEnv(scratch);
-    // Detection only: no LaMa, so let OpenCV use the cores it has.
-    const threads = String(Math.max(1, os.cpus().length));
+    // Detection only (no LaMa): allow a little more OpenCV parallelism than the
+    // shared pcleanerEnv cap, but never the whole box, and keep the BLAS vars in step.
+    const threads = String(Math.max(1, Math.min(8, Math.floor(os.cpus().length / 2))));
     env.OMP_NUM_THREADS = threads;
+    env.MKL_NUM_THREADS = threads;
+    env.OPENBLAS_NUM_THREADS = threads;
     const r = await lappy.withHeavy(() =>
       spawnSync(cmd[0]!, cmd.slice(1), { cwd: scratch, encoding: "utf8", timeout, env, maxBuffer: 32 * 1024 * 1024 }),
     );

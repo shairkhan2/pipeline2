@@ -35,6 +35,9 @@
  *
  * Ported from `pipeline/run.py`.
  */
+import { ARC_AHEAD, ARC_BLOCK, arcContext, ensureMoviePlan, fallbackPlan, handoffLines, movieShape as buildMovieShape, storyShapeMode } from "../stages/movie.js";
+import { resolveSeriesStyle } from "../config/seriesStyle.js";
+import { styleReport, formatStyleReport } from "../stages/styleReport.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -875,22 +878,40 @@ export async function _runLocked(
 
         // Look-ahead: read the next chapters now (cached obs, no bible merge) so the
         // story writer can weigh setup against filler. Best-effort: never blocks this chapter.
-        const readAhead = Math.max(0, Number.parseInt(process.env.READ_AHEAD ?? "2", 10) || 0);
+        // Only chapters this run will script are read ahead, so nothing is billed
+        // that the run does not need anyway (their cached obs are reused later).
+        // Movie mode plans the arc in blocks, so it reads a whole block ahead.
+        let aheadStyle: { storyShape?: string; writerMode?: string } | undefined;
+        try {
+          const m = JSON.parse(fs.readFileSync(path.join(sdir, "meta.json"), "utf8"));
+          if (isRecord(m) && isRecord(m.style)) aheadStyle = m.style as typeof aheadStyle;
+        } catch {
+          aheadStyle = undefined;
+        }
+        const movieAhead =
+          resolveSeriesStyle(aheadStyle as never).writerMode === "story" && storyShapeMode(aheadStyle) === "movie";
+        const readAhead = Math.max(
+          0,
+          Number.parseInt(process.env.READ_AHEAD ?? String(movieAhead ? ARC_BLOCK + ARC_AHEAD : 2), 10) || 0,
+        );
         if (attempt === 0 && readAhead > 0) {
           const aheadCast = (() => {
             try { return castBlock(bible); } catch { return _cast; }
           })();
-          for (const next of chs.slice(chs.indexOf(ch) + 1, chs.indexOf(ch) + 1 + readAhead)) {
+          const at = chs.indexOf(ch);
+          for (const next of chs.slice(at + 1, at + 1 + readAhead)) {
             const nextDir = path.join(sdir, next);
-            if (!isDirectory(nextDir)) continue;
+            const nextN = Number.parseInt(/\d+/.exec(next)?.[0] ?? "0", 10);
+            if (!isDirectory(nextDir) || nextN < startN) continue;
             try {
-              await _hooks.readChapter(nextDir, out, false, keepStale, aheadCast, cv);
+              await _hooks.readChapter(nextDir, out, force, keepStale, aheadCast, cv);
               console.log(`   read-ahead: ${next} ready for the writer's look-ahead`);
             } catch (e) {
               const msg = e instanceof Error ? e.message : String(e);
               process.stderr.write(`   read-ahead: ${next} skipped (${msg.slice(0, 160)})\n`);
             }
           }
+          _hooks.telemetry.bind({ chapter: ch });
         }
 
         const charsObj = isRecord(bible.characters) ? bible.characters : {};
@@ -1024,6 +1045,27 @@ export async function _runLocked(
           ? [...String(op.hook || "").matchAll(/@(p\d{4}_\d+)/g)].map((m) => m[1]!)
           : [];
 
+        // MOVIE MODE (story writer default): the chapter is one stretch of a single
+        // continuous narration. The arc plan (sliding blocks over chapters) sets its
+        // role, time budget, entry and exit; the writer continues the previous
+        // chapter's last lines instead of opening a new episode.
+        let movieShape: import("../stages/storyWriter.js").StoryShape | undefined;
+        let movieArc = "";
+        if (resolveSeriesStyle(seriesStyle).writerMode === "story" && storyShapeMode(seriesStyle as { storyShape?: string }) === "movie") {
+          const all = chaptersIn(sdir).filter((c) => (Number.parseInt(/\d+/.exec(c)?.[0] ?? "0", 10) || 0) >= startN);
+          const mplan = await ensureMoviePlan(out, { chapters: all, events: (c) => writerMod._obsEvents(out, c) }, {
+            diagnosticsDir: path.join(out, "movie_diagnostics"),
+          });
+          const cp = mplan.chapters[ch] ?? fallbackPlan(ch, ch === all[0]);
+          const handoff = ch === all[0] ? "" : handoffLines(out, ch);
+          movieShape = buildMovieShape(cp, handoff);
+          movieArc = arcContext(mplan, ch);
+          console.log(
+            `   movie: ${cp.role}, ~${cp.budget_s}s, entry "${cp.entry}", exit ${cp.exit}` +
+              (handoff ? ` | continues from ${handoff.split("\n").length} line(s)` : " | movie opening"),
+          );
+        }
+
         // I-21: writeScript publishes this chapter's continuity window in LAST_WINDOW.
         // Reset it per chapter so a cached chapter (which never calls writeScript)
         // cannot inherit the PREVIOUS chapter's window in factCheck.check.
@@ -1043,6 +1085,8 @@ export async function _runLocked(
               block: block as unknown as BlockLike | null,
               opening,
               taken: hookTaken,
+              shape: movieShape,
+              arcSoFar: movieArc,
             },
           );
           if (opening) {
@@ -1068,6 +1112,8 @@ export async function _runLocked(
                 block: block as unknown as BlockLike | null,
                 opening,
                 taken: hookTaken,
+                shape: movieShape,
+                arcSoFar: movieArc,
               },
             );
             if (opening) {
@@ -1125,12 +1171,20 @@ export async function _runLocked(
           windowTxt = writerMod.previousWindow(out, ch)[0];
         }
 
-        const issues = _hooks.factCheck.check(script, transcript, {
-          windowTxt,
-          promo: block,
-          prevScript,
-          characterNames: charNames,
-        });
+        // Story scripts are grounded by the plan/review loop; the legacy word-overlap
+        // check (and its persona advisories) does not measure grounding there, so story
+        // mode reports recap STYLE instead. Legacy scripts keep the old check.
+        const isStory = script.startsWith("# STORY_UNITS v1");
+        const issues: string[] = isStory
+          ? []
+          : _hooks.factCheck.check(script, transcript, {
+              windowTxt,
+              promo: block,
+              prevScript,
+              characterNames: charNames,
+            });
+        const style = isStory ? styleReport(script) : null;
+        if (style) for (const l of formatStyleReport(style)) console.log(l);
 
         const nlines = pySplitLines(script).filter(
           (l) => pyStrip(l) && !pyLstrip(l).startsWith("#"),
@@ -1154,8 +1208,10 @@ export async function _runLocked(
             ` | ${pyRoundFixed(nwords / ntags, 1)} words per tagged panel`,
         );
         console.log(
-          `   script: ${nlines} lines | fact_check: ` +
-            (issues.length === 0 ? "PASS" : `FAIL (${issues.length})`),
+          `   script: ${nlines} lines | ` +
+            (style
+              ? `style: ${style.metrics.filter((m) => m.ok).length}/${style.metrics.length} on target`
+              : `fact_check: ${issues.length === 0 ? "PASS" : `FAIL (${issues.length})`}`),
         );
         // UNGROUNDED is advisory: factCheck.ts documents its measured F1 of 0.35.
         const flagged = issues.filter((issue) => !/^UNGROUNDED\b/.test(String(issue)));
@@ -1178,6 +1234,7 @@ export async function _runLocked(
               status: "ok",
               lines: nlines,
               issues,
+              ...(style ? { style } : {}),
               window_holes: !repair ? missing : [],
             },
             1,

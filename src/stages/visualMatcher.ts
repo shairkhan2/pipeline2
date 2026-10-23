@@ -30,6 +30,8 @@ import { join } from "node:path";
 import sharp from "sharp";
 
 import { call, log, pageBlocks, parseJson, type ChatMessage, type Completion } from "../llm/client.js";
+/** Mirrors storyWriter.UNIT_HARD_MAX (not imported: storyWriter loads lazily). */
+export const STORY_UNIT_MAX_WORDS = 40;
 
 // ---------------------------------------------------------------------------
 // Constants (verbatim from visual_matcher.py)
@@ -37,8 +39,8 @@ import { call, log, pageBlocks, parseJson, type ChatMessage, type Completion } f
 // ---- Prompt strings: VERBATIM from manhwa-pipeline/pipeline/visual_matcher.py ----
 export const SYS = "You match story narration to comic panel images. You answer in strict JSON.";
 export const SEMANTIC_RULES = "\nSEMANTIC SELECTION CONTRACT (overrides the mandatory-picture rule above):\n- Match WHO does WHAT, to WHOM, in the CURRENT scene. A shared name or prop is\n  not action evidence. Preserve the primary action before considering a reaction.\n- BEAT COHERENCE: lines sharing the same [beat: ...] tag belong to ONE scene turn.\n  Keep their panels within that scene's visual sequence (progressing through setup,\n  arrival, reaction, exchange and reveal) rather than jumping to an unrelated\n  scene's setting mid-beat.\n- Source facts below establish history and motives, NOT that an assigned image\n  literally depicts them. Do not confuse a memory, an intention and present action.\n- An ABSTRACT continuation may use basis \"context\" with panels [] ONLY when\n  continuing the immediately previous displayed scene is appropriate; this becomes\n  a hold. Never do this to hide a concrete action with missing evidence.\n- If no offered image supports a concrete action, use basis \"missing\", panels [],\n  and explain the missing action in evidence. Do not invent a match or pad the line.\n- The reviewer may correct a missing proposal. Any missing action still present\n  after review blocks publication; it never silently borrows adjacent artwork.\n- Repeated justified panels and non-adjacent action/reaction pairs are allowed.\n- Evidence must quote the supported spoken clause and describe the visible act,\n  participants and setting. Captions are fallible lookup, not visual proof.\n- A reported offscreen event is NOT direct visual evidence. For explicit recollections\n  or accounts, use basis \"context\" with the appropriate source scene/aftermath and\n  say what is NOT visible. Never claim an unseen creature or action is in the image.\nSOURCE FACTS (observations, dialogue and events; not selection hints):\n%s\n";
-export const PROMPT = "You are shown %(nids)d comic (manhwa) panels from ONE chapter on %(ns)d contact-sheet\nimage(s). Each panel's exact id is printed directly ABOVE its artwork; sheets are laid\nout left-to-right, top-to-bottom. Only ids printed on the sheets may be used.\n\nFULL STORY (beat headers and narration, old tags stripped; beat headers are context\nonly and are NOT lines to answer):\n%(story)s\n\nThe full narration, in spoken order (%(nl)d lines; [HOLD] lines are spoken\ninterjections that introduce no new visual):\n%(narr)s\n\nFor EVERY line choose the panel(s) whose VISIBLE artwork best supports it.\n- \"direct\": the artwork literally shows the line's action, object or expression.\n- \"context\": the line is abstract (a feeling, intention or consequence) with no\n  literal picture; choose the scene that best carries it. Never claim a picture\n  literally shows an intent, and never treat a caption as proof - the art controls.\n- [HOLD] lines: panels [] and basis \"hold\".\n- Lines sharing the same [beat: ...] label belong to the same scene turn; keep\n  their panels within that scene's progression unless the line explicitly flashes\n  back or shifts setting.\n- A non-hold line needs at least one panel. Use TWO panels ONLY when the line\n  contains distinct clauses that depict, say, an action plus a setting or a\n  reaction; list them in spoken-clause order, not as unrelated adjacent art.\n- Cover the line's PRIMARY action. Do not settle for a mere prop, a leg or a\n  background when a panel shows the full action.\n- No arbitrary fill: if one panel genuinely covers the line, one is enough.\n- A wordless panel is fine; a panel where someone merely talks is weaker.\n- Prefer the correct panel even if another line already used it; repeated panels\n  are allowed when justified. Do NOT force page order or uniqueness to hide a\n  mismatch, and do NOT leave a relevant panel unused.\n%(fix)s\nReply with STRICT JSON ONLY (no prose, no fence):\n{\"lines\":[{\"n\":<int>,\"panels\":[\"<printed pid>\",...],\"basis\":\"direct\"|\"context\"|\"hold\",\"evidence\":\"<visible action/object>\"}]}\n- exactly one entry for EVERY line, in order; evidence must be non-empty.\n- panels: [] for [HOLD] lines, 1..max ids otherwise.\n\nPANEL LEGEND (id — full visual caption; may be wrong or incomplete):\n%(legend)s";
-export const REVIEW_PROMPT = "You are REVISING a first-pass panel assignment. You are shown %(nids)d comic (manhwa)\npanels from ONE chapter on %(ns)d contact-sheet image(s). Each panel's exact id is\nprinted directly ABOVE its artwork; sheets are left-to-right, top-to-bottom. Only ids\nprinted on the sheets may be used.\n\nFULL STORY (beat headers and narration, old tags stripped; beat headers are context\nonly and are NOT lines to answer):\n%(story)s\n\nThe full narration, in spoken order (%(nl)d lines; [HOLD] lines are spoken\ninterjections that introduce no new visual):\n%(narr)s\n\nFIRST-PASS PROPOSALS (FALLIBLE - do NOT trust them; each is one unverified guess):\n%(proposals)s\n\nInspect the ACTUAL images and produce the CORRECT assignment for EVERY line.\n- The first pass is only a guess. Reject any proposal whose image does not visibly\n  support the line. You may KEEP, DROP or REPLACE any proposed image, and you may\n  choose ANY offered image - never only the proposed one.\n- Each retained image must VISIBLY support a specific spoken clause: in \"evidence\",\n  quote the clause it supports and name the visible action/object that shows it.\n- \"context\": for an abstract clause with no literal picture, choose the scene that\n  best carries it; the image must match the CURRENT setting. Never match a\n  scene-context to the NEXT beat's setting (e.g. a later bedroom) or to unrelated\n  worldbuilding.\n- Lines sharing the same [beat: ...] label belong to the same scene turn; reject\n  a proposal that jumps to an unrelated scene's setting mid-beat.\n- Reject SECONDARY FILLER: an extra image added only to pad a line. At most TWO\n  grounded panels, and only when the line has distinct clauses; two is never a quota.\n- Reject the WRONG EVENT or REACTION, and reject a ground-rumble/warning image shown\n  BEFORE its trigger, unless the line explicitly previews or flashes back.\n- Use the ACTUAL narrative causality and beat context - not hard page chronology.\n- [HOLD] lines: panels [] and basis \"hold\".\n- A non-hold line needs at least one panel. Do not leave a relevant panel unused,\n  and do not force uniqueness.\n%(fix)s\nReply with STRICT JSON ONLY (no prose, no fence):\n{\"lines\":[{\"n\":<int>,\"panels\":[\"<printed pid>\",...],\"basis\":\"direct\"|\"context\"|\"hold\",\"evidence\":\"<quoted clause + visible action>\"}]}\n- exactly one entry for EVERY line, in order; evidence must be non-empty.\n- panels: [] for [HOLD] lines, 1..max ids otherwise.\n\nPANEL LEGEND (id — full visual caption; may be wrong or incomplete):\n%(legend)s";
+export const PROMPT = "You are shown %(nids)d comic (manhwa) panels from ONE chapter on %(ns)d contact-sheet\nimage(s). Each panel's exact id is printed directly ABOVE its artwork; sheets are laid\nout left-to-right, top-to-bottom. Only ids printed on the sheets may be used.\n\nFULL STORY (beat headers and narration, old tags stripped; beat headers are context\nonly and are NOT lines to answer):\n%(story)s\n\nThe full narration, in spoken order (%(nl)d lines; [HOLD] lines are spoken\ninterjections that introduce no new visual):\n%(narr)s\n\nFor EVERY line choose the panel(s) whose VISIBLE artwork best supports it.\n- \"direct\": the artwork literally shows the line's action, object or expression.\n- \"context\": the line is abstract (a feeling, intention or consequence) with no\n  literal picture; choose the scene that best carries it. Never claim a picture\n  literally shows an intent, and never treat a caption as proof - the art controls.\n- [HOLD] lines: panels [] and basis \"hold\".\n- Lines sharing the same [beat: ...] label belong to the same scene turn; keep\n  their panels within that scene's progression unless the line explicitly flashes\n  back or shifts setting.\n- A non-hold line needs at least one panel and at most its [max N]. Use more than one\n  ONLY when the line has distinct clauses (an action, a reaction, a setting or prop);\n  list them in spoken-clause order, not as unrelated adjacent art.\n- Cover the line's PRIMARY action. Do not settle for a mere prop, a leg or a\n  background when a panel shows the full action.\n- No arbitrary fill: if one panel genuinely covers the line, one is enough.\n- A wordless panel is fine; a panel where someone merely talks is weaker.\n- Prefer the correct panel even if another line already used it; repeated panels\n  are allowed when justified. Do NOT force page order or uniqueness to hide a\n  mismatch, and do NOT leave a relevant panel unused.\n%(fix)s\nReply with STRICT JSON ONLY (no prose, no fence):\n{\"lines\":[{\"n\":<int>,\"panels\":[\"<printed pid>\",...],\"basis\":\"direct\"|\"context\"|\"hold\",\"evidence\":\"<visible action/object>\"}]}\n- exactly one entry for EVERY line, in order; evidence must be non-empty.\n- panels: [] for [HOLD] lines, 1..max ids otherwise.\n\nPANEL LEGEND (id — full visual caption; may be wrong or incomplete):\n%(legend)s";
+export const REVIEW_PROMPT = "You are REVISING a first-pass panel assignment. You are shown %(nids)d comic (manhwa)\npanels from ONE chapter on %(ns)d contact-sheet image(s). Each panel's exact id is\nprinted directly ABOVE its artwork; sheets are left-to-right, top-to-bottom. Only ids\nprinted on the sheets may be used.\n\nFULL STORY (beat headers and narration, old tags stripped; beat headers are context\nonly and are NOT lines to answer):\n%(story)s\n\nThe full narration, in spoken order (%(nl)d lines; [HOLD] lines are spoken\ninterjections that introduce no new visual):\n%(narr)s\n\nFIRST-PASS PROPOSALS (FALLIBLE - do NOT trust them; each is one unverified guess):\n%(proposals)s\n\nInspect the ACTUAL images and produce the CORRECT assignment for EVERY line.\n- The first pass is only a guess. Reject any proposal whose image does not visibly\n  support the line. You may KEEP, DROP or REPLACE any proposed image, and you may\n  choose ANY offered image - never only the proposed one.\n- Each retained image must VISIBLY support a specific spoken clause: in \"evidence\",\n  quote the clause it supports and name the visible action/object that shows it.\n- \"context\": for an abstract clause with no literal picture, choose the scene that\n  best carries it; the image must match the CURRENT setting. Never match a\n  scene-context to the NEXT beat's setting (e.g. a later bedroom) or to unrelated\n  worldbuilding.\n- Lines sharing the same [beat: ...] label belong to the same scene turn; reject\n  a proposal that jumps to an unrelated scene's setting mid-beat.\n- Reject SECONDARY FILLER: an extra image added only to pad a line. At most the\n  line's [max N] grounded panels, one per distinct clause; the cap is never a quota.\n- Reject the WRONG EVENT or REACTION, and reject a ground-rumble/warning image shown\n  BEFORE its trigger, unless the line explicitly previews or flashes back.\n- Use the ACTUAL narrative causality and beat context - not hard page chronology.\n- [HOLD] lines: panels [] and basis \"hold\".\n- A non-hold line needs at least one panel. Do not leave a relevant panel unused,\n  and do not force uniqueness.\n%(fix)s\nReply with STRICT JSON ONLY (no prose, no fence):\n{\"lines\":[{\"n\":<int>,\"panels\":[\"<printed pid>\",...],\"basis\":\"direct\"|\"context\"|\"hold\",\"evidence\":\"<quoted clause + visible action>\"}]}\n- exactly one entry for EVERY line, in order; evidence must be non-empty.\n- panels: [] for [HOLD] lines, 1..max ids otherwise.\n\nPANEL LEGEND (id — full visual caption; may be wrong or incomplete):\n%(legend)s";
 
 export const COLS = 4;
 export const ROWS = 3;
@@ -245,6 +247,15 @@ export function _capFor(text: string, wps: number, minPanelS: number): number {
 }
 
 export const _cap_for = _capFor;
+
+/** Seconds of narration one picture should hold in a story unit (recap channels cut ~2.5-3 s). */
+export const UNIT_SHOT_S = 3;
+export const UNIT_MAX_PANELS = 4;
+
+/** Story units: one picture per ~3 s of voice, so a 26-word line gets 2-3 cuts, not one 8 s hold. */
+export function _unitCap(text: string, wps: number): number {
+  return Math.min(UNIT_MAX_PANELS, Math.max(1, Math.round(_spokenWords(text) / wps / UNIT_SHOT_S)));
+}
 
 /** Python `float()` for a JSON scalar: bool -> 1/0, str with inf/nan/underscores allowed. */
 function pyFloat(value: unknown): number {
@@ -588,6 +599,7 @@ export function _validateSelection(
   caps: Record<number, number>,
   holds: ReadonlySet<number>,
   semantic = false,
+  units = false,
 ): ValidateResult {
   const nar = lines.filter((l) => l.kind === "narration");
   const ns = new Set<number>(nar.map((l) => l.n as number));
@@ -638,10 +650,13 @@ export function _validateSelection(
       if (!offerSet.has(p)) return _reject(`panel ${pyRepr(p)} at n=${n} is not offered`);
     }
     if (pans.length !== new Set(pans).size) return _reject(`duplicate panels within n=${n}`);
-    if (pans.length > caps[n]!) {
+    // Story units: the cap is a pacing target, so an over-full line keeps its first
+    // (spoken-clause order) pictures instead of failing the whole match.
+    const kept = units && pans.length > caps[n]! ? pans.slice(0, caps[n]!) : pans;
+    if (kept.length > caps[n]!) {
       return _reject(`n=${n} offers ${pans.length} panels, cap is ${caps[n]}`);
     }
-    seen[n] = { n, panels: pans, basis, evidence: pyStrip(ev) };
+    seen[n] = { n, panels: kept, basis, evidence: pyStrip(ev) };
   }
   const missing = [...ns].filter((n) => !Object.prototype.hasOwnProperty.call(seen, n)).sort((a, b) => a - b);
   if (missing.length) return _reject(`missing indices: ${missing.join(",")}`);
@@ -666,8 +681,9 @@ export function _validateReview(
   caps: Record<number, number>,
   holds: ReadonlySet<number>,
   semantic = false,
+  units = false,
 ): ValidateResult {
-  return _validateSelection(data, lines, offer, caps, holds, semantic);
+  return _validateSelection(data, lines, offer, caps, holds, semantic, units);
 }
 
 export const _validate_review = _validateReview;
@@ -707,12 +723,14 @@ export interface MatchDiagnostics {
 }
 
 const UNITS_EDIT =
-  "\nSPOKEN-UNIT EDIT: each numbered line is a separately voiced event-sized unit with " +
-  "its own real audio duration. Choose ONE image for that exact moment, not two images " +
-  "split equally. A BEAT can span many units/images. Match first appearances, reactions, " +
-  "exchanges and reveals individually in spoken order. Do not anticipate the next event. " +
-  "Reuse only when the same image really carries the continuing event; choose an available " +
-  "more specific moment when the narration progresses.\n";
+  "\nSPOKEN-UNIT EDIT: each numbered line is a separately voiced unit with its own real " +
+  "audio duration; [max N] is how many cuts it should carry (about one picture per 3 s of " +
+  "voice, the pace of top recap channels). For a multi-clause line, give one image per " +
+  "clause in spoken order: the action, then the reaction face, then the key detail or " +
+  "prop. Fill toward [max N] when the art supports it; never pad with an unrelated or " +
+  "next-event image, and never repeat the same image twice in one line. Do not anticipate " +
+  "the next event. Reuse across lines only when the same image really carries the " +
+  "continuing event.\n";
 const FINALIST_NOTE =
   "\nAdditional individually labelled finalist images follow the full gallery. Inspect " +
   "these readable originals, not only thumbnails. You may still choose ANY gallery image.\n";
@@ -761,12 +779,12 @@ export async function matchPanels(
   const nar = lines.filter((l) => l.kind === "narration");
   const holds = new Set<number>(nar.filter((l) => l.hold).map((l) => l.n as number));
   const units = semantic && pySplitLines(script).includes("# STORY_UNITS v1");
-  if (units && nar.some((l) => !l.hold && _spokenWords(l.text as string) > 24)) {
+  if (units && nar.some((l) => !l.hold && _spokenWords(l.text as string) > STORY_UNIT_MAX_WORDS)) {
     throw new SemanticMatchError("oversized story unit: split the spoken event before matching");
   }
   const caps: Record<number, number> = {};
   for (const l of nar) {
-    caps[l.n as number] = units ? 1 : _capFor(l.text as string, wps, minPanelS);
+    caps[l.n as number] = units ? _unitCap(l.text as string, wps) : _capFor(l.text as string, wps, minPanelS);
   }
   const offer = panels.map((p) => p.id);
   if (offer.length !== new Set(offer).size) throw new ValueError("duplicate panel ids in offer");
@@ -820,7 +838,7 @@ export async function matchPanels(
         const msg = e instanceof Error ? e.message : String(e);
         return [null, `unparseable JSON: ${msg.slice(0, 120)}`];
       }
-      const res = _validateSelection(data, lines, offer, caps, holds, semantic);
+      const res = _validateSelection(data, lines, offer, caps, holds, semantic, units);
       return [res.ok ? res.picks : null, res.error];
     };
 

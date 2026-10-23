@@ -831,6 +831,10 @@ export function setLastWindow(v: string): void {
 
 export interface WriteScriptOptions {
   style?: SeriesStyle;
+  /** Movie mode: this chapter's shape inside the whole narration (from movie.ts). */
+  shape?: import("./storyWriter.js").StoryShape;
+  /** Movie mode: arc summary + open threads, prepended to STORY SO FAR. */
+  arcSoFar?: string;
   maxPanels?: number;
   maxH?: number;
   outDir?: string | null;
@@ -886,8 +890,10 @@ async function writeScriptWithStyle(
     }
     fs.mkdirSync(diagnosticsDir, { recursive: true });
     LAST_BUDGET = 0; // story scope, never a function of panel inventory
+    // Movie mode: the arc plan carries the long story, so the verbatim window only
+    // needs the most recent narration (voice + exact hand-off), not 25k chars of it.
     LAST_WINDOW = outDir
-      ? previousWindow(outDir, path.basename(panelsDir.replace(/\/+$/, "")))[0]
+      ? previousWindow(outDir, path.basename(panelsDir.replace(/\/+$/, "")), opts.shape ? 6000 : undefined)[0]
       : "";
     // story_writer.generate: v2 exposes the same orchestration as writeStoryScript and
     // keeps `generate` as an alias for callers ported from Python.
@@ -903,8 +909,9 @@ async function writeScriptWithStyle(
       emotion,
       diagnosticsDir,
       diagnostics_dir: diagnosticsDir,
-      soFar: outDir ? storySoFar(outDir, storyCh) : "",
+      soFar: outDir ? (opts.arcSoFar ? opts.arcSoFar + "\n" : "") + storySoFar(outDir, storyCh) : "",
       upcoming: outDir ? upcomingBlock(outDir, storyCh) : "",
+      shape: opts.shape,
       onPlan: (plan: { premise?: unknown; moments?: unknown }) => {
         acceptedPlan = plan;
       },

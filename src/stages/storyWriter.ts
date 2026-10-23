@@ -27,6 +27,7 @@ import { join } from "node:path";
 
 import {
   EMOTION_TAGS,
+  SHAPE_EPISODE,
   STORY_PLAN_TASK,
   STORY_REVIEW_TASK,
   STORY_TASK,
@@ -266,6 +267,8 @@ export interface StoryCallOptions {
   upcoming?: string;
   /** Receives the validated plan (series memory records it). */
   onPlan?: (plan: StoryPlan) => void;
+  /** Story shape blocks (episode vs movie); defaults to the standalone episode shape. */
+  shape?: StoryShape;
   /** ElevenLabs v3 inline delivery tags on the drafting call. */
   emotion?: boolean;
   /** Directory for prompt/response diagnostics; null disables every write. */
@@ -273,6 +276,18 @@ export interface StoryCallOptions {
 }
 
 export const UNIT_MAX_WORDS = 32;
+/** Validation ceiling: a line that cannot be split cleanly may run this long. */
+export const UNIT_HARD_MAX = 40;
+
+/** Resolved prompt blocks that set the chapter's shape inside the whole story. */
+export interface StoryShape {
+  plan: string;
+  draft: string;
+  review: string;
+}
+/** Review kinds that may ship after the repair budget; everything else blocks. */
+export const SOFT_REVIEW_KINDS = new Set(["caption_tour"]);
+export const SOFT_ISSUE_LIMIT = 1;
 export const JAB_MAX_WORDS = 12;
 export const JAB_GAP = 4;
 
@@ -360,6 +375,72 @@ export const cast_context = castContext;
  * `moments` null/undefined -> skip scene-reference and unit-size checks. Selection is
  * the point of story mode: a draft may skip planned scenes, so there is no coverage check.
  */
+/**
+ * Split one over-long spoken line, but only where both halves stay real sentences:
+ * at a sentence end, or before a clause-opening "but"/"so"/"yet". A line with no
+ * such break stays whole (validation allows up to UNIT_HARD_MAX words) instead of
+ * being cut into broken fragments.
+ */
+export function splitLongLine(line: string, max: number = UNIT_MAX_WORDS): string[] {
+  const words = pySplit(line.replace(EMO_RE, ""));
+  if (words.length <= max) return [line];
+  const tokens = line.trim().split(/\s+/);
+  const mid = tokens.length / 2;
+  let cut = -1;
+  let conj = false;
+  let bestScore = Infinity;
+  for (let i = 4; i <= tokens.length - 4; i++) {
+    const tok = tokens[i - 1]!;
+    const next = (tokens[i] ?? "").toLowerCase().replace(/[^a-z]/g, "");
+    let rank: number;
+    if (/[.!?;]["')\]]?$/.test(tok)) rank = 0;
+    else if (/,$/.test(tok) && ["but", "so", "yet"].includes(next)) rank = 1;
+    else continue;
+    const score = rank * tokens.length + Math.abs(i - mid);
+    if (score < bestScore) {
+      bestScore = score;
+      cut = i;
+      conj = rank === 1;
+    }
+  }
+  if (cut < 0) return [line];
+  let head = tokens.slice(0, cut).join(" ");
+  if (conj) head = head.replace(/,$/, ".");
+  else if (/;$/.test(head)) head = head.replace(/;$/, ".");
+  let tail = tokens.slice(cut).join(" ");
+  tail = tail.charAt(0).toUpperCase() + tail.slice(1);
+  return [...splitLongLine(head, max), ...splitLongLine(tail, max)];
+}
+
+/**
+ * Deterministic unit repair: split over-long or multi-line narration into units
+ * that share the step's beat and scene (the jab stays on the last unit). Spares a
+ * whole chapter from failing on one wordy sentence.
+ */
+export function normalizeUnits(data: unknown): unknown {
+  if (!isRecord(data) || !Array.isArray(data.steps)) return data;
+  const steps: unknown[] = [];
+  for (const raw of data.steps) {
+    if (!isRecord(raw) || typeof raw.line !== "string") {
+      steps.push(raw);
+      continue;
+    }
+    const parts = raw.line
+      .split(/\n+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .flatMap((s) => splitLongLine(s));
+    if (parts.length <= 1) {
+      steps.push(parts.length ? { ...raw, line: parts[0] } : raw);
+      continue;
+    }
+    parts.forEach((line, i) => {
+      steps.push({ ...raw, line, jab: i === parts.length - 1 ? raw.jab : "" });
+    });
+  }
+  return { ...data, steps };
+}
+
 export function validateDraft(data: unknown, moments?: unknown[] | null): Draft {
   if (!isRecord(data) || !exactKeys(data, ["outline", "steps"])) {
     throw new StoryReviewError("draft must contain outline and steps only");
@@ -407,9 +488,9 @@ export function validateDraft(data: unknown, moments?: unknown[] | null): Draft 
         throw new StoryReviewError(`step ${n} needs an existing scene reference`);
       }
       const words = pySplit((raw.line as string).replace(EMO_RE, ""));
-      if (words.length > UNIT_MAX_WORDS || (raw.line as string).includes("\n")) {
+      if (words.length > UNIT_HARD_MAX || (raw.line as string).includes("\n")) {
         throw new StoryReviewError(
-          `step ${n} is an oversized spoken unit (${words.length} words, max ${UNIT_MAX_WORDS})`,
+          `step ${n} is an oversized spoken unit (${words.length} words, max ${UNIT_HARD_MAX})`,
         );
       }
       if (pySplit(raw.jab as string).length > JAB_MAX_WORDS) {
@@ -474,11 +555,14 @@ export function validatePlan(data: unknown, nEvents?: number | null): StoryPlan 
     }
     for (const i of refs) accounted.add(i as number);
   }
-  if (!hasOwn(data, "omitted_events")) data.omitted_events = [];
-  if (!Array.isArray(data.omitted_events)) {
+  const rawOmitted = hasOwn(data, "omitted_events") ? data.omitted_events : [];
+  if (!Array.isArray(rawOmitted)) {
     throw new StoryReviewError("omitted_events must be a list when given");
   }
-  for (const raw of data.omitted_events) {
+  // Selection mode: omissions are informational. An entry that a moment already
+  // uses is a harmless contradiction, so it is dropped instead of failing the plan.
+  const omitted: Array<Record<string, unknown>> = [];
+  for (const raw of rawOmitted) {
     if (
       !isRecord(raw) ||
       !exactKeys(raw, ["event", "reason"]) ||
@@ -489,9 +573,11 @@ export function validatePlan(data: unknown, nEvents?: number | null): StoryPlan 
     ) {
       throw new StoryReviewError("invalid omitted event");
     }
-    if (accounted.has(raw.event)) throw new StoryReviewError("covered event also marked omitted");
+    if (accounted.has(raw.event)) continue;
     accounted.add(raw.event);
+    omitted.push(raw);
   }
+  data.omitted_events = omitted;
   if (nEvents && [...accounted].some((i) => i > nEvents)) {
     throw new StoryReviewError("plan references a source event that does not exist");
   }
@@ -635,6 +721,7 @@ export async function planStory(
     opening,
     so_far: opts.soFar || "(none yet)",
     upcoming: opts.upcoming ? opts.upcoming.replace(/\n*$/, "\n") : "",
+    shape_plan: (opts.shape ?? SHAPE_EPISODE).plan,
   });
   writeDiag(opts.diagnosticsDir, "plan-prompt.txt", planPrompt);
   const planned = await call([{ role: "user", content: planPrompt }], {
@@ -649,7 +736,11 @@ export async function planStory(
   try {
     const events = Array.isArray(obs?.events) ? obs.events : [];
     const plan = validatePlan(parseJson(completionContent(planned)), events.length);
-    opts.onPlan?.(plan);
+    try {
+      opts.onPlan?.(plan);
+    } catch {
+      // a caller-side hook failure must not be blamed on the model's plan
+    }
     return plan;
   } catch (e) {
     throw new StoryReviewError(`story plan contract: ${errMessage(e)}`);
@@ -690,6 +781,7 @@ export async function draftStory(
     previous,
     opening,
     delivery,
+    shape_draft: (opts.shape ?? SHAPE_EPISODE).draft,
   });
   writeDiag(opts.diagnosticsDir, "draft-prompt.txt", prompt);
   const r = await call([{ role: "user", content: prompt }], {
@@ -703,7 +795,7 @@ export async function draftStory(
   const raw = completionContent(r);
   writeDiag(opts.diagnosticsDir, "draft-response.json", jsonIndent1(r));
   try {
-    return { draft: validateDraft(parseJson(raw)), prompt, source };
+    return { draft: validateDraft(normalizeUnits(parseJson(raw))), prompt, source };
   } catch (e) {
     throw new StoryReviewError(`story draft contract: ${errMessage(e)}`);
   }
@@ -740,6 +832,7 @@ export async function reviewStory(
     previous,
     opening,
     draft: pyJsonDumps(numbered, { ensureAscii: false }),
+    shape_review: (opts.shape ?? SHAPE_EPISODE).review,
   });
   writeDiag(opts.diagnosticsDir, `${prefix}review-prompt.txt`, reviewPrompt);
   const reviewed = await call([{ role: "user", content: reviewPrompt }], {
@@ -763,6 +856,57 @@ export async function reviewStory(
 }
 
 export const review_story = reviewStory;
+
+/** 1-based steps a review flags, or null when it names the whole draft (step 0) / none. */
+export function flaggedSteps(review: StoryReview, nSteps: number): number[] | null {
+  const issues = Array.isArray(review.issues) ? review.issues : [];
+  const steps = new Set<number>();
+  for (const i of issues) {
+    const n = Number(i.step);
+    if (!Number.isInteger(n) || n < 1 || n > nSteps) return null;
+    steps.add(n);
+  }
+  return steps.size ? [...steps].sort((a, b) => a - b) : null;
+}
+
+/** Drop the helper `step` numbers a model may echo back from the numbered draft. */
+function stripStepNumbers(data: unknown): unknown {
+  if (!isRecord(data) || !Array.isArray(data.steps)) return data;
+  return {
+    ...data,
+    steps: data.steps.map((r) => {
+      if (!isRecord(r) || !hasOwn(r, "step")) return r;
+      const { step: _drop, ...rest } = r;
+      return rest;
+    }),
+  };
+}
+
+/**
+ * Apply a PATCH-mode reply: each flagged step is replaced by the given steps (or
+ * cut); unflagged steps are kept verbatim. A patch for an unflagged step is ignored.
+ */
+export function applyPatches(draft: Draft, reply: unknown, flagged: number[]): Draft {
+  if (!isRecord(reply) || !Array.isArray(reply.patches)) {
+    throw new StoryReviewError("patch reply must contain patches");
+  }
+  const allowed = new Set(flagged);
+  const repl = new Map<number, unknown[]>();
+  for (const p of reply.patches) {
+    if (!isRecord(p) || !Number.isInteger(p.step) || !Array.isArray(p.steps)) {
+      throw new StoryReviewError("invalid patch entry");
+    }
+    if (allowed.has(p.step as number)) repl.set(p.step as number, p.steps as unknown[]);
+  }
+  const steps: unknown[] = [];
+  draft.steps.forEach((row, i) => {
+    const r = repl.get(i + 1);
+    if (r === undefined) steps.push(row);
+    else steps.push(...r);
+  });
+  if (!steps.length) throw new StoryReviewError("patches removed every step");
+  return { ...draft, steps } as Draft;
+}
 
 /**
  * Scene planning -> drafting -> source review, with ONE bounded source-backed repair.
@@ -794,20 +938,60 @@ export async function writeStoryScript(
     writeDiag(diag, "draft-structure-error.json", jsonIndent1(structural));
   }
   verdict = structural ?? (await reviewStory(draft, plan, obs, bible, transcript, opts));
-  if (verdict.verdict !== "accept") {
-    // One content correction, not reroll-until-accept. Keep all original evidence:
-    // original dialogue is needed here, not an instruction to merely obey a fallible judge.
+  // Bounded source-backed repair. Round 1 may restructure the whole draft (a
+  // structural error or a missing cause can need it); later rounds PATCH only the
+  // flagged steps, so lines already accepted cannot regress into new issues.
+  // STORY_REPAIRS (default 3, max 4) sets the budget.
+  const rounds = Math.min(4, Math.max(1, Number.parseInt(process.env.STORY_REPAIRS ?? "3", 10) || 3));
+  for (let round = 1; verdict.verdict !== "accept"; round++) {
+    if (round > rounds) {
+      // Budget spent. Only a lone caption-tour note may ship (a wording nit);
+      // invented facts, broken continuity, factual jabs and missing causes block.
+      const issues = Array.isArray(verdict.issues) ? verdict.issues : [];
+      const blocking = issues.filter((i) => !SOFT_REVIEW_KINDS.has(String(i.kind)));
+      if (blocking.length === 0 && issues.length <= SOFT_ISSUE_LIMIT) {
+        writeDiag(diag, "accepted-with-soft-issues.json", jsonIndent1(issues));
+        process.stderr.write(
+          `   story: accepted with ${issues.length} soft review note(s): ` +
+            issues.map((i) => `step ${i.step} ${i.kind}`).join(", ") + "\n",
+        );
+        verdict = { ...verdict, verdict: "accept", soft_issues: issues, issues: [] };
+        break;
+      }
+      throw new StoryReviewError(
+        "story review rejected corrected draft: " +
+          pyJsonDumps(verdict.issues, { ensureAscii: false }),
+      );
+    }
+    const tag = round === 1 ? "revision-" : `revision${round}-`;
+    const flagged = flaggedSteps(verdict, draft.steps.length);
+    const patch = round > 1 && flagged !== null;
+    const contract = patch
+      ? "PATCH MODE: rewrite ONLY the flagged steps listed below; every other step is " +
+        "accepted and must stay word-for-word. Reply STRICT JSON only: " +
+        '{"patches":[{"step":<1-based step number>,"steps":[{"beat":"...","line":"...","jab":"","scene":<int>}]}]}. ' +
+        "A patch replaces that one step with 1-3 steps (or [] to cut it). Keep the step's " +
+        `scene unless the review shows it is wrong; ${UNIT_MAX_WORDS}-word unit maximum.\n` +
+        `FLAGGED STEPS: ${flagged!.join(", ")}\n`
+      : "Same strict JSON contract, every step " +
+        `with an existing scene reference, ${UNIT_MAX_WORDS}-word unit maximum.\n`;
+    // Keep all original evidence: original dialogue is needed here, not an
+    // instruction to merely obey a fallible judge.
     const repairPrompt =
       prompt +
-      "\n\nSOURCE-BACKED CORRECTION (one attempt):\n" +
+      `\n\nSOURCE-BACKED CORRECTION (attempt ${round} of ${rounds}):\n` +
       "Revise the supplied draft using the original facts. Fix only the flagged " +
-      "problems: unsupported claims, false intervals or knowledge, caption-tour or " +
-      "'then'-chain lines, factual jabs, and a missing pivotal cause or payoff. " +
-      "The review is fallible: if a claim is already paraphrased, do not duplicate " +
-      "it or invent facts to appease the reviewer. Stay selective: do not add " +
-      "scenes, reactions or exchanges back just to cover the source. Keep the cold " +
-      "open, causal glue and closing hook. Same strict JSON contract, every step " +
-      `with an existing scene reference, ${UNIT_MAX_WORDS}-word unit maximum.\n` +
+      "problems: unsupported claims, false intervals or order, fused or misplaced " +
+      "moments, unclear jumps or pronouns, caption-tour or 'then'-chain lines, factual " +
+      "jabs, and a missing pivotal cause or payoff. For a continuity issue, re-read the " +
+      "source around that moment and state the real place, time and order in a few " +
+      "words (\"later that night\", \"back home\"). Rewrite a flagged line rather than " +
+      "padding it; cut it if it carries nothing. Replace every 'and then' / ', then' " +
+      "with a causal link (so, but, because) or a new sentence. The review is fallible: " +
+      "if a claim is already paraphrased, do not duplicate it or invent facts to appease " +
+      "the reviewer. Stay selective: do not add scenes, reactions or exchanges back just " +
+      "to cover the source. Keep the cold open, causal glue and closing hook. " +
+      contract +
       "ORIGINAL SOURCE:\n" +
       transcript +
       "\nORIGINAL EVENTS:\n" +
@@ -815,8 +999,11 @@ export async function writeStoryScript(
       "\nFALLIBLE REVIEW:\n" +
       pyJsonDumps(verdict, { ensureAscii: false }) +
       "\nDRAFT TO CORRECT:\n" +
-      pyJsonDumps(draft, { ensureAscii: false });
-    writeDiag(diag, "revision-prompt.txt", repairPrompt);
+      pyJsonDumps(
+        { ...draft, steps: draft.steps.map((row, i) => ({ step: i + 1, ...row })) },
+        { ensureAscii: false },
+      );
+    writeDiag(diag, `${tag}prompt.txt`, repairPrompt);
     const revised = await call([{ role: "user", content: repairPrompt }], {
       maxTokens: 6000,
       temperature: 0.2,
@@ -825,19 +1012,15 @@ export async function writeStoryScript(
       stage: "writer",
       retries: 1,
     });
-    writeDiag(diag, "revision-response.json", jsonIndent1(revised));
+    writeDiag(diag, `${tag}response.json`, jsonIndent1(revised));
     try {
-      draft = validateDraft(parseJson(completionContent(revised)), plan.moments);
+      const parsed = parseJson(completionContent(revised));
+      const next = patch ? applyPatches(draft, parsed, flagged!) : parsed;
+      draft = validateDraft(normalizeUnits(stripStepNumbers(next)), plan.moments);
     } catch (e) {
       throw new StoryReviewError(`story correction contract: ${errMessage(e)}`);
     }
-    verdict = await reviewStory(draft, plan, obs, bible, transcript, { ...opts, prefix: "revision-" });
-    if (verdict.verdict !== "accept") {
-      throw new StoryReviewError(
-        "story review rejected corrected draft: " +
-          pyJsonDumps(verdict.issues, { ensureAscii: false }),
-      );
-    }
+    verdict = await reviewStory(draft, plan, obs, bible, transcript, { ...opts, prefix: tag });
   }
   writeDiag(diag, "accepted-draft.json", jsonIndent1(draft));
   writeDiag(diag, "accepted-review.json", jsonIndent1(verdict));

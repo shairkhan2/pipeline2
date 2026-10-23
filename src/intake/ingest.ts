@@ -38,8 +38,8 @@ import { seriesStyleSchema } from '../config/seriesStyle.js';
 export const BACKGROUNDS = ["starfield", "storm-valley", "mist-pines"] as const;
 export const DEFAULT_BACKGROUND = "starfield";
 // Keep in sync with remotion-studio/src/motions/index.tsx MOTIONS keys.
-export const MOTIONS = ["cut", "duo"] as const;
-export const DEFAULT_MOTION = "cut";
+export const MOTIONS = ["window", "cut", "duo"] as const;
+export const DEFAULT_MOTION = "window";
 
 const IMG_RE = /\.(webp|jpg|jpeg|png|gif|bmp)$/i;
 const CH_RE = /(?:chapter|ch|chap|ep|episode)[\s._-]*(\d+)/i;

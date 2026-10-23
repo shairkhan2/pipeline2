@@ -1,7 +1,7 @@
 /**
  * Panel order and adjacency. Ports reader.panel_order_key, reader.panel_positions,
  * reader._needs_positions, timeline._pid, timeline._keymap, timeline._adj_keys,
- * timeline._is_adj, timeline._chain. MIN_PANEL_S = 0.8.
+ * timeline._is_adj, timeline._chain. MIN_PANEL_S = 1.5 (legacy 0.8).
  *
  * adjKeys / isAdj share one encoding: successor lookup is by `${page},${idx}`,
  * not by panel id. Pass adjKeys(keymap(...)) into isAdj / isChain.
