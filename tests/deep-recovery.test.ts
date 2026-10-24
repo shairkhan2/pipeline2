@@ -1293,6 +1293,23 @@ describe('timeline audio/cleaner recovery', () => {
     expect(logs.join('\n')).toContain('tts: cache hit');
   });
 
+  it('passes a valid visuals.animation into shots.json props and drops an invalid one', async () => {
+    const timeline = await import('../src/stages/timeline.js');
+    const fx = await makeTimelineFixture('timeline-animation');
+    const metaPath = path.join(fx.sdir, 'meta.json');
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    meta.visuals = { background: 'starfield', motion: 'window', animation: { entry: 'fade', exit: 'zoom-out', entryS: 0.3, pushIn: 'strong', drift: false } };
+    fs.writeFileSync(metaPath, JSON.stringify(meta));
+    const props = JSON.parse(fs.readFileSync(await timeline.main(fx.sdir, fx.ch, fx.script, fx.obs, fx.vdir, { env: fx.env }), 'utf8'));
+    expect(props.animation).toEqual({ entry: 'fade', exit: 'zoom-out', entryS: 0.3, pushIn: 'strong', drift: false });
+    expect(props.motion).toBe('window');
+
+    meta.visuals.animation = { entry: 'spin' };
+    fs.writeFileSync(metaPath, JSON.stringify(meta));
+    const again = JSON.parse(fs.readFileSync(await timeline.main(fx.sdir, fx.ch, fx.script, fx.obs, fx.vdir, { env: fx.env }), 'utf8'));
+    expect('animation' in again).toBe(false);
+  });
+
   it('a mid-audio failure leaves no shots.json, retains completed lines, and resumes without re-billing line 0', async () => {
     const timeline = await import('../src/stages/timeline.js');
     const fx = await makeTimelineFixture('timeline-audio-fail');

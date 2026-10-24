@@ -174,16 +174,25 @@ export interface JobsList {
 export type SeriesStyle = Partial<Record<'writerMode' | 'storyShape' | 'matchMode' | 'emotionTags' | 'pacing', string>>;
 export type StyleOptions = Record<keyof SeriesStyle, Array<{ value: string; label: string; description: string }>>;
 export interface TtsStyle { voice_id?: string; speed?: number; style?: string; language?: string }
+/** Window-motion card animation (series meta visuals.animation). Absent fields use the renderer defaults. */
+export interface CardAnimation {
+  entry?: 'none' | 'fade' | 'zoom' | 'slide-up' | 'slide-left';
+  exit?: 'none' | 'fade' | 'zoom-out' | 'slide-down';
+  entryS?: number;
+  exitS?: number;
+  pushIn?: 'off' | 'subtle' | 'normal' | 'strong';
+  drift?: boolean;
+}
 export interface SeriesSettings {
   style: SeriesStyle;
   tts: TtsStyle & { engine?: string };
-  visuals: { background?: string; motion?: string };
+  visuals: { background?: string; motion?: string; animation?: CardAnimation };
   styleOptions: StyleOptions;
 }
 export interface SeriesSettingsPatch {
   style?: Partial<Record<keyof SeriesStyle, string | null>>;
   tts?: { voice_id?: string | null; speed?: number | null; style?: string | null; language?: string | null };
-  visuals?: { background?: string; motion?: string };
+  visuals?: { background?: string; motion?: string; animation?: CardAnimation | null };
 }
 
 export interface IntakeCatalog {
@@ -553,6 +562,7 @@ export interface GdriveJobInput {
   chapters?: string;
   background?: string;
   motion?: string;
+  animation?: CardAnimation;
   renderLane?: string;
   renderQuality?: RenderQuality;
   outroConfig?: OutroConfigInput;
@@ -570,6 +580,7 @@ export interface UploadJobInput {
   chapters?: string;
   background?: string;
   motion?: string;
+  animation?: CardAnimation;
   renderLane?: string;
   renderQuality?: RenderQuality;
   outroConfig?: OutroConfigInput;
@@ -1190,6 +1201,7 @@ export const api = {
       if (input.chapters) query.chapters = input.chapters;
       if (input.background) query.background = input.background;
       if (input.motion) query.motion = input.motion;
+      if (input.animation && Object.keys(input.animation).length) query.animation = JSON.stringify(input.animation);
       if (input.renderLane) query.renderLane = input.renderLane;
       if (input.renderQuality) query.renderQuality = input.renderQuality;
       if (input.outroConfig) query.outroConfig = JSON.stringify(input.outroConfig);

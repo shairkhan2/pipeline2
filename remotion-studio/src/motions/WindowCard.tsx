@@ -4,6 +4,10 @@
  * Motion: a slow linear push-in about the subject point; the card itself and
  * the backdrop stay still, so the cut between shots is the only hard move.
  * Scaling >= 1 about a point inside the card never bares a card edge.
+ * Card animation (animation.ts): optional entry/exit on the card, a backdrop
+ * crossfade over the previous shot during the entry, push-in strength, and
+ * drift (push-in about the subject point; off = about the card centre).
+ * Defaults reproduce the hard-cut look exactly.
  */
 import React from 'react';
 import {AbsoluteFill, Img, interpolate, staticFile, useCurrentFrame} from 'remotion';
@@ -21,6 +25,13 @@ import {
   WINDOW_BG_DOWNSCALE,
   WINDOW_SHADOW,
 } from './tunables';
+import {
+  DEFAULT_ANIMATION,
+  cardFrame,
+  pushInEnd,
+  type ResolvedAnimation,
+  type ShotPlan,
+} from './animation';
 import type {Shot, ShotBox} from './types';
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -81,20 +92,23 @@ export function windowGeometry(s: Shot) {
 }
 
 /** End zoom for a shot: weight sets the target, duration caps the speed. */
-export function windowZoomEnd(s: Shot, durS: number, boxLimit = Infinity) {
+export function windowZoomEnd(
+  s: Shot,
+  durS: number,
+  boxLimit = Infinity,
+  pushIn: ResolvedAnimation['pushIn'] = 'normal',
+) {
   const weight = clamp(Math.round(num(s.weight, 1)), 1, 3);
-  const target = WINDOW_ZOOM[weight - 1];
-  const z = 1 + Math.min(target, WINDOW_ZOOM_RATE * Math.max(0, durS));
-  return Math.max(1, Math.min(z, boxLimit));
+  return pushInEnd(WINDOW_ZOOM[weight - 1], WINDOW_ZOOM_RATE, durS, pushIn, boxLimit);
 }
 
-const Backdrop: React.FC<{src: string}> = ({src}) => {
+const Backdrop: React.FC<{src: string; opacity?: number}> = ({src, opacity = 1}) => {
   // Blur at 1/DOWNSCALE size then scale up: same look, a fraction of the cost.
   const k = WINDOW_BG_DOWNSCALE;
   const bw = W / k;
   const bh = H / k;
   return (
-    <AbsoluteFill style={{overflow: 'hidden', background: '#000'}}>
+    <AbsoluteFill style={{overflow: 'hidden', background: '#000', ...(opacity < 1 ? {opacity} : {})}}>
       <div
         style={{
           position: 'absolute',
@@ -120,15 +134,29 @@ const Backdrop: React.FC<{src: string}> = ({src}) => {
   );
 };
 
-export const WindowCard: React.FC<{shot: Shot; durationInFrames: number; fps: number}> = ({
-  shot,
-  durationInFrames,
-  fps,
-}) => {
+export const WindowCard: React.FC<{
+  shot: Shot;
+  durationInFrames: number;
+  fps: number;
+  plan?: Pick<ShotPlan, 'entryF' | 'exitF'>;
+  animation?: ResolvedAnimation;
+  first?: boolean;
+}> = ({shot, durationInFrames, fps, plan, animation = DEFAULT_ANIMATION, first = false}) => {
   const frame = useCurrentFrame();
   const src = staticFile(shot.panel);
   const g = windowGeometry(shot);
-  const zEnd = windowZoomEnd(shot, durationInFrames / fps, g.boxLimit);
+  const zEnd = windowZoomEnd(shot, durationInFrames / fps, g.boxLimit, animation.pushIn);
+  const cf = cardFrame(
+    frame,
+    {dur: durationInFrames, entryF: plan?.entryF ?? 0, exitF: plan?.exitF ?? 0},
+    animation,
+    {w: W, h: H},
+    first,
+  );
+  const moved = cf.scale !== 1 || cf.dx !== 0 || cf.dy !== 0;
+  const origin = animation.drift
+    ? `${(g.ox - g.left).toFixed(2)}px ${(g.oy - g.top).toFixed(2)}px`
+    : `${(g.w / 2 - g.left).toFixed(2)}px ${(g.h / 2 - g.top).toFixed(2)}px`;
   const z = interpolate(frame, [0, Math.max(1, durationInFrames - 1)], [1, zEnd], {
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
@@ -136,7 +164,7 @@ export const WindowCard: React.FC<{shot: Shot; durationInFrames: number; fps: nu
 
   return (
     <AbsoluteFill>
-      <Backdrop src={src} />
+      <Backdrop src={src} opacity={cf.backdropOpacity} />
       <AbsoluteFill style={{justifyContent: 'center', alignItems: 'center'}}>
         <div
           style={{
@@ -145,6 +173,10 @@ export const WindowCard: React.FC<{shot: Shot; durationInFrames: number; fps: nu
             position: 'relative',
             overflow: 'hidden',
             boxShadow: WINDOW_SHADOW,
+            ...(cf.opacity < 1 ? {opacity: cf.opacity} : {}),
+            ...(moved
+              ? {transform: `translate(${cf.dx.toFixed(2)}px, ${cf.dy.toFixed(2)}px) scale(${cf.scale.toFixed(5)})`}
+              : {}),
           }}
         >
           <Img
@@ -156,7 +188,7 @@ export const WindowCard: React.FC<{shot: Shot; durationInFrames: number; fps: nu
               width: g.iw,
               height: g.ih,
               maxWidth: 'none',
-              transformOrigin: `${(g.ox - g.left).toFixed(2)}px ${(g.oy - g.top).toFixed(2)}px`,
+              transformOrigin: origin,
               transform: `scale(${z.toFixed(5)})`,
               willChange: 'transform',
             }}

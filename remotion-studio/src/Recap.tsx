@@ -20,6 +20,8 @@ import {W, H} from './motions/tunables';
 
 export type {Shot, ShotBox} from './motions/types';
 import type {Shot} from './motions/types';
+import type {CardAnimation} from './motions/animation';
+export type {CardAnimation} from './motions/animation';
 
 export type RecapProps = {
   shots: Shot[];
@@ -27,6 +29,8 @@ export type RecapProps = {
   volume?: number;
   background?: BackgroundId | string;
   motion?: MotionId | string;
+  /** Card entry/exit/push-in (window motion only). Absent = hard cuts, today's push-in. */
+  animation?: CardAnimation | null;
   /** Optional music bed (off unless the pipeline sets it). Loops under the narration. */
   music?: {src: string; volume?: number; loopS?: number} | null;
 };
@@ -40,12 +44,12 @@ const MusicBed: React.FC<{src: string; volume: number; loopS?: number}> = ({src,
   return loopS && loopS > 0 ? <Loop durationInFrames={Math.round(loopS * fps)}>{audio}</Loop> : audio;
 };
 
-export const Recap: React.FC<RecapProps> = ({shots, audio, volume, background, motion, music}) => {
+export const Recap: React.FC<RecapProps> = ({shots, audio, volume, background, motion, animation, music}) => {
   const glowRgb = backgroundGlow(background);
   return (
     <AbsoluteFill>
       {motionOwnsBackdrop(motion) ? <AbsoluteFill style={{background: '#000'}} /> : <Background id={background} />}
-      <MotionLayout id={motion} shots={shots} glowRgb={glowRgb} />
+      <MotionLayout id={motion} shots={shots} glowRgb={glowRgb} animation={animation} />
       {audio ? <Audio src={staticFile(audio)} volume={volume ?? 1} /> : null}
       {music?.src ? <MusicBed src={music.src} volume={music.volume ?? 0.12} loopS={music.loopS} /> : null}
     </AbsoluteFill>

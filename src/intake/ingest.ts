@@ -30,6 +30,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 import AdmZip from "adm-zip";
+import { z } from "zod";
 
 import { pyFloatRepr, pyReprStr } from "../contracts/hashes.js";
 import { seriesStyleSchema } from '../config/seriesStyle.js';
@@ -40,6 +41,31 @@ export const DEFAULT_BACKGROUND = "starfield";
 // Keep in sync with remotion-studio/src/motions/index.tsx MOTIONS keys.
 export const MOTIONS = ["window", "cut", "duo"] as const;
 export const DEFAULT_MOTION = "window";
+// Card animation for the window motion (meta.json visuals.animation).
+// Keep in sync with remotion-studio/src/motions/animation.ts. Every field is
+// optional; an absent field renders the default hard-cut look.
+export const CARD_ENTRIES = ["none", "fade", "zoom", "slide-up", "slide-left"] as const;
+export const CARD_EXITS = ["none", "fade", "zoom-out", "slide-down"] as const;
+export const CARD_PUSH_INS = ["off", "subtle", "normal", "strong"] as const;
+export const cardAnimationSchema = z.object({
+  entry: z.enum(CARD_ENTRIES).optional(),
+  exit: z.enum(CARD_EXITS).optional(),
+  entryS: z.number().finite().min(0).max(1).optional(),
+  exitS: z.number().finite().min(0).max(1).optional(),
+  pushIn: z.enum(CARD_PUSH_INS).optional(),
+  drift: z.boolean().optional(),
+}).strict();
+export type CardAnimation = z.infer<typeof cardAnimationSchema>;
+
+/** Valid object minus undefined keys; invalid or empty yields null (renderer defaults). */
+export function normalizeCardAnimation(value: unknown): CardAnimation | null {
+  const parsed = cardAnimationSchema.safeParse(value);
+  if (!parsed.success) return null;
+  const out = Object.fromEntries(
+    Object.entries(parsed.data).filter(([, v]) => v !== undefined),
+  ) as CardAnimation;
+  return Object.keys(out).length ? out : null;
+}
 
 const IMG_RE = /\.(webp|jpg|jpeg|png|gif|bmp)$/i;
 const CH_RE = /(?:chapter|ch|chap|ep|episode)[\s._-]*(\d+)/i;
@@ -203,6 +229,7 @@ export interface IngestOptions {
   voice_id?: string | null;
   background?: string | null;
   motion?: string | null;
+  animation?: CardAnimation | null;
   interactive?: boolean | null;
   ttsConfig?: TtsConfig | null;
   tts_config?: TtsConfig | null;
@@ -1182,6 +1209,7 @@ export function ingest(series: string, options: IngestOptions = {}): number[] {
   let voiceId = defined(options.voiceId, options.voice_id) ?? null;
   let background = options.background ?? null;
   let motion = options.motion ?? null;
+  const animation = options.animation == null ? null : normalizeCardAnimation(cardAnimationSchema.parse(options.animation));
   let interactive = options.interactive ?? null;
   const ttsConfig = defined(options.ttsConfig, options.tts_config) ?? null;
   const title = options.title ?? null;
@@ -1244,7 +1272,7 @@ export function ingest(series: string, options: IngestOptions = {}): number[] {
     }
     const meta = {
       tts: ttsBlock,
-      visuals: { background, motion },
+      visuals: { background, motion, ...(animation ? { animation } : {}) },
       title: detected || series,
       ...(style ? { style } : {}),
     };

@@ -6,11 +6,13 @@ import React from 'react';
 import {CutLayout} from './Cut';
 import {DuoLayout} from './Duo';
 import {WindowLayout} from './Window';
+import type {CardAnimation} from './animation';
 import type {Shot} from './types';
 
 export type MotionId = 'window' | 'cut' | 'duo';
 
-type Layout = React.FC<{shots: Shot[]; glowRgb: string}>;
+// animation: card entry/exit/push-in options, honoured by 'window' only.
+type Layout = React.FC<{shots: Shot[]; glowRgb: string; animation?: CardAnimation | null}>;
 
 // ownsBackdrop: the layout paints its own full-frame backdrop per shot, so the
 // procedural background (src/backgrounds/) is not rendered behind it.
@@ -30,11 +32,12 @@ export const resolveMotion = (id?: string): MotionId =>
 
 export const motionOwnsBackdrop = (id?: string): boolean => MOTIONS[resolveMotion(id)].ownsBackdrop;
 
-export const MotionLayout: React.FC<{id?: string; shots: Shot[]; glowRgb: string}> = ({
-  id,
-  shots,
-  glowRgb,
-}) => {
+export const MotionLayout: React.FC<{
+  id?: string;
+  shots: Shot[];
+  glowRgb: string;
+  animation?: CardAnimation | null;
+}> = ({id, shots, glowRgb, animation}) => {
   const {Layout} = MOTIONS[resolveMotion(id)];
-  return <Layout shots={shots} glowRgb={glowRgb} />;
+  return <Layout shots={shots} glowRgb={glowRgb} animation={animation} />;
 };

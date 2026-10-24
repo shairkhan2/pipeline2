@@ -41,6 +41,7 @@ import { handleIntakeRoute, initIntakeQueue as initJobsQueue, parseJsonParam, pa
 import { MAX_ZIP_BYTES } from '../intake/ingest.js';
 import { extendSeries, generateSeriesOutro, getSeriesMergeState, inspectSeriesOutro, mergeSeriesChapters, resolveSeriesDir, setSeriesOutroAttachment } from './seriesTools.js';
 import { getSeriesSettings, patchSeriesSettings } from './seriesSettings.js';
+import { getMoviePlanView } from './moviePlanView.js';
 import { assertNoSymlinks } from './storageTrash.js';
 import { handleSetupRoute, isSetupOpen } from './setup.js';
 import { handleStudioRoute } from './studio.js';
@@ -761,6 +762,14 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse): 
       if (!csrf.ok) return sendJson(res, 403, { error: csrf.error });
       const { csrfToken: _token, ...patch } = body;
       return sendJson(res, 200, patchSeriesSettings(dir, patch));
+    }
+    const moviePlanMatch = /^\/api\/series\/([^/]+)\/movie-plan$/.exec(pathname);
+    if (moviePlanMatch) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') { req.resume(); return sendJson(res, 405, { error: 'method not allowed' }); }
+      const slug = validateSlug(moviePlanMatch[1]);
+      if (!slug) return sendJson(res, 400, { error: 'Invalid series slug' });
+      const dir = resolveSeriesDir({ seriesRoot: SERIES_ROOT, slug });
+      return sendJson(res, 200, getMoviePlanView(dir));
     }
     const seriesMatch = /^\/api\/series\/([^/]+)\/(outro|merge|extend)$/.exec(pathname);
     // Outro attachment: a series-level saved preference, never a rewrite of chapter files.

@@ -252,12 +252,12 @@ interface ServiceAccountPreview {
   json: string;
 }
 
-const STAGE_META: Array<{ id: UiStage; title: string; purpose: string; gate: "vision" | "text" }> = [
+const STAGE_META: Array<{ id: UiStage; title: string; purpose: string; gate: "vision" | "text"; scope?: string }> = [
   { id: "reader", title: "Reader", purpose: "Panel vision extraction", gate: "vision" },
   { id: "matcher", title: "Matcher", purpose: "Contact-sheet and semantic matching", gate: "vision" },
   { id: "writer", title: "Writer", purpose: "Recap and story script", gate: "text" },
   { id: "scout", title: "Scout", purpose: "Promo, watermark, and credit detection", gate: "vision" },
-  { id: "fact_check", title: "Fact Check", purpose: "Deterministic rules plus optional LLM verify", gate: "text" },
+  { id: "fact_check", title: "Fact Check", purpose: "Legacy writer only. Story and movie scripts skip it and get a style report instead.", gate: "text", scope: "Legacy only" },
 ];
 
 const LOCAL_PRESETS = [
@@ -4071,8 +4071,12 @@ export function RoutingTab({
                   </h3>
                   <span className="cap font-mono">{draft.chain.length}</span>
                 </div>
-                <span className="cap is-on">{meta.gate === "vision" ? "Vision" : "Text"}</span>
+                <div className="flex items-center gap-2">
+                  {meta.scope ? <span className="cap">{meta.scope}</span> : null}
+                  <span className="cap is-on">{meta.gate === "vision" ? "Vision" : "Text"}</span>
+                </div>
               </header>
+              {meta.scope ? <p className="mt-2 text-xs text-muted-foreground">{meta.purpose}</p> : null}
               {inherited ? (
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
                   <span className="cap is-on">Linked to Reader ({drafts.reader.chain.length})</span>

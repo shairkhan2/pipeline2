@@ -8,28 +8,32 @@ import React from 'react';
 import {Sequence, useVideoConfig} from 'remotion';
 import {WindowCard} from './WindowCard';
 import {WINDOW_PREMOUNT_S} from './tunables';
+import {planShots, resolveAnimation, type CardAnimation} from './animation';
 import type {Shot} from './types';
 
-export const WindowLayout: React.FC<{shots: Shot[]; glowRgb: string}> = ({shots}) => {
+export const WindowLayout: React.FC<{shots: Shot[]; glowRgb: string; animation?: CardAnimation | null}> = ({
+  shots,
+  animation,
+}) => {
   const {fps} = useVideoConfig();
   const premountFor = Math.round(WINDOW_PREMOUNT_S * fps);
+  const anim = resolveAnimation(animation);
+  // Close any gap: each shot runs to the next shot's first frame (else its own
+  // end), plus the next shot's entry length so it stays painted underneath.
+  const plans = planShots(shots, fps, anim);
   return (
     <>
       {shots.map((s, i) => {
-        const from = Math.round(s.start_s * fps);
-        const next = shots[i + 1];
-        // Close any gap: run to the next shot's first frame, else to our own end.
-        const to = next ? Math.round(next.start_s * fps) : Math.round(s.end_s * fps);
-        const dur = Math.max(1, to - from);
+        const plan = plans[i];
         return (
           <Sequence
             key={i}
-            from={from}
-            durationInFrames={dur}
+            from={plan.from}
+            durationInFrames={plan.seqDur}
             premountFor={premountFor}
             name={`shot-${i}`}
           >
-            <WindowCard shot={s} durationInFrames={dur} fps={fps} />
+            <WindowCard shot={s} durationInFrames={plan.dur} fps={fps} plan={plan} animation={anim} first={i === 0} />
           </Sequence>
         );
       })}

@@ -25,6 +25,8 @@ describe('separated backend HTTP boundary', () => {
     vi.stubEnv('PLAYER_API_ONLY', '1');
     vi.stubEnv('MANHWA_SERIES_ROOT', path.join(root, 'series'));
     vi.stubEnv('MANHWA_NO_AUTO_WORKER', '1');
+    vi.stubEnv('MANHWA_OUT_DIR', path.join(root, 'out'));
+    vi.stubEnv('MANHWA_JOBS_DIR', path.join(root, 'out', 'jobs'));
     const mod = await import('../src/player/server.js');
     fs.writeFileSync(path.join(root, 'users'), `admin:${mod.apr1('test-password', 'fixture')}\n`);
     server = mod.createPlayerServer();
@@ -84,6 +86,21 @@ describe('separated backend HTTP boundary', () => {
       expect(response.status).toBe(400);
       expect(((await response.json()) as { error: string }).error).toBeTruthy();
     }
+  });
+
+  it('passes card animation from a Drive job request into the queued job, and rejects an invalid one', async () => {
+    const post = (body: unknown) => fetch(`${base}/api/intake/jobs`, {
+      method: 'POST', headers: { cookie, Origin: base, 'X-CSRF-Token': csrf, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const base_ = { sourceType: 'gdrive', gdriveUrl: `https://drive.google.com/file/d/ANIM${Date.now()}x${process.pid}/view`, title: `Anim Demo ${Date.now()}` };
+    const ok = await post({ ...base_, animation: { entry: 'fade', pushIn: 'strong' } });
+    if (ok.status !== 201) throw new Error(`status ${ok.status}: ${await ok.text()}`);
+    const job = await ok.json() as { id: string; visuals?: { motion?: string; animation?: unknown } };
+    expect(job.visuals?.animation).toEqual({ entry: 'fade', pushIn: 'strong' });
+    expect(job.visuals?.motion).toBe('window');
+    const bad = await post({ ...base_, gdriveUrl: `https://drive.google.com/file/d/ANIMBAD${Date.now()}x${process.pid}/view`, title: `Anim Bad ${Date.now()}`, animation: { entry: 'spin' } });
+    expect(bad.status).toBe(400);
   });
 
   it('returns 413 for an oversized chunked body instead of resetting the socket', async () => {

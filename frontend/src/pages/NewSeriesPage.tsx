@@ -11,6 +11,7 @@ import { Activity, Cloud, Info, Link2, Monitor, RefreshCw, Rocket, Server, Uploa
 
 import { AppShell } from "@/components/layout/AppShell";
 import { StyleFields, type EditableTtsStyle } from '@/components/library/StyleFields';
+import { CardAnimationFields, compactCardAnimation } from '@/components/library/CardAnimationFields';
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { Dropzone } from "@/components/ui/dropzone";
@@ -77,7 +78,7 @@ const BG_LABELS: Record<string, string> = {
   "storm-valley": "Storm Valley",
   "mist-pines": "Mist Pines",
 };
-const MOTION_LABELS: Record<string, string> = { cut: "Cut", duo: "Duo" };
+const MOTION_LABELS: Record<string, string> = { window: "Window", cut: "Cut", duo: "Duo" };
 const STEPS = [
   { title: "Source" },
   { title: "Voice & style" },
@@ -651,6 +652,7 @@ export default function NewSeriesPage() {
   const [ttsStyle, setTtsStyle] = useState<EditableTtsStyle>({});
   const [background, setBackground] = useState("starfield");
   const [motion, setMotion] = useState("");
+  const [cardAnimation, setCardAnimation] = useState<import('@/lib/api').CardAnimation>({});
   const [laneId, setLaneId] = useState(DEFAULT_LANE);
   const [renderQuality, setRenderQuality] = useState<RenderQuality>("1080p");
   const [outroEnabled, setOutroEnabled] = useState(false);
@@ -1047,6 +1049,7 @@ export default function NewSeriesPage() {
           chapters: chapterCheck.spec,
           background,
           motion: motion || "window",
+          animation: compactCardAnimation(cardAnimation),
           renderLane: lane.id,
           renderQuality: finalQuality,
           outroConfig,
@@ -1070,6 +1073,7 @@ export default function NewSeriesPage() {
             chapters: chapterCheck.spec,
             background,
             motion: motion || "window",
+            animation: compactCardAnimation(cardAnimation),
             renderLane: lane.id || DEFAULT_LANE,
             renderQuality: finalQuality,
             outroConfig,
@@ -1744,6 +1748,10 @@ export default function NewSeriesPage() {
                       </div>
                     </div>
                   </div>
+                  <details className="mt-4 text-sm">
+                    <summary className="min-h-11 cursor-pointer py-3">Card animation (optional)</summary>
+                    <CardAnimationFields className="mt-2" idPrefix="newCardAnim" value={cardAnimation} onChange={setCardAnimation} disabled={!privileged} />
+                  </details>
                 </section>
               ) : null}
 

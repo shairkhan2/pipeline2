@@ -40,6 +40,8 @@ import {
   MAX_ZIP_BYTES,
   MOTIONS,
   SystemExit,
+  cardAnimationSchema,
+  normalizeCardAnimation,
   ZipValidationError,
   archiveIndex,
   comicTitle,
@@ -460,6 +462,8 @@ export interface EnqueueOptions {
   chapters?: string | null;
   background?: string | null;
   motion?: string | null;
+  /** Optional window-motion card animation, stored as meta.json visuals.animation. */
+  animation?: unknown;
   renderLane?: string | null;
   render_lane?: string | null;
   createdBy?: string | null;
@@ -2972,6 +2976,9 @@ function moveFile(src: string, dest: string): void {
 export async function enqueueJob(opts: EnqueueOptions = {}): Promise<Record<string, unknown>> {
   const parsedStyle = seriesStyleSchema.optional().safeParse(opts.style);
   const parsedTts = ttsStyleSchema.optional().safeParse(opts.tts);
+  const parsedAnimation = cardAnimationSchema.nullable().optional().safeParse(opts.animation);
+  if (!parsedAnimation.success) throw new IntakeError(`Invalid card animation: ${validationMessage(parsedAnimation.error)}`);
+  const animationNorm = normalizeCardAnimation(parsedAnimation.data);
   if (!parsedStyle.success) throw new IntakeError(validationMessage(parsedStyle.error));
   if (!parsedTts.success) throw new IntakeError(validationMessage(parsedTts.error));
   const env = resolveEnv(opts.env);
@@ -3115,7 +3122,7 @@ export async function enqueueJob(opts: EnqueueOptions = {}): Promise<Record<stri
           voiceLabel: ttsResolved.voiceLabel,
           metaTts: ttsResolved.metaTts,
         },
-        visuals: { background: bgNorm, motion: moNorm },
+        visuals: { background: bgNorm, motion: moNorm, ...(animationNorm ? { animation: animationNorm } : {}) },
         ...(parsedStyle.data ? { style: parsedStyle.data } : {}),
         renderLane: renderLaneNorm,
         renderQuality: renderQualityNorm,
@@ -3653,6 +3660,7 @@ export async function executeSingleJob(
             voiceId: ttsMeta.voice_id ? String(ttsMeta.voice_id) : null,
             background: String(visuals.background || DEFAULT_BACKGROUND),
             motion: String(visuals.motion || DEFAULT_MOTION),
+            animation: normalizeCardAnimation(visuals.animation),
             interactive: false,
             ttsConfig: ttsMeta,
             style: job.style ? seriesStyleSchema.parse(job.style) : undefined,

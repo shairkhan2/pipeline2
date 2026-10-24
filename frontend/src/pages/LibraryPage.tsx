@@ -3,6 +3,7 @@ import { Download, Film, HardDrive, Info, Play, Plus, RefreshCw, Search, Sparkle
 
 import { AppShell } from "@/components/layout/AppShell";
 import { LanguageVersions } from "@/components/library/LanguageVersions";
+import { MoviePlanPanel } from "@/components/library/MoviePlanPanel";
 import { SeriesSettingsEditor } from '@/components/library/SeriesSettingsEditor';
 import { StorageTrashDrawer } from "@/components/shared/StorageTrashDrawer";
 import { ErrorNotice, Notice, RawDetails } from "@/components/ui/notice";
@@ -1572,6 +1573,7 @@ function SeriesView({
         onToast={onToast}
       />
       <SeriesSettingsEditor slug={series.slug} privileged={privileged} />
+      <MoviePlanPanel slug={series.slug} />
 
       <section aria-label="Chapters">
         <h3 className="mb-3 text-2xl font-semibold tracking-[-0.015em]">Chapters</h3>

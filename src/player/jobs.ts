@@ -525,7 +525,7 @@ export async function handleIntakeRoute(
       const voice = String(urlObj.searchParams.get('voice') || decodeHeader('x-tts-voice') || '').trim();
       const chapters = String(urlObj.searchParams.get('chapters') || decodeHeader('x-chapters') || 'all').trim();
       const background = String(urlObj.searchParams.get('background') || decodeHeader('x-background') || 'starfield').trim();
-      const motion = String(urlObj.searchParams.get('motion') || decodeHeader('x-motion') || 'cut').trim();
+      const motion = String(urlObj.searchParams.get('motion') || decodeHeader('x-motion') || 'window').trim();
       const filename = String(urlObj.searchParams.get('filename') || decodeHeader('x-upload-filename') || 'upload.zip').trim();
       const rawRenderLane = urlObj.searchParams.get('renderLane') ?? decodeHeader('x-render-lane');
       const renderLane = isBlankField(rawRenderLane) ? undefined : normalizeRenderLane(rawRenderLane);
@@ -570,6 +570,7 @@ export async function handleIntakeRoute(
           outroConfig,
           style: parseJsonParam(urlObj.searchParams.get('style')) as import('../config/seriesStyle.js').SeriesStyle | undefined,
           tts: parseJsonParam(urlObj.searchParams.get('tts')) as import('../intake/intake.js').EnqueueOptions['tts'],
+          animation: parseJsonParam(urlObj.searchParams.get('animation')) as import('../intake/intake.js').EnqueueOptions['animation'],
         });
         return sendJson(res, 201, job);
       } catch (err) {
@@ -631,13 +632,14 @@ export async function handleIntakeRoute(
         voice: String(body.voice || body.voiceId || '').trim(),
         chapters: String(body.chapters || 'all').trim(),
         background: String(body.background || 'starfield').trim(),
-        motion: String(body.motion || 'cut').trim(),
+        motion: String(body.motion || 'window').trim(),
         renderLane,
         renderQuality,
         createdBy: session.user,
         outroConfig: parseOutroConfig(body.outroConfig),
         style: body.style as import('../config/seriesStyle.js').SeriesStyle | undefined,
         tts: body.tts as import('../intake/intake.js').EnqueueOptions['tts'],
+        animation: body.animation as import('../intake/intake.js').EnqueueOptions['animation'],
       });
       return sendJson(res, 201, job);
     } catch (err) {

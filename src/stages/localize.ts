@@ -915,6 +915,10 @@ interface RenderConfig {
   /** Hash of the effective promo block the cleaner uses (rules, not just a rev). */
   promo: string;
   panels: string;
+  /** Hash of `visuals.animation` (forwarded opaquely to the props); absent when unset. */
+  animation?: string;
+  /** Hash of the top-level `music` config; absent when unset. */
+  music?: string;
 }
 
 /**
@@ -928,12 +932,18 @@ function promoBlockHash(sdir: string): string {
   return sha256File(file);
 }
 
-/** Effective render configuration read from the same sources the renderer uses. */
-function renderConfig(sdir: string, check: SourceCheck): RenderConfig {
+/**
+ * Effective render configuration read from the same sources the renderer uses.
+ * Defaults mirror the English timeline (motion "window"), so a dub of a series
+ * with no saved motion renders and caches like the English movie.
+ */
+export function renderConfig(sdir: string, check: SourceCheck): RenderConfig {
   const meta = readJsonObject(path.join(sdir, "meta.json")) ?? {};
   const visuals = isRecord(meta.visuals) ? meta.visuals : {};
   const background = String(visuals.background ?? meta.background ?? "starfield");
-  const motion = String(visuals.motion ?? meta.motion ?? "cut");
+  const motion = String(visuals.motion ?? meta.motion ?? "window");
+  const animation = isRecord(visuals.animation) ? sha256Json(visuals.animation) : undefined;
+  const music = isRecord(meta.music) ? sha256Json(meta.music) : undefined;
   let quality = "1080p";
   const envQuality = (process.env.MANHWA_RENDER_QUALITY ?? "").trim().toLowerCase();
   if (envQuality.startsWith("720")) quality = "720p";
@@ -952,6 +962,8 @@ function renderConfig(sdir: string, check: SourceCheck): RenderConfig {
     cleaner: CLEANER_REVISION,
     promo: promoBlockHash(sdir),
     panels: check.panelHash ?? "",
+    ...(animation ? { animation } : {}),
+    ...(music ? { music } : {}),
   };
 }
 
@@ -1001,6 +1013,9 @@ export function renderKeyFor(
     cleaner: config.cleaner,
     promo: config.promo,
     panels: config.panels,
+    // Only hashed when set, so keys of series without them stay byte-identical.
+    ...(config.animation ? { animation: config.animation } : {}),
+    ...(config.music ? { music: config.music } : {}),
   });
 }
 
@@ -1162,6 +1177,23 @@ function validateHindiAnswer(
   return validateTranslation(parsed, units, { allowLatin });
 }
 
+/** Header the English story writer puts on movie-mode scripts. */
+const MOVIE_SCRIPT_HEADER = "# STORY_UNITS v1";
+
+/** True when the English source is one chapter of a continuous movie narration. */
+export function isMovieScript(scriptText: string | undefined | null): boolean {
+  return String(scriptText ?? "").trimStart().startsWith(MOVIE_SCRIPT_HEADER);
+}
+
+/**
+ * Movie-mode rule for the translation prompt. The units are translated 1:1, so
+ * continuity is inherited from the English; this keeps the model from adding
+ * the per-chapter framing an episode-style dub would have.
+ */
+export const MOVIE_CONTINUITY_RULE = `MOVIE MODE - this chapter is one part of a single continuous movie narration:
+- Its first unit continues directly from the previous chapter's last line. Do NOT add an opening, greeting, welcome back, re-introduction of characters, "previously"/"पिछले चैप्टर में" recap, or a closing hook / "next time" teaser.
+- Translate only what each unit says; no chapter titles or episode framing.`;
+
 export interface TranslateChapterOptions {
   previousChapterEnding?: string;
 }
@@ -1260,10 +1292,11 @@ export async function translateChapter(
   const continuityBlock = ending
     ? `PREVIOUS CHAPTER ENDING (Hindi; for continuity of names, terms and tone only. Do not translate, repeat or continue it):\n${ending}\n\n`
     : "";
+  const movieBlock = isMovieScript(check.scriptText) ? `${MOVIE_CONTINUITY_RULE}\n\n` : "";
   const prompt = TRANSLATE_PROMPT
     .replace("{context}", groundingContext(check))
     .replace("{glossary}", JSON.stringify(glossary, null, 1))
-    .replace("ENGLISH UNITS (JSON):", () => `${continuityBlock}ENGLISH UNITS (JSON):`)
+    .replace("ENGLISH UNITS (JSON):", () => `${movieBlock}${continuityBlock}ENGLISH UNITS (JSON):`)
     .replace("{units}", unitsForPrompt(parsed));
 
   const raw = await llm([{ role: "user", content: prompt }], {

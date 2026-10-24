@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { seriesStyleSchema, ttsStyleSchema, STYLE_CATALOG, resolveSeriesStyle, validationMessage } from '../config/seriesStyle.js';
-import { BACKGROUNDS, MOTIONS } from '../intake/ingest.js';
+import { BACKGROUNDS, MOTIONS, cardAnimationSchema } from '../intake/ingest.js';
 import { atomicWriteJson } from '../intake/intake.js';
 
 const nullableFields = <T extends z.ZodRawShape>(shape: T) => Object.fromEntries(
@@ -14,6 +14,8 @@ export const seriesSettingsPatchSchema = z.object({
   visuals: z.object({
     background: z.enum(BACKGROUNDS).optional(),
     motion: z.enum(MOTIONS).optional(),
+    // Whole-object replace; null resets to the renderer defaults.
+    animation: cardAnimationSchema.nullable().optional(),
   }).strict().optional(),
 }).strict();
 

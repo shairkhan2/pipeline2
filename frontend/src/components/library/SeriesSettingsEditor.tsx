@@ -1,11 +1,17 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, type IntakeCatalog, type SeriesSettings, type SeriesSettingsPatch } from '@/lib/api';
 import { StyleFields, type EditableTtsStyle } from './StyleFields';
+import { CardAnimationFields, compactCardAnimation } from './CardAnimationFields';
 import { Button } from '@/components/ui/button';
 import { ErrorNotice, Notice } from '@/components/ui/notice';
 import { describeError, type ErrorInfo } from '@/lib/errors';
 import { Tooltip } from '@/components/ui/tooltip';
 import { Info } from 'lucide-react';
+
+const VISUAL_LABELS: Record<string, string> = {
+  window: 'Window', cut: 'Cut', duo: 'Duo',
+  starfield: 'Starfield', 'storm-valley': 'Storm Valley', 'mist-pines': 'Mist Pines',
+};
 
 export function SeriesSettingsEditor({ slug, privileged }: { slug: string; privileged: boolean }) {
   const [open, setOpen] = useState(false);
@@ -30,7 +36,10 @@ export function SeriesSettingsEditor({ slug, privileged }: { slug: string; privi
     const patch: SeriesSettingsPatch = {
       style: Object.fromEntries(Object.keys(settings.styleOptions ?? {}).map(key => [key, settings.style[key as keyof typeof settings.style] ?? null])),
       tts: Object.fromEntries(['voice_id', 'speed', 'style', 'language'].map(key => [key, settings.tts[key as keyof typeof settings.tts] ?? null])),
-      visuals: settings.visuals,
+      visuals: (() => {
+        const animation = compactCardAnimation(settings.visuals.animation ?? {});
+        return { ...settings.visuals, animation: Object.keys(animation).length ? animation : null };
+      })(),
     };
     try { setSettings(await api.series.patchSettings(slug, patch)); setNotice('Settings saved.'); }
     catch (err) { setError(describeError(err)); }
@@ -52,10 +61,12 @@ export function SeriesSettingsEditor({ slug, privileged }: { slug: string; privi
           {(['background', 'motion'] as const).map(key => <label key={key} className="text-sm">{key === 'background' ? 'Background' : 'Panel motion'}
             <select disabled={!catalog} className="field mt-1 min-h-11" value={settings.visuals[key] ?? (key === 'background' ? catalog?.defaultBackground : catalog?.defaultMotion) ?? ''} onChange={e => setSettings({ ...settings, visuals: { ...settings.visuals, [key]: e.target.value } })}>
               {settings.visuals[key] && !(key === 'background' ? catalog?.backgrounds : catalog?.motions)?.includes(settings.visuals[key]!) ? <option value={settings.visuals[key]!}>{settings.visuals[key]}</option> : null}
-              {(key === 'background' ? catalog?.backgrounds : catalog?.motions)?.map(value => <option key={value} value={value}>{value}</option>)}
+              {(key === 'background' ? catalog?.backgrounds : catalog?.motions)?.map(value => <option key={value} value={value}>{VISUAL_LABELS[value] ?? value}</option>)}
             </select>
           </label>)}
         </fieldset>
+        <CardAnimationFields className="" idPrefix={`cardAnim-${slug}`} value={settings.visuals.animation ?? {}} disabled={!privileged || busy}
+          onChange={animation => setSettings({ ...settings, visuals: { ...settings.visuals, animation } })} />
         <Button type="submit" disabled={!privileged || busy}>{busy ? 'Saving…' : 'Save settings'}</Button>
       </> : null}
     </form> : null}

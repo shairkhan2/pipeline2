@@ -80,6 +80,7 @@ import {
 } from "../config/languages.js";
 import { stage } from "../telemetry/telemetry.js";
 import { resolveMusicBed } from "./music.js";
+import { normalizeCardAnimation } from "../intake/ingest.js";
 
 export {
   gsk,
@@ -1220,6 +1221,8 @@ export async function main(
   const visuals = pyGet(fullMeta, "visuals", {});
   const background = String(pyGet(visuals, "background", pyGet(fullMeta, "background", "starfield")));
   const motion = String(pyGet(visuals, "motion", pyGet(fullMeta, "motion", "window")));
+  // Card animation (window motion). Invalid or empty -> omitted -> renderer defaults.
+  const animation = normalizeCardAnimation(pyGet(visuals, "animation", null));
   let extCfg: ExternalTtsConfig | undefined;
   if (engine === "eleven" && !voiceId) {
     throw new SystemExit("meta.json says engine=eleven but voice_id is empty - shair sets the voice");
@@ -1578,6 +1581,7 @@ export async function main(
     volume: 1,
     background,
     motion,
+    ...(animation ? { animation } : {}),
     quality,
     ...(musicProp ? { music: musicProp } : {}),
   };
