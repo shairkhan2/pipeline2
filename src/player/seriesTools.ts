@@ -466,12 +466,16 @@ export async function resolveOutroTts(tts: Json, overrides: { provider?: string;
   if (voice) {
     // A voice-only override resolves against the persisted external provider so a
     // foreign voice id cannot slip through; an unknown provider keeps the old merge.
-    const persistedProvider = tts.engine === 'external' || tts.engine === 'vertex' || tts.engine === 'grok'
+    const persistedProvider = tts.engine === 'external' || tts.engine === 'vertex' || tts.engine === 'grok' || tts.engine === 'elevenlabs'
       ? String(tts.provider || '').trim()
       : '';
     if (persistedProvider) {
       try {
         const selection = await resolveTtsSelection(persistedProvider, voice, undefined, undefined, false);
+        // ElevenLabs keeps the series model when only the voice changes.
+        if (tts.engine === 'elevenlabs' && tts.model_id) {
+          return { ...selection.metaTts, model_id: tts.model_id, voice_id: selection.voiceId };
+        }
         return { ...selection.metaTts, voice_id: selection.voiceId };
       } catch {
         // Fall through to the stored block with the requested voice.
@@ -529,6 +533,27 @@ async function synthesizeOutroAudio(
           synthesizeGrokTtsToFile({
             text,
             voiceId,
+            destPath: output,
+            speed: Number(tts.speed ?? 1) || 1,
+            signal,
+          }),
+        remMs(),
+        'Outro narration timed out; generated a silent panel showcase',
+      );
+    } catch (err) {
+      throw new IntakeError(`Outro narration failed: ${(err as Error).message}`, 422);
+    }
+  } else if (tts.engine === 'elevenlabs') {
+    const { synthesizeElevenLabsToFile, ELEVENLABS_DEFAULT_MODEL } = await import('../llm/elevenlabsTts.js');
+    const voiceId = String(tts.voice_id || '').trim();
+    if (!voiceId) throw new IntakeError('Outro narration voice is empty', 422);
+    try {
+      await withBoundedTimeout(
+        (signal) =>
+          synthesizeElevenLabsToFile({
+            text,
+            voiceId,
+            modelId: String(tts.model_id || ELEVENLABS_DEFAULT_MODEL),
             destPath: output,
             speed: Number(tts.speed ?? 1) || 1,
             signal,

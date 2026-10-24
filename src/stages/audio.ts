@@ -47,6 +47,13 @@ import {
   synthesizeVertexTtsToFile,
 } from "../llm/vertexTts.js";
 import { findGrokTtsVoice, synthesizeGrokTtsToFile } from "../llm/grokTts.js";
+import {
+  ELEVENLABS_DEFAULT_MODEL,
+  ElevenLabsPoolExhaustedError,
+  elevenLabsModelSupportsTags,
+  isValidElevenLabsVoiceId,
+  synthesizeElevenLabsToFile,
+} from "../llm/elevenlabsTts.js";
 
 export type { ExternalTtsConfig };
 
@@ -1015,11 +1022,19 @@ async function synthesizeLineWithRetry(
   let invalidFailures = 0;
   for (let attempt = 0; ; attempt++) {
     let providerError: unknown;
+    let permanentError: unknown;
     if (existsSync(tmpOut)) unlinkSync(tmpOut);
     stageCurrent("audio", "running", { completed: i, total, unit: "lines", note: "Synthesizing narration" });
     try {
       try { await synthesize(); }
       catch (e) {
+        // The provider already waited (e.g. the ElevenLabs key pool): keep the
+        // error's class and permanent flag so failClass() never requeues it.
+        if (e instanceof ElevenLabsPoolExhaustedError
+          || (e !== null && typeof e === "object" && (e as { permanent?: unknown }).permanent === true)) {
+          permanentError = e;
+          throw e;
+        }
         providerError = e;
         throw new RuntimeError(`${engine} tts line ${i} failed: ${(e as Error).message || String(e)}`);
       }
@@ -1030,6 +1045,7 @@ async function synthesizeLineWithRetry(
       return duration;
     } catch (error) {
       if (existsSync(tmpOut)) unlinkSync(tmpOut);
+      if (permanentError !== undefined) throw permanentError;
       const text = `${(providerError as Error | undefined)?.name ?? ""}: ${String(error)}`;
       const status = httpStatusOf(text);
       if (status !== null && !retryableHttpStatus(status)) throw error;
@@ -1216,6 +1232,109 @@ export async function ttsLinesGrok(
 }
 
 /**
+ * ElevenLabs direct API with the user's key pool, one file per line. Key
+ * rotation happens inside synthesizeElevenLabsToFile. The per-line proof holds
+ * the model but never the key, so a key switch mid-chapter does not re-bill
+ * finished lines. Each new line is silence-trimmed before its cache commit.
+ */
+export async function ttsLinesElevenlabs(
+  lines: ReadonlyArray<readonly [string, unknown]>,
+  tmpdirPath: string,
+  meta: unknown,
+  env?: NodeJS.ProcessEnv,
+): Promise<Array<[number, number]>> {
+  const m = meta !== null && typeof meta === "object" && !Array.isArray(meta)
+    ? meta as Record<string, unknown>
+    : {};
+  const voiceId = typeof m.voice_id === "string" ? m.voice_id.trim() : "";
+  if (!voiceId) {
+    throw new ValueError("meta.json says engine=elevenlabs but voice_id is empty - shair sets the voice");
+  }
+  if (!isValidElevenLabsVoiceId(voiceId)) {
+    throw new ValueError(`Voice '${voiceId}' is not an ElevenLabs voice id`);
+  }
+  const modelId = elevenLabsModelOf(m);
+  const rawSpeed = m.speed !== undefined && m.speed !== null ? m.speed : 1;
+  const requestedSpeed = Number(rawSpeed);
+  if (!Number.isFinite(requestedSpeed) || requestedSpeed <= 0) {
+    throw new ValueError(`tts.speed must be > 0, got ${pyRepr(rawSpeed)}`);
+  }
+  // ElevenLabs accepts 0.7-1.2. The proof records the clamped value, so two
+  // requests that clamp alike share one cached take instead of re-billing.
+  const speed = Math.min(1.2, Math.max(0.7, requestedSpeed));
+  if (speed !== requestedSpeed) {
+    console.log(`   audio: elevenlabs speed ${requestedSpeed} clamped to ${speed} (allowed 0.7-1.2)`);
+  }
+  const keepTags = elevenLabsModelSupportsTags(modelId);
+  const runEnv = env ?? process.env;
+  const onPoolWait = (info: { untilMs: number; reasons: Array<{ hint: string; reason: string }> }): void => {
+    stageCurrent("audio", "retrying", {
+      note: "ElevenLabs: every key is used up; waiting for a key",
+      retryAt: info.untilMs / 1000,
+      attempt: 1,
+      maxAttempts: 1,
+    });
+    console.log(
+      `   audio: elevenlabs key pool empty, waiting until ${new Date(info.untilMs).toISOString()}: `
+      + info.reasons.map((r) => r.reason).join("; "),
+    );
+  };
+  mkdirSync(tmpdirPath, { recursive: true });
+  const spans: Array<[number, number]> = [];
+  let t = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = String(lines[i]![0]);
+    const text = keepTags ? raw : stripEmotionControls(raw);
+    const proof = pyJsonDumps(
+      {
+        text: raw,
+        tts: { engine: "elevenlabs", voice: voiceId, model: modelId, speed: pyFloat(pyRound(speed, 4)) },
+      },
+      { sortKeys: true },
+    );
+    const [f, side] = _lineFile(tmpdirPath, i, raw, proof);
+    let d = existsSync(f) ? _probeDuration(f) : 0;
+    if (d <= 0) {
+      if (existsSync(f)) unlinkSync(f);
+      if (existsSync(side)) unlinkSync(side);
+      const tmpOut = join(tmpdirPath, `.line_${String(i).padStart(3, "0")}.${process.pid}.tmp.mp3`);
+      if (existsSync(tmpOut)) unlinkSync(tmpOut);
+      // Trim inside the attempt: the retry wrapper then probes the trimmed take,
+      // so the span is the post-trim duration and a broken trim never commits.
+      d = await synthesizeLineWithRetry("elevenlabs", i, lines.length, tmpOut, runEnv, async () => {
+        await synthesizeElevenLabsToFile({
+          text,
+          voiceId,
+          modelId,
+          destPath: tmpOut,
+          speed,
+          env: runEnv,
+          onPoolWait,
+        });
+        _trimSilence(tmpOut, runEnv);
+      });
+      renameSync(tmpOut, f);
+      writeFileSync(side, proof, "utf8");
+    }
+    spans.push([t, t + d]);
+    t += d;
+    stageCurrent("audio", "running", { completed: i + 1, total: lines.length, unit: "lines" });
+  }
+  return spans;
+}
+
+/** Series model id for engine=elevenlabs (`meta.tts.model_id`), or the default. */
+export function elevenLabsModelOf(meta: unknown): string {
+  const m = meta !== null && typeof meta === "object" && !Array.isArray(meta)
+    ? meta as Record<string, unknown>
+    : {};
+  const raw = typeof m.model_id === "string" ? m.model_id.trim() : "";
+  if (!raw) return ELEVENLABS_DEFAULT_MODEL;
+  if (!/^[a-z0-9_]{2,64}$/.test(raw)) throw new ValueError(`tts.model_id is invalid: ${pyRepr(raw)}`);
+  return raw;
+}
+
+/**
  * edge-tts, one file per line. Returns [spans, concatListPath, totalSeconds].
  *
  * With `locale` set this is a language-version render: inline delivery controls
@@ -1284,6 +1403,7 @@ export {
   ttsLinesExternal as tts_lines_external,
   ttsLinesVertex as tts_lines_vertex,
   ttsLinesGrok as tts_lines_grok,
+  ttsLinesElevenlabs as tts_lines_elevenlabs,
   ttsLines as tts_lines,
   ttsConcat as tts_concat,
 };

@@ -455,15 +455,19 @@ export async function handleIntakeRoute(
     }
     const csrfCheck = verifyCsrf(req, session);
     if (!csrfCheck.ok) return sendJson(res, 403, { error: csrfCheck.error });
-    const allowedKeys = new Set(['provider', 'voice']);
+    const allowedKeys = new Set(['provider', 'voice', 'model']);
     for (const key of Object.keys(body)) {
       if (!allowedKeys.has(key)) return sendJson(res, 400, { error: `Unsupported preview field: ${key}` });
     }
     const provider = typeof body.provider === 'string' ? body.provider.trim() : '';
     const voice = typeof body.voice === 'string' ? body.voice.trim() : '';
     if (!provider || !voice) return sendJson(res, 400, { error: 'provider and voice are required' });
+    const model = typeof body.model === 'string' ? body.model.trim() : '';
+    if (body.model != null && (typeof body.model !== 'string' || (model && !/^[a-z0-9_]{2,64}$/.test(model)))) {
+      return sendJson(res, 400, { error: 'Invalid preview model' });
+    }
     try {
-      const result = await generatePreview(provider, voice);
+      const result = await generatePreview(provider, voice, undefined, model ? { model } : {});
       return sendJson(res, 200, {
         id: result.id,
         duration: result.duration,

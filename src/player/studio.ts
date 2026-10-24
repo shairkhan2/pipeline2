@@ -76,6 +76,7 @@ import {
   testNodeConnection,
 } from "../workers/nodeRegistry.js";
 import { readJsonBody, verifyCsrf, type LaneSession, type SendJson } from "./lanes.js";
+import { ELEVENLABS_ROUTE_PREFIX, handleElevenLabsRoute } from "./elevenlabsRoutes.js";
 import { controlRenderLane, reconcileJobs } from "../intake/intake.js";
 import { assertNoSymlinks, getStorageSummary, listTmpTrash, moveToTmpTrash, purgeTmpTrash, restoreFromTmpTrash, type TrashKind } from "./storageTrash.js";
 import { deleteChapterVideo, validateChapter, validateSlug } from "./libraryDelete.js";
@@ -825,6 +826,9 @@ export async function handleStudioRoute(
   }
 
   try {
+    if (pathname.startsWith(ELEVENLABS_ROUTE_PREFIX)) {
+      return await handleElevenLabsRoute(req, res, pathname, _u, body, sendJson);
+    }
     if (pathname === "/api/studio/prompts") {
       if (isRead) return sendJson(res, 200, getPromptsConfig(outDir));
       if (method !== "PUT" && method !== "POST") return sendJson(res, 405, { error: "method not allowed" });

@@ -7,6 +7,8 @@ import { ErrorNotice, Notice } from '@/components/ui/notice';
 import { describeError, type ErrorInfo } from '@/lib/errors';
 import { Tooltip } from '@/components/ui/tooltip';
 import { Info } from 'lucide-react';
+import { ElevenLabsVoiceCheck } from './ElevenLabsVoiceCheck';
+import { parseSynthModels } from '@/lib/tts';
 
 const VISUAL_LABELS: Record<string, string> = {
   window: 'Window', cut: 'Cut', duo: 'Duo',
@@ -30,12 +32,16 @@ export function SeriesSettingsEditor({ slug, privileged }: { slug: string; privi
     }).catch(err => { if (active) setError(describeError(err)); });
     return () => { active = false; };
   }, [slug, open]);
+  const isEleven = settings?.ttsEngine === 'elevenlabs';
+  const elevenEntry = catalog?.providers?.find(p => p && (p.id === 'elevenlabs' || p.engine === 'elevenlabs'));
+  const synthModels = parseSynthModels(elevenEntry?.models);
+  const defaultModel = typeof elevenEntry?.defaultModel === 'string' ? elevenEntry.defaultModel : '';
   async function save(event: FormEvent) {
     event.preventDefault(); if (!settings) return;
     setBusy(true); setError(null); setNotice('');
     const patch: SeriesSettingsPatch = {
       style: Object.fromEntries(Object.keys(settings.styleOptions ?? {}).map(key => [key, settings.style[key as keyof typeof settings.style] ?? null])),
-      tts: Object.fromEntries(['voice_id', 'speed', 'style', 'language'].map(key => [key, settings.tts[key as keyof typeof settings.tts] ?? null])),
+      tts: Object.fromEntries(['voice_id', 'speed', 'style', 'language', ...(isEleven ? ['model_id'] : [])].map(key => [key, settings.tts[key as keyof typeof settings.tts] ?? null])),
       visuals: (() => {
         const animation = compactCardAnimation(settings.visuals.animation ?? {});
         return { ...settings.visuals, animation: Object.keys(animation).length ? animation : null };
@@ -55,9 +61,20 @@ export function SeriesSettingsEditor({ slug, privileged }: { slug: string; privi
       {settings ? <>
         <StyleFields catalog={catalog} style={settings.style} tts={settings.tts} onStyle={style => setSettings({ ...settings, style })} onTts={tts => setSettings({ ...settings, tts })} disabled={!privileged || busy} />
         <fieldset disabled={!privileged || busy} className="grid gap-4 sm:grid-cols-3">
-          <label className="text-sm">Voice ID
-            <input className="field mt-1 min-h-11" value={settings.tts.voice_id ?? ''} placeholder="Default" onChange={e => setSettings({ ...settings, tts: { ...settings.tts, voice_id: e.target.value || undefined } })} />
-          </label>
+          <div className="text-sm">
+            <label className="block">Voice ID
+              <input className={`field mt-1 min-h-11${isEleven ? ' font-mono' : ''}`} value={settings.tts.voice_id ?? ''} placeholder="Default" spellCheck={isEleven ? false : undefined}
+                onChange={e => setSettings({ ...settings, tts: { ...settings.tts, voice_id: e.target.value || undefined } })} />
+            </label>
+            {isEleven ? <ElevenLabsVoiceCheck className="mt-2" voiceId={settings.tts.voice_id ?? ''} disabled={busy} /> : null}
+          </div>
+          {isEleven ? <label className="text-sm">ElevenLabs model
+            <select className="field mt-1 min-h-11" value={settings.tts.model_id ?? ''} onChange={e => setSettings({ ...settings, tts: { ...settings.tts, model_id: e.target.value || undefined } })}>
+              <option value="">Default{defaultModel ? ` (${synthModels.find(m => m.id === defaultModel)?.label ?? defaultModel})` : ''}</option>
+              {settings.tts.model_id && !synthModels.some(m => m.id === settings.tts.model_id) ? <option value={settings.tts.model_id}>{settings.tts.model_id}</option> : null}
+              {synthModels.map(m => <option key={m.id} value={m.id}>{m.label}{m.tags ? ' · audio tags' : ''}</option>)}
+            </select>
+          </label> : null}
           {(['background', 'motion'] as const).map(key => <label key={key} className="text-sm">{key === 'background' ? 'Background' : 'Panel motion'}
             <select disabled={!catalog} className="field mt-1 min-h-11" value={settings.visuals[key] ?? (key === 'background' ? catalog?.defaultBackground : catalog?.defaultMotion) ?? ''} onChange={e => setSettings({ ...settings, visuals: { ...settings.visuals, [key]: e.target.value } })}>
               {settings.visuals[key] && !(key === 'background' ? catalog?.backgrounds : catalog?.motions)?.includes(settings.visuals[key]!) ? <option value={settings.visuals[key]!}>{settings.visuals[key]}</option> : null}

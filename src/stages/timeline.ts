@@ -46,6 +46,8 @@ import {
   ttsLinesExternal,
   ttsLinesVertex,
   ttsLinesGrok,
+  ttsLinesElevenlabs,
+  elevenLabsModelOf,
   edgeRateFromSpeed,
   LOCALE_EDGE_RATE,
   stripEmotionControls,
@@ -108,6 +110,7 @@ export {
   ttsLinesExternal,
   ttsLinesVertex,
   ttsLinesGrok,
+  ttsLinesElevenlabs,
   ttsLines,
   ttsConcat,
   edgeRateFromSpeed as edge_rate_from_speed,
@@ -1200,13 +1203,13 @@ export async function main(
   const engineRaw = pyGet(meta, "engine", "edge");
   if (
     engineRaw !== "edge" && engineRaw !== "eleven" && engineRaw !== "external"
-    && engineRaw !== "vertex" && engineRaw !== "grok"
+    && engineRaw !== "vertex" && engineRaw !== "grok" && engineRaw !== "elevenlabs"
   ) {
     throw new SystemExit(
-      `meta.json has unknown tts.engine=${pyRepr(engineRaw)} (expected edge, eleven, external, vertex, or grok)`,
+      `meta.json has unknown tts.engine=${pyRepr(engineRaw)} (expected edge, eleven, elevenlabs, external, vertex, or grok)`,
     );
   }
-  const engine = engineRaw as "edge" | "eleven" | "external" | "vertex" | "grok";
+  const engine = engineRaw as "edge" | "eleven" | "elevenlabs" | "external" | "vertex" | "grok";
   // English keeps the original pass-through; a locale run requires a usable voice.
   const voiceId = (locale === null
     ? meta.voice_id
@@ -1224,8 +1227,17 @@ export async function main(
   // Card animation (window motion). Invalid or empty -> omitted -> renderer defaults.
   const animation = normalizeCardAnimation(pyGet(visuals, "animation", null));
   let extCfg: ExternalTtsConfig | undefined;
-  if (engine === "eleven" && !voiceId) {
-    throw new SystemExit("meta.json says engine=eleven but voice_id is empty - shair sets the voice");
+  if ((engine === "eleven" || engine === "elevenlabs") && !voiceId) {
+    throw new SystemExit(`meta.json says engine=${engine} but voice_id is empty - shair sets the voice`);
+  }
+  let elevenModel: string | undefined;
+  if (engine === "elevenlabs") {
+    try {
+      elevenModel = elevenLabsModelOf(meta);
+    } catch (e) {
+      if (e instanceof ValueError) throw new SystemExit(e.message);
+      throw e;
+    }
   }
   if (engine === "external") {
     try {
@@ -1235,13 +1247,13 @@ export async function main(
       throw e;
     }
   }
-  if (engine === "eleven") {
+  if (engine === "eleven" || engine === "elevenlabs") {
     const cand = scriptPath.replaceAll("script.md", "script_eleven.md");
     if (existsSync(cand)) {
       scriptPath = cand;
     } else if (locale === null) {
       throw new SystemExit(
-        `engine=eleven but ${cand} missing - run the writer first (python run.py <series> ${ch})`,
+        `engine=${engine} but ${cand} missing - run the writer first (python run.py <series> ${ch})`,
       );
     }
     // Locale run: the localize stage writes script.md only, so fall back to it.
@@ -1269,7 +1281,7 @@ export async function main(
   } catch {
     opensWithHook = false;
   }
-  if (engine === "eleven" || engine === "external") {
+  if (engine === "eleven" || engine === "elevenlabs" || engine === "external") {
     const joined = lines.map((x) => x[0]).join(" ");
     const tags = [...joined.matchAll(/\[[a-z ]+\]/g)].map((m) => m[0]);
     const uniq = [...new Set(tags)].sort();
@@ -1286,7 +1298,11 @@ export async function main(
   mkdirSync(outDir, { recursive: true });
   const mp3 = join(outDir, "narration.mp3");
   const tmpdir = join(outDir, "tts_lines_" + engine);
-  const baseKey = _narrationCacheKey(lines, engine, voiceId, extCfg, ttsSpeed);
+  // elevenlabs folds the model into the voice slot of the key: a model change
+  // re-renders, a key-pool change does not.
+  const baseKey = _narrationCacheKey(
+    lines, engine, elevenModel === undefined ? voiceId : `${voiceId}|model=${elevenModel}`, extCfg, ttsSpeed,
+  );
   // English keeps the golden key formula verbatim. A locale run wraps it in a
   // versioned locale fingerprint, so Hindi audio can never satisfy an English
   // narration.key (or vice versa) and a voice/provider change re-bills.
@@ -1298,7 +1314,8 @@ export async function main(
   let spans: Array<[number, number]> = [];
   for (let attempt = 0; attempt < 2; attempt++) {
     if (existsSync(mp3) && existsSync(stamp) && pyStripLine(readFileSync(stamp, "utf8")) === key
-      && ((engine !== "external" && engine !== "vertex" && engine !== "grok") || _probeDuration(mp3) > 0)) {
+      && ((engine !== "external" && engine !== "vertex" && engine !== "grok" && engine !== "elevenlabs")
+        || _probeDuration(mp3) > 0)) {
       const durs = _readTtsDurs(join(outDir, "tts_durs.json"), lines.length);
       if (durs) {
         spans = [];
@@ -1324,6 +1341,9 @@ export async function main(
       lst = writeIndexConcat(tmpdir, lines.length);
     } else if (engine === "grok") {
       spans = await ttsLinesGrok(lines, tmpdir, meta, options.env);
+      lst = writeIndexConcat(tmpdir, lines.length);
+    } else if (engine === "elevenlabs") {
+      spans = await ttsLinesElevenlabs(lines, tmpdir, meta, options.env);
       lst = writeIndexConcat(tmpdir, lines.length);
     } else {
       // Series-selected Edge voice and speed must actually reach edge-tts.
@@ -1377,7 +1397,8 @@ export async function main(
       }
     }
     ttsConcat(lst, mp3);
-    if ((engine === "external" || engine === "vertex" || engine === "grok") && _probeDuration(mp3) <= 0) {
+    if ((engine === "external" || engine === "vertex" || engine === "grok" || engine === "elevenlabs")
+      && _probeDuration(mp3) <= 0) {
       if (existsSync(mp3)) unlinkSyncSafe(mp3);
       throw new RuntimeError(`${engine} tts concat produced invalid narration.mp3 (ffprobe duration<=0)`);
     }

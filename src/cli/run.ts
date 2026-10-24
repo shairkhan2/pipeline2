@@ -941,21 +941,23 @@ export async function _runLocked(
         const engine = String(meta.engine || "edge");
         if (
           engine !== "edge" && engine !== "eleven" && engine !== "external"
-          && engine !== "vertex" && engine !== "grok"
+          && engine !== "vertex" && engine !== "grok" && engine !== "elevenlabs"
         ) {
           throw new RuntimeError(
-            `unknown tts.engine=${pyRepr(engine)} in meta.json (expected edge, eleven, external, vertex, or grok)`,
+            `unknown tts.engine=${pyRepr(engine)} in meta.json (expected edge, eleven, elevenlabs, external, vertex, or grok)`,
           );
         }
         if (
-          (engine === "eleven" || engine === "external" || engine === "vertex" || engine === "grok") &&
+          (engine === "eleven" || engine === "elevenlabs" || engine === "external" || engine === "vertex"
+            || engine === "grok") &&
           !pyStrip(String(meta.voice_id || ""))
         ) {
           throw new RuntimeError(
             `meta.json says engine=${engine} but voice_id is empty - shair sets the voice`,
           );
         }
-        const eleven = engine === "eleven";
+        // The direct-API engine writes the same tagged script as legacy GSK eleven.
+        const eleven = engine === "eleven" || engine === "elevenlabs";
         const external = engine === "external";
         const emotionSetting = seriesStyle?.emotionTags ?? process.env.EMOTION_TAGS ?? 'auto';
         const expressive = emotionSetting === 'auto' ? eleven || external : emotionSetting === 'on';

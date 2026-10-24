@@ -173,7 +173,45 @@ export interface JobsList {
 
 export type SeriesStyle = Partial<Record<'writerMode' | 'storyShape' | 'matchMode' | 'emotionTags' | 'pacing', string>>;
 export type StyleOptions = Record<keyof SeriesStyle, Array<{ value: string; label: string; description: string }>>;
-export interface TtsStyle { voice_id?: string; speed?: number; style?: string; language?: string }
+export interface TtsStyle { voice_id?: string; model_id?: string; speed?: number; style?: string; language?: string }
+
+export type ElevenLabsKeyStatus = "ok" | "exhausted" | "invalid" | "cooldown" | "disabled";
+export interface ElevenLabsKeySummary {
+  id: string;
+  label: string;
+  hint: string;
+  enabled: boolean;
+  tier?: string;
+  characterCount?: number;
+  characterLimit?: number;
+  /** Unix seconds. */
+  resetAt?: number;
+  checkedAt?: string;
+  canExtend?: boolean;
+  allowOverage: boolean;
+  status: ElevenLabsKeyStatus;
+  /** Epoch milliseconds. */
+  statusUntil?: number;
+  statusReason?: string;
+  blockedVoices: string[];
+}
+export interface ElevenLabsModel { id: string; label: string; tags: boolean; costMultiplier?: number }
+export interface ElevenLabsKeysState {
+  keys: ElevenLabsKeySummary[];
+  models?: ElevenLabsModel[];
+  defaultModel?: string;
+  defaultVoice?: string;
+}
+export interface ElevenLabsVoiceCheck {
+  voiceId: string;
+  found: boolean;
+  name?: string;
+  category?: string;
+  library: boolean;
+  needsPaidKey: boolean;
+  paidKeyAvailable: boolean;
+  note?: string;
+}
 /** Window-motion card animation (series meta visuals.animation). Absent fields use the renderer defaults. */
 export interface CardAnimation {
   entry?: 'none' | 'fade' | 'zoom' | 'slide-up' | 'slide-left';
@@ -188,10 +226,12 @@ export interface SeriesSettings {
   tts: TtsStyle & { engine?: string };
   visuals: { background?: string; motion?: string; animation?: CardAnimation };
   styleOptions: StyleOptions;
+  /** Read-only, from meta.tts.engine. */
+  ttsEngine?: string | null;
 }
 export interface SeriesSettingsPatch {
   style?: Partial<Record<keyof SeriesStyle, string | null>>;
-  tts?: { voice_id?: string | null; speed?: number | null; style?: string | null; language?: string | null };
+  tts?: { voice_id?: string | null; model_id?: string | null; speed?: number | null; style?: string | null; language?: string | null };
   visuals?: { background?: string; motion?: string; animation?: CardAnimation | null };
 }
 
@@ -1166,12 +1206,12 @@ export const api = {
         (res) => ({ ...res, job: parseIntakeJob(res?.job ?? res) }),
       );
     },
-    /** Voice preview. CSRF travels in the header only — the body allow-list is `provider` and `voice`. */
-    preview(provider: string, voice: string, signal?: AbortSignal): Promise<PreviewResult> {
+    /** Voice preview. CSRF travels in the header only — the body allow-list is `provider`, `voice` and `model`. */
+    preview(provider: string, voice: string, signal?: AbortSignal, model?: string): Promise<PreviewResult> {
       return request<PreviewResult>("/api/intake/preview", {
         method: "POST",
         csrf: "header",
-        body: { provider, voice },
+        body: model ? { provider, voice, model } : { provider, voice },
         signal,
         timeoutMs: 60000,
       });
@@ -1676,6 +1716,36 @@ export const api = {
     },
     audit(): Promise<{ entries: AuditEntry[] }> {
       return request("/api/studio/audit");
+    },
+    elevenlabs: {
+      keys(signal?: AbortSignal): Promise<ElevenLabsKeysState> {
+        return request<ElevenLabsKeysState>("/api/studio/elevenlabs/keys", { signal, timeoutMs: 20000 });
+      },
+      addKey(input: { key: string; label?: string }): Promise<{ key: ElevenLabsKeySummary }> {
+        return request("/api/studio/elevenlabs/keys", { method: "POST", body: input, timeoutMs: 45000 });
+      },
+      updateKey(id: string, patch: { label?: string; enabled?: boolean; allowOverage?: boolean }): Promise<{ key: ElevenLabsKeySummary }> {
+        return request(`/api/studio/elevenlabs/keys/${enc(id)}`, { method: "PATCH", body: patch });
+      },
+      removeKey(id: string): Promise<{ ok: boolean }> {
+        return request(`/api/studio/elevenlabs/keys/${enc(id)}`, { method: "DELETE", body: {} });
+      },
+      refreshKey(id: string): Promise<{ key: ElevenLabsKeySummary }> {
+        return request(`/api/studio/elevenlabs/keys/${enc(id)}/refresh`, { method: "POST", body: {}, timeoutMs: 45000 });
+      },
+      reorder(ids: string[]): Promise<{ keys: ElevenLabsKeySummary[] }> {
+        return request("/api/studio/elevenlabs/keys/order", { method: "PUT", body: { ids } });
+      },
+      voices(): Promise<{ voices: Array<{ voiceId: string; name: string; category?: string }> }> {
+        return request("/api/studio/elevenlabs/voices", { timeoutMs: 30000 });
+      },
+      voiceCheck(voiceId: string, signal?: AbortSignal): Promise<ElevenLabsVoiceCheck> {
+        return request<ElevenLabsVoiceCheck>("/api/studio/elevenlabs/voice-check", {
+          query: { voiceId },
+          signal,
+          timeoutMs: 30000,
+        });
+      },
     },
   },
 

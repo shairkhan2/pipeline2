@@ -29,9 +29,13 @@ import {
   shlexSplit,
   type Env,
 } from "./intake.js";
+import { scrubSecrets } from "../config/secretStore.js";
 import { flockFd, tryFlockFd } from "../locks/seriesLock.js";
 import { findVertexTtsVoice, synthesizeVertexTtsToFile } from "../llm/vertexTts.js";
 import { findGrokTtsVoice, synthesizeGrokTtsToFile } from "../llm/grokTts.js";
+import { ELEVENLABS_DEFAULT_MODEL, synthesizeElevenLabsToFile } from "../llm/elevenlabsTts.js";
+
+const ELEVENLABS_MODEL_ID_RE = /^[a-z0-9_]{2,64}$/;
 
 export const SAMPLE_TEXT =
   "She thought the danger had passed. Then the gate opened again, " +
@@ -171,8 +175,28 @@ async function effectiveConfig(
   voiceId: string,
   env?: Env,
   preflight = false,
+  modelId?: string,
 ): Promise<EffectiveConfig> {
   const sel = await resolveTtsSelection(providerId, voiceId, undefined, env, preflight);
+  if (sel.engine === "elevenlabs") {
+    const model = String(modelId || ELEVENLABS_DEFAULT_MODEL).trim();
+    if (!ELEVENLABS_MODEL_ID_RE.test(model)) throw new PreviewError("Invalid ElevenLabs model id");
+    const effectiveSpeed = finiteSpeed(sel.metaTts?.speed != null ? sel.metaTts.speed : 1);
+    const cfg = {
+      engine: "elevenlabs",
+      provider: "elevenlabs",
+      revision: String((sel.metaTts && sel.metaTts.revision) || "v1"),
+      voice: String(sel.voiceId),
+      model,
+      speed: String(effectiveSpeed),
+    };
+    return {
+      engine: "elevenlabs",
+      voiceId: String(sel.voiceId),
+      metaTts: { ...(sel.metaTts || {}), model_id: model },
+      payload: pyJsonDumps(cfg, { sortKeys: true, separators: [",", ":"], ensureAscii: false }),
+    };
+  }
   if (sel.engine === "edge") {
     if (String(sel.voiceId).toLowerCase() !== EDGE_VOICE.toLowerCase()) {
       throw new IntakeError("Edge previews are only available for the pipeline narration voice");
@@ -608,9 +632,39 @@ async function generateGrok(dest: string, meta: Record<string, unknown>, env?: E
   }
 }
 
+async function generateElevenLabs(dest: string, meta: Record<string, unknown>, env?: Env): Promise<number> {
+  const dir = ensurePreviewDir(env);
+  const tmpdir = fs.mkdtempSync(path.join(dir, ".gen-"));
+  try {
+    const voiceId = String(meta.voice_id ?? "").trim();
+    if (!voiceId) throw new PreviewError("ElevenLabs voice_id is empty");
+    const speed = finiteSpeed(meta.speed != null ? meta.speed : 1);
+    const tmpOut = path.join(tmpdir, "preview.mp3");
+    try {
+      await synthesizeElevenLabsToFile({
+        text: SAMPLE_TEXT,
+        voiceId,
+        modelId: String(meta.model_id || ELEVENLABS_DEFAULT_MODEL),
+        destPath: tmpOut,
+        speed,
+        // A preview fails fast with the pool reasons instead of waiting on an exhausted pool.
+        env: { ...stringifyEnv(resolveEnv(env)), MANHWA_ELEVENLABS_POOL_WAIT_S: "0" },
+        signal: AbortSignal.timeout(GENERATION_TIMEOUT_S * 1000),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new PreviewError(`Voice preview generation failed: ${sanitizeLine(scrubSecrets(message))}`);
+    }
+    return installAudio(tmpOut, dest, env);
+  } finally {
+    fs.rmSync(tmpdir, { recursive: true, force: true });
+  }
+}
+
 async function generate(cacheId: string, eff: EffectiveConfig, env?: Env): Promise<number> {
   const dest = cacheFile(cacheId, env);
   if (eff.engine === "edge") return generateEdge(dest, env);
+  if (eff.engine === "elevenlabs") return generateElevenLabs(dest, eff.metaTts || {}, env);
   if (eff.engine === "vertex") return generateVertex(dest, eff.metaTts || {}, env);
   if (eff.engine === "grok") return generateGrok(dest, eff.metaTts || {}, env);
   return generateExternal(dest, eff.metaTts || {}, env);
@@ -620,13 +674,19 @@ function result(cacheId: string, duration: number, cached: boolean): PreviewResu
   return { id: cacheId, duration: Math.round(Number(duration) * 1000) / 1000, cached: Boolean(cached) };
 }
 
-export async function generatePreview(providerId: string, voiceId: string, env?: Env): Promise<PreviewResult> {
+export async function generatePreview(
+  providerId: string,
+  voiceId: string,
+  env?: Env,
+  opts: { model?: string } = {},
+): Promise<PreviewResult> {
   const e = resolveEnv(env);
   if (typeof providerId !== "string" || !providerId.trim()) throw new IntakeError("TTS provider is required");
   if (typeof voiceId !== "string" || !voiceId.trim()) throw new IntakeError("TTS voice is required");
   const provider = providerId.trim();
   const voice = voiceId.trim();
-  let eff = await effectiveConfig(provider, voice, e, false);
+  const model = typeof opts.model === "string" && opts.model.trim() ? opts.model.trim() : undefined;
+  let eff = await effectiveConfig(provider, voice, e, false, model);
   const id = cacheKey(eff.payload);
   const cached = readCache(id, e);
   if (cached != null) return result(id, cached, true);
@@ -641,7 +701,7 @@ export async function generatePreview(providerId: string, voiceId: string, env?:
         `Voice preview is cooling down for ${remaining.toFixed(0)}s to bound TTS spend; try again shortly`,
       );
     }
-    eff = await effectiveConfig(provider, voice, e, true);
+    eff = await effectiveConfig(provider, voice, e, true, model);
     if (cacheKey(eff.payload) !== id) {
       throw new PreflightError("TTS provider configuration changed during preview; try again");
     }

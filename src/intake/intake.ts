@@ -31,6 +31,16 @@ import {
   readCachedGrokTtsVoices,
 } from "../llm/grokTts.js";
 import {
+  ELEVENLABS_DEFAULT_MODEL,
+  ELEVENLABS_DEFAULT_VOICE,
+  ELEVENLABS_MODELS,
+  ELEVENLABS_PREMADE_VOICES,
+  ElevenLabsKeyError,
+  checkElevenLabsVoice,
+  hasElevenLabsKeys,
+  isValidElevenLabsVoiceId,
+} from "../llm/elevenlabsTts.js";
+import {
   BACKGROUNDS,
   DEFAULT_BACKGROUND,
   DEFAULT_MOTION,
@@ -299,6 +309,24 @@ export const BUILTIN_VERTEX_PROVIDER = {
     default: Boolean(v.default),
   })),
 } as const;
+
+/** ElevenLabs direct API with the Studio key pool. Always listed; available only with a key. */
+export const BUILTIN_ELEVENLABS_PROVIDER = {
+  id: "elevenlabs",
+  label: "ElevenLabs",
+  engine: "elevenlabs",
+  provider: "elevenlabs",
+  revision: "v1",
+  costNotice:
+    "Uses ElevenLabs credits from your key pool. Free-tier keys get 10,000 characters a month and only premade voices.",
+  voices: ELEVENLABS_PREMADE_VOICES.map((v) => ({
+    id: v.id,
+    label: v.label,
+    default: v.id === ELEVENLABS_DEFAULT_VOICE,
+  })),
+} as const;
+
+export const ELEVENLABS_NO_KEYS_REASON = "No ElevenLabs API keys. Add one in Studio > Voice.";
 
 const RESERVED_SLUGS = new Set([
   "out",
@@ -1737,6 +1765,7 @@ export function loadRawTtsProviders(env?: Env): RawTtsProvider[] {
   if (hasGrokTtsCredentials(e as NodeJS.ProcessEnv)) {
     providers.push(grokCatalogProvider(e));
   }
+  providers.push(structuredClone(BUILTIN_ELEVENLABS_PROVIDER) as unknown as RawTtsProvider);
   const resolvedCatalog = resolveExternalCatalogPath(e);
   const catPathStr = resolvedCatalog.explicit ? resolvedCatalog.path : null;
   const catPath = resolvedCatalog.path;
@@ -1753,7 +1782,7 @@ export function loadRawTtsProviders(env?: Env): RawTtsProvider[] {
         const rec = item as Record<string, unknown>;
         const pid = String(rec.id || "").trim().toLowerCase();
         const engine = String(rec.engine || "").trim().toLowerCase();
-        if (!pid || pid === "edge" || pid === "eleven" || pid === "gsk" || engine !== "external") continue;
+        if (!pid || pid === "edge" || pid === "eleven" || pid === "elevenlabs" || pid === "gsk" || engine !== "external") continue;
         const voices: TtsVoice[] = [];
         const voiceList = Array.isArray(rec.voices) ? rec.voices : [];
         for (const v of voiceList) {
@@ -1889,6 +1918,9 @@ export async function preflightTtsProvider(
       ? [true, null]
       : [false, "Grok TTS credentials are not configured (connect grok-subscription in Studio)"];
   }
+  if (engine === "elevenlabs") {
+    return hasElevenLabsKeys(pEnv as NodeJS.ProcessEnv) ? [true, null] : [false, ELEVENLABS_NO_KEYS_REASON];
+  }
   if (engine !== "external") return [false, `Unsupported TTS engine ${pyReprStr(engine)} for provider ${pyReprStr(pid)}`];
   const cmd = commandArgv(providerEntry.command);
   if (cmd.length === 0) return [false, `TTS provider ${pyReprStr(pid)} has an empty adapter command in server catalog`];
@@ -1983,6 +2015,9 @@ export async function getCatalog(repoRoot = REPO_ROOT, env?: Env): Promise<Publi
       available: ok,
       unavailableReason: reason,
       voices: p.voices,
+      ...(p.engine === "elevenlabs"
+        ? { allowCustomVoice: true, models: structuredClone(ELEVENLABS_MODELS), defaultModel: ELEVENLABS_DEFAULT_MODEL }
+        : {}),
     });
   }
   const settings = studioSettingsOrDefaults(env);
@@ -2054,9 +2089,9 @@ export async function resolveTtsSelection(
 ): Promise<TtsSelection> {
   const providers = loadRawTtsProviders(env);
   let reqProv = String(providerId || "edge").trim().toLowerCase() || "edge";
-  if (reqProv === "eleven" || reqProv === "elevenlabs" || reqProv === "gsk") {
+  if (reqProv === "eleven" || reqProv === "gsk") {
     throw new IntakeError(
-      "ElevenLabs / GSK TTS is not available. Select 'edge' (default) or a configured external provider such as 'grok'.",
+      "Legacy ElevenLabs / GSK TTS is not available. Select 'edge' (default), 'elevenlabs', or a configured external provider such as 'grok'.",
     );
   }
   let matched = providers.find((p) => p.id === reqProv) ?? null;
@@ -2074,9 +2109,23 @@ export async function resolveTtsSelection(
   }
   const voices = matched.voices;
   const reqVoice = String(voiceId || "").trim();
-  let chosen = reqVoice
-    ? voices.find((v) => v.id.toLowerCase() === reqVoice.toLowerCase()) ?? null
-    : voices.find((v) => v.default) ?? voices[0]!;
+  let chosen: TtsVoice | null;
+  if (matched.engine === "elevenlabs") {
+    // ElevenLabs voice ids are case-sensitive; any well-formed id is allowed.
+    chosen = !reqVoice
+      ? voices.find((v) => v.default) ?? voices[0]!
+      : voices.find((v) => v.id === reqVoice)
+        ?? (isValidElevenLabsVoiceId(reqVoice) ? { id: reqVoice, label: reqVoice, default: false } : null);
+    if (!chosen) {
+      throw new IntakeError(
+        `Invalid ElevenLabs voice id ${pyReprStr(reqVoice)} (expected 16-40 letters or digits)`,
+      );
+    }
+  } else {
+    chosen = reqVoice
+      ? voices.find((v) => v.id.toLowerCase() === reqVoice.toLowerCase()) ?? null
+      : voices.find((v) => v.default) ?? voices[0]!;
+  }
   if (!chosen) {
     const valid = voices.map((v) => v.id).join(", ");
     throw new IntakeError(
@@ -2092,6 +2141,15 @@ export async function resolveTtsSelection(
       engine: "vertex",
       provider: matched.provider,
       revision: matched.revision,
+      voice_id: chosen.id,
+      language: matched.language || "en",
+      speed: matched.speed ?? 1,
+    };
+  } else if (matched.engine === "elevenlabs") {
+    metaTts = {
+      engine: "elevenlabs",
+      provider: "elevenlabs",
+      revision: "v1",
       voice_id: chosen.id,
       language: matched.language || "en",
       speed: matched.speed ?? 1,
@@ -2973,6 +3031,35 @@ function moveFile(src: string, dest: string): void {
   }
 }
 
+/**
+ * Job-create check for an ElevenLabs voice. Rejects a voice that does not exist or
+ * that only a paid-tier key may use. A network or pool failure only warns.
+ */
+export async function assertElevenLabsVoiceUsable(voiceId: string, env?: Env): Promise<void> {
+  let check: Awaited<ReturnType<typeof checkElevenLabsVoice>>;
+  try {
+    check = await checkElevenLabsVoice(voiceId, env as NodeJS.ProcessEnv | undefined);
+  } catch (err) {
+    if (err instanceof ElevenLabsKeyError && err.code === "not_found") {
+      throw new IntakeError(
+        "No usable ElevenLabs key: every key in Studio > Voice is invalid or disabled. Add a working key, then try again.",
+      );
+    }
+    console.warn(`[intake] ElevenLabs voice check for ${voiceId} skipped: ${sanitizeLine(err)}`);
+    return;
+  }
+  const name = check.name ? `${voiceId} (${check.name})` : voiceId;
+  if (!check.found && !check.library) {
+    throw new IntakeError(`ElevenLabs voice ${pyReprStr(voiceId)} was not found. Check the voice id or pick a premade voice.`);
+  }
+  if (check.needsPaidKey && !check.paidKeyAvailable) {
+    throw new IntakeError(
+      `ElevenLabs voice ${name} is a Voice Library voice: free-tier keys cannot use Voice Library voices over the API; ` +
+        "add a paid-tier key or pick a premade voice.",
+    );
+  }
+}
+
 export async function enqueueJob(opts: EnqueueOptions = {}): Promise<Record<string, unknown>> {
   const parsedStyle = seriesStyleSchema.optional().safeParse(opts.style);
   const parsedTts = ttsStyleSchema.optional().safeParse(opts.tts);
@@ -3006,6 +3093,17 @@ export async function enqueueJob(opts: EnqueueOptions = {}): Promise<Record<stri
   }
   const ttsResolved = await resolveTtsSelection(opts.provider || "edge", opts.voice, repoRoot, env, true);
   Object.assign(ttsResolved.metaTts, parsedTts.data);
+  if (ttsResolved.engine === "elevenlabs") {
+    const voiceId = String(ttsResolved.metaTts.voice_id || "").trim();
+    if (!isValidElevenLabsVoiceId(voiceId)) {
+      throw new IntakeError(`Invalid ElevenLabs voice id ${pyReprStr(voiceId)} (expected 16-40 letters or digits)`);
+    }
+    if (voiceId !== ttsResolved.voiceId) {
+      ttsResolved.voiceId = voiceId;
+      ttsResolved.voiceLabel = ELEVENLABS_PREMADE_VOICES.find((v) => v.id === voiceId)?.label ?? voiceId;
+    }
+    await assertElevenLabsVoiceUsable(voiceId, env);
+  }
   const renderLaneNorm = resolveRequestedRenderLane(opts.renderLane ?? opts.render_lane ?? null, env, repoRoot);
   // The lane is resolved now: an explicit request wins, an omitted one uses the
   // Studio default, and the resulting id is what this job pins. Quality stays
@@ -3208,6 +3306,18 @@ export async function createJob(opts: EnqueueOptions = {}): Promise<Record<strin
   if (!(MOTIONS as readonly string[]).includes(moNorm)) {
     throw new IntakeError(`Unknown motion preset ${pyReprStr(moNorm)} (allowed: ${MOTIONS.join(", ")})`);
   }
+  const metaTts = !requestedProvider && !String(opts.voice ?? "").trim() && persistedTts
+    ? persistedTts
+    : selection.engine === "elevenlabs" && persistedTts?.engine === "elevenlabs" && persistedTts.model_id
+      ? { ...selection.metaTts, model_id: persistedTts.model_id }
+      : selection.metaTts;
+  if (selection.engine === "elevenlabs") {
+    const voiceId = String(metaTts.voice_id || "").trim();
+    if (!isValidElevenLabsVoiceId(voiceId)) {
+      throw new IntakeError(`Invalid ElevenLabs voice id ${pyReprStr(voiceId)} (expected 16-40 letters or digits)`);
+    }
+    await assertElevenLabsVoiceUsable(voiceId, env);
+  }
   const job = withJobMetaLock(env, () => {
     reconcileJobs(env);
     const conflict = activeConflictFor(slug, null, env);
@@ -3226,9 +3336,7 @@ export async function createJob(opts: EnqueueOptions = {}): Promise<Record<strin
       tts: {
         ...selection,
         providerId: selection.providerId,
-        metaTts: !requestedProvider && !String(opts.voice ?? "").trim() && persistedTts
-          ? persistedTts
-          : selection.metaTts,
+        metaTts,
       },
       visuals: { background: bgNorm, motion: moNorm },
       renderLane,

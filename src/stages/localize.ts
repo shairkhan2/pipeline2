@@ -319,6 +319,7 @@ export function parseChapterSelection(spec: unknown, available: readonly string[
 
 const SCRIPT_BY_ENGINE: Record<string, string> = {
   eleven: "script_eleven.md",
+  elevenlabs: "script_eleven.md",
   external: "script_voice.md",
 };
 const PANEL_EXTS = [".jpg", ".png", ".jpeg", ".webp"] as const;

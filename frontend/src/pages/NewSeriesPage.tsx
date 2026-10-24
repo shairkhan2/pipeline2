@@ -11,6 +11,7 @@ import { Activity, Cloud, Info, Link2, Monitor, RefreshCw, Rocket, Server, Uploa
 
 import { AppShell } from "@/components/layout/AppShell";
 import { StyleFields, type EditableTtsStyle } from '@/components/library/StyleFields';
+import { ElevenLabsVoiceCheck } from '@/components/library/ElevenLabsVoiceCheck';
 import { CardAnimationFields, compactCardAnimation } from '@/components/library/CardAnimationFields';
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -51,6 +52,8 @@ import {
 import {
   buildTtsProviders,
   conciseVoiceName,
+  ELEVENLABS_VOICE_ID_RE,
+  isElevenLabsProvider,
   isPaidTtsProvider,
   readPreferredVoice,
   writePreferredVoice,
@@ -411,6 +414,8 @@ function fmtAudioTime(seconds: number): string {
   return `${mins}:${String(secs).padStart(2, "0")}`;
 }
 
+const CUSTOM_VOICE = "__custom_voice__";
+
 function FieldError({ id, message }: { id: string; message?: string }) {
   return (
     <div id={id} hidden={!message} className="mt-2">
@@ -430,10 +435,12 @@ function VoicePreview({
   provider,
   voice,
   privileged,
+  model,
 }: {
   provider: TtsProviderGroup | null;
   voice: TtsVoiceItem | null;
   privileged: boolean;
+  model?: string;
 }) {
   const [src, setSrc] = useState("");
   const [error, setError] = useState<string | ErrorInfo>("");
@@ -463,7 +470,7 @@ function VoicePreview({
     setCurrentTime(0);
     setDuration(0);
     setSpendOk(false);
-  }, [provider?.id, voice?.id]);
+  }, [provider?.id, voice?.id, model]);
 
   useEffect(() => {
     const onHide = () => {
@@ -506,7 +513,7 @@ function VoicePreview({
     setBusy(true);
     setError("");
     try {
-      const preview = await api.intake.preview(provider.id, voice.id, controller.signal);
+      const preview = await api.intake.preview(provider.id, voice.id, controller.signal, model);
       if (token !== gen.current) return;
       setSrc(preview.audioUrl);
       window.setTimeout(() => {
@@ -648,6 +655,9 @@ export default function NewSeriesPage() {
   const [providerId, setProviderId] = useState("");
   const [modelId, setModelId] = useState("");
   const [voiceId, setVoiceId] = useState("");
+  const [customVoice, setCustomVoice] = useState(false);
+  const [customVoiceId, setCustomVoiceId] = useState("");
+  const [synthModel, setSynthModel] = useState("");
   const [style, setStyle] = useState<import('@/lib/api').SeriesStyle>({});
   const [ttsStyle, setTtsStyle] = useState<EditableTtsStyle>({});
   const [background, setBackground] = useState("starfield");
@@ -714,7 +724,26 @@ export default function NewSeriesPage() {
     return provider.models[0] || null;
   }, [provider, modelId, voiceId]);
   const modelVoices = activeModelGroup?.voices || provider?.voices || [];
-  const voice = modelVoices.find((item) => item.id === voiceId) || provider?.voices.find((item) => item.id === voiceId) || modelVoices[0] || provider?.voices[0] || null;
+  const listVoice = modelVoices.find((item) => item.id === voiceId) || provider?.voices.find((item) => item.id === voiceId) || modelVoices[0] || provider?.voices[0] || null;
+  const isEleven = isElevenLabsProvider(provider);
+  const useCustomVoice = Boolean(isEleven && provider?.allowCustomVoice && customVoice);
+  const customVoiceTrim = customVoiceId.trim();
+  const customVoiceValid = ELEVENLABS_VOICE_ID_RE.test(customVoiceTrim);
+  const voice: TtsVoiceItem | null = useCustomVoice
+    ? customVoiceValid
+      ? { id: customVoiceTrim, label: customVoiceTrim, rawLabel: customVoiceTrim, modelId: listVoice?.modelId || "default", modelLabel: listVoice?.modelLabel || "Default", default: false }
+      : null
+    : listVoice;
+  const synthModels = isEleven ? provider?.synthModels || [] : [];
+  const activeSynthModel = synthModels.find((m) => m.id === synthModel) || synthModels.find((m) => m.id === provider?.defaultSynthModel) || synthModels[0] || null;
+  const voiceMissingMessage = useCustomVoice && !customVoiceValid
+    ? "Enter a valid ElevenLabs voice ID: 16 to 40 letters or digits."
+    : "Choose an available narrator before continuing.";
+  const ttsPayload = {
+    ...ttsStyle,
+    speed: ttsStyle.speed ?? undefined,
+    ...(isEleven && activeSynthModel ? { model_id: activeSynthModel.id } : {}),
+  };
   const backgrounds = catalog?.backgrounds?.length ? catalog.backgrounds : ["starfield", "storm-valley", "mist-pines"];
   const motions = catalog?.motions?.length ? catalog.motions : ["window", "cut", "duo"];
   const driveId = parseDriveId(gdriveUrl);
@@ -943,8 +972,8 @@ export default function NewSeriesPage() {
     if (next > step && !validateStory()) return;
     if (next > 1 && (!provider?.available || !voice)) {
       setStep(1);
-      setField("voice", "Choose an available narrator before continuing.");
-      focusField.current = "ttsVoice";
+      setField("voice", provider?.available ? voiceMissingMessage : "Choose an available narrator before continuing.");
+      focusField.current = useCustomVoice ? "ttsCustomVoice" : "ttsVoice";
       return;
     }
     setAlert(null);
@@ -998,7 +1027,7 @@ export default function NewSeriesPage() {
         "voice",
         provider && !provider.available
           ? `${provider.label} unavailable: ${provider.unavailableReason || "connect in Studio"}`
-          : "Choose an available narrator before continuing.",
+          : voiceMissingMessage,
       );
       return;
     }
@@ -1054,7 +1083,7 @@ export default function NewSeriesPage() {
           renderQuality: finalQuality,
           outroConfig,
           style,
-          tts: { ...ttsStyle, speed: ttsStyle.speed ?? undefined },
+          tts: ttsPayload,
         }) as IntakeJob;
         setGdriveUrl("");
       } else {
@@ -1078,7 +1107,7 @@ export default function NewSeriesPage() {
             renderQuality: finalQuality,
             outroConfig,
             style,
-            tts: { ...ttsStyle, speed: ttsStyle.speed ?? undefined },
+            tts: ttsPayload,
           },
           controller.signal,
           (pct, loaded, total) => {
@@ -1602,7 +1631,7 @@ export default function NewSeriesPage() {
               {step === 1 ? (
                 <section aria-labelledby="narrationHeading">
                   <h2 id="narrationHeading" tabIndex={-1} className="sr-only">Voice &amp; style</h2>
-                  <div className={cn("mt-4 grid gap-3", provider?.hasExplicitModels ? "sm:grid-cols-3" : "sm:grid-cols-2")}>
+                  <div className={cn("mt-4 grid gap-3", provider?.hasExplicitModels || synthModels.length ? "sm:grid-cols-3" : "sm:grid-cols-2")}>
                     <label className="text-sm" htmlFor="ttsProvider">
                       Provider
                       <select
@@ -1613,6 +1642,8 @@ export default function NewSeriesPage() {
                           const nextProviderId = event.target.value;
                           providerTouched.current = true;
                           setProviderId(nextProviderId);
+                          setCustomVoice(false);
+                          setSynthModel("");
                           const nextProv = providers.find((item) => item.id === nextProviderId);
                           const nextDefaultVoice = nextProv?.voices.find((v) => v.default) || nextProv?.voices[0];
                           if (nextDefaultVoice) {
@@ -1679,16 +1710,23 @@ export default function NewSeriesPage() {
                       </label>
                     ) : null}
                     <label className="text-sm" htmlFor="ttsVoice">
-                      Narrator voice
+                      <span id="ttsVoiceLabel">Narrator voice</span>
                       <select
                         id="ttsVoice"
+                        aria-labelledby="ttsVoiceLabel"
                         className="field mt-1 min-h-11"
-                        value={voice?.id || ""}
-                        aria-invalid={errors.voice ? true : undefined}
+                        value={useCustomVoice ? CUSTOM_VOICE : listVoice?.id || ""}
+                        aria-invalid={errors.voice && !useCustomVoice ? true : undefined}
                         aria-describedby="voiceError"
                         onChange={(event) => {
                           const nextVoiceId = event.target.value;
                           voiceTouched.current = true;
+                          setField("voice", "");
+                          if (nextVoiceId === CUSTOM_VOICE) {
+                            setCustomVoice(true);
+                            return;
+                          }
+                          setCustomVoice(false);
                           setVoiceId(nextVoiceId);
                           const nextVoice = provider?.voices.find((v) => v.id === nextVoiceId);
                           if (nextVoice && provider) {
@@ -1709,9 +1747,63 @@ export default function NewSeriesPage() {
                         {modelVoices.map((item) => (
                           <option key={item.id} value={item.id}>{item.label}</option>
                         ))}
+                        {isEleven && provider?.allowCustomVoice ? <option value={CUSTOM_VOICE}>Custom voice ID…</option> : null}
                       </select>
                     </label>
+                    {synthModels.length ? (
+                      <label className="text-sm" htmlFor="ttsSynthModel">
+                        Model
+                        <select
+                          id="ttsSynthModel"
+                          className="field mt-1 min-h-11"
+                          value={activeSynthModel?.id || ""}
+                          aria-describedby="ttsSynthModelHint"
+                          onChange={(event) => setSynthModel(event.target.value)}
+                        >
+                          {synthModels.map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.label}{m.tags ? " · audio tags" : ""}{m.id === provider?.defaultSynthModel ? " (default)" : ""}
+                            </option>
+                          ))}
+                        </select>
+                        <span id="ttsSynthModelHint" className="mt-1 block text-xs text-muted-foreground">
+                          {activeSynthModel?.tags ? "Supports audio tags like [whispers]." : "No audio tags. Tags are removed from the script."}
+                        </span>
+                      </label>
+                    ) : null}
                   </div>
+                  {useCustomVoice ? (
+                    <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
+                      <label className="text-sm" htmlFor="ttsCustomVoice">
+                        <span id="ttsCustomVoiceLabel">Custom voice ID</span>
+                        <input
+                          id="ttsCustomVoice"
+                          aria-labelledby="ttsCustomVoiceLabel"
+                          className="field mt-1 min-h-11 font-mono"
+                          value={customVoiceId}
+                          spellCheck={false}
+                          autoComplete="off"
+                          placeholder="e.g. JBFqnCBsd6RMkjVDRZzb"
+                          aria-invalid={customVoiceTrim && !customVoiceValid ? true : undefined}
+                          aria-describedby="ttsCustomVoiceHint voiceError"
+                          onChange={(event) => {
+                            voiceTouched.current = true;
+                            setCustomVoiceId(event.target.value);
+                            setField("voice", "");
+                          }}
+                        />
+                        <span id="ttsCustomVoiceHint" className={cn("mt-1 block text-xs", customVoiceTrim && !customVoiceValid ? "text-destructive" : "text-muted-foreground")}>
+                          {customVoiceTrim && !customVoiceValid ? "Use 16 to 40 letters or digits." : "Paste the voice ID from ElevenLabs."}
+                        </span>
+                      </label>
+                      <ElevenLabsVoiceCheck className="sm:mt-6" voiceId={customVoiceId} disabled={!provider?.available} />
+                    </div>
+                  ) : isEleven && listVoice ? (
+                    <ElevenLabsVoiceCheck className="mt-3" voiceId={listVoice.id} disabled={!provider?.available} />
+                  ) : null}
+                  {isEleven && provider?.costNotice ? (
+                    <p className="mt-3 text-xs text-muted-foreground" role="note">{provider.costNotice}</p>
+                  ) : null}
                   {providers.some((item) => !item.available && item.unavailableReason) ? (
                     <ul className="mt-3 rounded-xl bg-warning-soft px-3 py-2 text-xs text-warning" role="status">
                       {providers
@@ -1719,12 +1811,18 @@ export default function NewSeriesPage() {
                         .map((item) => (
                           <li key={item.id}>
                             <strong>{item.label} unavailable:</strong> {item.unavailableReason}
+                            {isElevenLabsProvider(item) ? (
+                              <>
+                                {" "}
+                                <a className="underline underline-offset-2" href="/studio.html?settings=voice">Open Studio &gt; Voice</a>
+                              </>
+                            ) : null}
                           </li>
                         ))}
                     </ul>
                   ) : null}
                   <FieldError id="voiceError" message={errors.voice} />
-                  <VoicePreview provider={provider} voice={voice} privileged={privileged} />
+                  <VoicePreview provider={provider} voice={voice} privileged={privileged} model={isEleven ? activeSynthModel?.id : undefined} />
                   <StyleFields catalog={catalog} style={style} tts={ttsStyle} onStyle={setStyle} onTts={setTtsStyle} disabled={!privileged} />
                   <div className="mt-5 grid gap-4 sm:grid-cols-2">
                     <div>
@@ -1915,7 +2013,9 @@ export default function NewSeriesPage() {
                       <dt>Narration</dt>
                       <dd>
                         {provider && voice
-                          ? provider.hasExplicitModels && activeModelGroup
+                          ? isEleven && activeSynthModel
+                            ? `${provider.label} · ${activeSynthModel.label} · ${voice.label}`
+                            : provider.hasExplicitModels && activeModelGroup
                             ? `${provider.label} · ${activeModelGroup.label} · ${voice.label}`
                             : `${provider.label} · ${voice.label}`
                           : "Not set"}

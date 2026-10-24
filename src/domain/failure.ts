@@ -36,10 +36,12 @@ export const REFUSAL =
   /Prohibited Use policy|prompt could not be submitted|prompt contains sensitive words|policy refusal/i;
 
 const ALL_LANES = /all lanes failed:\s*/i;
+const ELEVENLABS_POOL = /ElevenLabs key pool exhausted/i;
 
 const STATUS_HINT: Record<number, string> = {
   400: "request rejected",
   401: "key rejected",
+  402: "payment required",
   403: "access denied",
   404: "not found",
   408: "timed out",
@@ -120,6 +122,10 @@ export function failClass(e: unknown): FailClass {
   }
   const name = errorName(e);
   const s = errorText(e);
+  // The key pool already waited for a key; a wrapped copy must not requeue either.
+  if (name === "ElevenLabsPoolExhaustedError" || ELEVENLABS_POOL.test(s)) return "permanent";
+  // A 402 is billing (credits or plan), never cured by waiting minutes.
+  if (/ElevenLabs HTTP 402\b/i.test(s)) return "permanent";
   const m = ALL_LANES.exec(s);
   if (m) {
     const parts = s.slice(m.index + m[0].length).split(" | ").map((p) => p.trim()).filter(Boolean);
@@ -141,6 +147,7 @@ export function failClass(e: unknown): FailClass {
 export function failureNote(e: unknown): string {
   const name = errorName(e);
   const s = errorText(e);
+  if (name === "ElevenLabsPoolExhaustedError" || ELEVENLABS_POOL.test(s)) return "ElevenLabs keys exhausted";
   if (ALL_LANES.test(s)) {
     const cls = failClass(e);
     if (cls === "transient") return "All models busy";

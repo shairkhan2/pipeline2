@@ -1266,14 +1266,15 @@ describe('intake: TTS catalog resolution', () => {
     expect(def.voiceId).toBe('eve');
   });
 
-  it('rejects unknown providers, eleven/gsk, and off-catalog voices', async () => {
+  it('rejects unknown providers, legacy eleven/gsk, and off-catalog voices', async () => {
     const env = catEnv();
     await expect(resolveTtsSelection('nope', undefined, undefined, env))
       .rejects.toThrowError(/Unknown TTS provider/);
     await expect(resolveTtsSelection('eleven', 'sam', undefined, env))
-      .rejects.toThrowError(/ElevenLabs\/GSK TTS is not available|not available/);
-    await expect(resolveTtsSelection('elevenlabs', 'sam', undefined, env))
       .rejects.toThrowError(/not available/);
+    // The new direct-API engine is not rejected by name (see tests/elevenlabs-intake.test.ts).
+    await expect(resolveTtsSelection('elevenlabs', undefined, undefined, env, false))
+      .resolves.toMatchObject({ providerId: 'elevenlabs', engine: 'elevenlabs' });
     await expect(resolveTtsSelection('gsk', 'sam', undefined, env))
       .rejects.toThrowError(/not available/);
     await expect(resolveTtsSelection('grok', 'nope', undefined, env))

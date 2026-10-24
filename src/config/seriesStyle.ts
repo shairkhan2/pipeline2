@@ -13,6 +13,7 @@ export const ttsStyleSchema = z.object({
   speed: z.number().finite().min(0.5).max(2).optional(),
   style: z.string().max(2000).optional(),
   language: z.string().trim().min(1).max(100).optional(),
+  model_id: z.string().trim().regex(/^[a-z0-9_]{2,64}$/).optional(),
 }).strict();
 
 export const PACING = {

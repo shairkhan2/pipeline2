@@ -45,6 +45,7 @@ import {
 import { errorLine } from "@/lib/errors";
 import { navigateClient } from "@/components/layout/AppShell";
 import { StorageTrashDrawer, StorageTrashPanel, fmtStorageBytes } from "@/components/shared/StorageTrashDrawer";
+import { ElevenLabsKeysPanel } from "@/components/shared/ElevenLabsKeysPanel";
 import { AppearanceSection, AccountSection, ShortcutsSection } from "@/components/layout/SettingsDialog";
 import { MeterPage } from "@/pages/MeterPage";
 import {
@@ -6094,6 +6095,7 @@ export function VoiceTab({
   }
 
   return (
+    <>
     <div className="desk-card studio-voice">
       <div className="flex flex-col gap-3">
         <div className="flex flex-wrap items-end gap-3">
@@ -6259,6 +6261,8 @@ export function VoiceTab({
         {error ? <p className="text-xs text-destructive" role="alert">{error}</p> : null}
       </div>
     </div>
+    <ElevenLabsKeysPanel privileged={privileged} onPoolChange={() => void onRefreshCatalog?.()} />
+    </>
   );
 }
 

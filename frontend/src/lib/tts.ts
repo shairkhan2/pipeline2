@@ -43,6 +43,33 @@ export interface TtsProviderGroup {
   hasExplicitModels: boolean;
   models: TtsModelGroup[];
   voices: TtsVoiceItem[];
+  /** Engine-level synthesis models (ElevenLabs), separate from the voice grouping in `models`. */
+  synthModels?: TtsSynthModel[];
+  defaultSynthModel?: string;
+  allowCustomVoice?: boolean;
+}
+
+export interface TtsSynthModel {
+  id: string;
+  label: string;
+  tags: boolean;
+}
+
+export const ELEVENLABS_VOICE_ID_RE = /^[A-Za-z0-9]{16,40}$/;
+
+export function isElevenLabsProvider(provider: { id?: string; engine?: string } | null | undefined): boolean {
+  return Boolean(provider && (provider.engine === "elevenlabs" || provider.id === "elevenlabs"));
+}
+
+export function parseSynthModels(raw: unknown): TtsSynthModel[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((m: unknown) => {
+    if (!m || typeof m !== "object") return [];
+    const rec = m as Record<string, unknown>;
+    const id = typeof rec.id === "string" ? rec.id.trim() : "";
+    if (!id) return [];
+    return [{ id, label: typeof rec.label === "string" && rec.label.trim() ? rec.label.trim() : id, tags: rec.tags === true }];
+  });
 }
 
 export interface PreferredVoiceRecord {
@@ -310,6 +337,8 @@ export function buildTtsProviders(
           ? "No voices returned in catalog"
           : "";
     const costNotice = typeof item.costNotice === "string" ? item.costNotice.trim() : "";
+    const synthModels = parseSynthModels(item.models);
+    const defaultSynthModel = typeof item.defaultModel === "string" ? item.defaultModel.trim() : "";
 
     byId.set(id, {
       id,
@@ -321,6 +350,8 @@ export function buildTtsProviders(
       hasExplicitModels: (id === "vertex" || engine === "vertex" || models.length > 1) && models.length > 0,
       models,
       voices,
+      ...(synthModels.length ? { synthModels, defaultSynthModel: defaultSynthModel || synthModels[0]!.id } : {}),
+      ...(item.allowCustomVoice === true ? { allowCustomVoice: true } : {}),
     });
   }
 

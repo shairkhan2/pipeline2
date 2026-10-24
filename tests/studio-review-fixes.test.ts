@@ -1045,7 +1045,8 @@ describe('review fixes: grok-subscription TTS catalog wiring', () => {
       MANHWA_JOBS_DIR: path.join(root, 'out', 'jobs'),
       PATH: process.env.PATH ?? '',
     } as never);
-    expect(providers.map((p) => p.id)).toEqual(['edge']);
+    // ElevenLabs is always listed; its preflight decides availability.
+    expect(providers.map((p) => p.id)).toEqual(['edge', 'elevenlabs']);
   });
 
   it('discovers xAI voices into out/config/grok-tts-voices.json and synthesizes via /v1/tts', async () => {
@@ -1104,7 +1105,7 @@ describe('review fixes: grok-subscription TTS catalog wiring', () => {
       MANHWA_JOBS_DIR: '/tmp/opencode/jobs',
       PATH: process.env.PATH ?? '',
     } as never);
-    expect(providers.map((p) => p.id)).toEqual(['edge', 'explicit']);
+    expect(providers.map((p) => p.id)).toEqual(['edge', 'elevenlabs', 'explicit']);
   });
 });
 

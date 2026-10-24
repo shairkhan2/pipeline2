@@ -34,6 +34,7 @@ import { z } from "zod";
 
 import { pyFloatRepr, pyReprStr } from "../contracts/hashes.js";
 import { seriesStyleSchema } from '../config/seriesStyle.js';
+import { ELEVENLABS_DEFAULT_VOICE, isValidElevenLabsVoiceId } from "../llm/elevenlabsTts.js";
 
 // Keep in sync with remotion-studio/src/backgrounds/index.tsx BACKGROUNDS keys.
 export const BACKGROUNDS = ["starfield", "storm-valley", "mist-pines"] as const;
@@ -1062,29 +1063,35 @@ export function askFreshConfig(
   const dMotion = d.motion ?? DEFAULT_MOTION;
   let engine: string;
   try {
-    engine = input(`TTS engine [edge/eleven/external] (default ${dEngine}): `).trim().toLowerCase() || dEngine;
+    engine = input(`TTS engine [edge/eleven/elevenlabs/external] (default ${dEngine}): `).trim().toLowerCase() || dEngine;
   } catch (e) {
     if (!(e instanceof EOFError)) throw e;
     engine = dEngine;
   }
-  if (engine !== "edge" && engine !== "eleven" && engine !== "external") {
+  if (engine !== "edge" && engine !== "eleven" && engine !== "elevenlabs" && engine !== "external") {
     console.log(`  unknown engine ${pyReprStr(engine)} - using ${dEngine}`);
     engine = dEngine;
   }
   let voiceId = d.voice_id ?? d.voiceId ?? "";
-  if ((engine === "eleven" || engine === "external") && !voiceId) {
+  if ((engine === "eleven" || engine === "elevenlabs" || engine === "external") && !voiceId) {
     const promptLbl = engine === "eleven"
       ? "ElevenLabs voice (gsk preset name or voice id)"
-      : "External TTS voice id";
+      : engine === "elevenlabs"
+        ? `ElevenLabs voice id (default ${ELEVENLABS_DEFAULT_VOICE})`
+        : "External TTS voice id";
     try {
       voiceId = input(`${promptLbl}: `).trim();
     } catch (e) {
       if (!(e instanceof EOFError)) throw e;
       voiceId = "";
     }
+    if (!voiceId && engine === "elevenlabs") voiceId = ELEVENLABS_DEFAULT_VOICE;
     if (!voiceId) {
       throw new SystemExit(`engine=${engine} needs a voice - rerun with --voice <id>`);
     }
+  }
+  if (engine === "elevenlabs" && !isValidElevenLabsVoiceId(voiceId)) {
+    throw new SystemExit(`invalid ElevenLabs voice id ${pyReprStr(voiceId)} (expected 16-40 letters or digits)`);
   }
   let bg: string;
   try {
@@ -1244,12 +1251,18 @@ export function ingest(series: string, options: IngestOptions = {}): number[] {
     }
     if (
       engine !== "edge" && engine !== "eleven" && engine !== "external"
-      && engine !== "vertex" && engine !== "grok"
+      && engine !== "vertex" && engine !== "grok" && engine !== "elevenlabs"
     ) {
-      throw new SystemExit(`unknown engine ${pyReprStr(engine)} (expected edge, eleven, external, vertex, or grok)`);
+      throw new SystemExit(`unknown engine ${pyReprStr(engine)} (expected edge, eleven, elevenlabs, external, vertex, or grok)`);
     }
-    if ((engine === "eleven" || engine === "external" || engine === "vertex" || engine === "grok") && !voiceId) {
+    if (
+      (engine === "eleven" || engine === "elevenlabs" || engine === "external" || engine === "vertex" || engine === "grok")
+      && !voiceId
+    ) {
       throw new SystemExit(`engine=${engine} needs --voice <id> (non-interactive)`);
+    }
+    if (engine === "elevenlabs" && !isValidElevenLabsVoiceId(voiceId!)) {
+      throw new SystemExit(`invalid ElevenLabs voice id ${pyReprStr(voiceId!)} (expected 16-40 letters or digits)`);
     }
     const firstKey = found[0];
     const firstCbz = layout === "cbz" && firstKey !== undefined
@@ -1259,11 +1272,15 @@ export function ingest(series: string, options: IngestOptions = {}): number[] {
     const detected = strippedTitle || comicTitle(zipPath, firstCbz);
     const ttsBlock: Record<string, unknown> = { engine };
     if (ttsConfig && typeof ttsConfig === "object") {
-      for (const k of ["provider", "revision", "command", "voice_id", "language", "speed", "style", "settings"]) {
+      for (const k of ["provider", "revision", "command", "voice_id", "model_id", "language", "speed", "style", "settings"]) {
         if (k in ttsConfig && ttsConfig[k] != null && ttsConfig[k] !== "") {
           ttsBlock[k] = ttsConfig[k];
         }
       }
+    }
+    if (engine === "elevenlabs") {
+      ttsBlock.provider ??= "elevenlabs";
+      ttsBlock.revision ??= "v1";
     }
     if (voiceId && (engine !== "edge" || voiceId !== EDGE_DEFAULT_VOICE)) {
       ttsBlock.voice_id = voiceId;

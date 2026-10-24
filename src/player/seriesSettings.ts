@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { seriesStyleSchema, ttsStyleSchema, STYLE_CATALOG, resolveSeriesStyle, validationMessage } from '../config/seriesStyle.js';
 import { BACKGROUNDS, MOTIONS, cardAnimationSchema } from '../intake/ingest.js';
 import { atomicWriteJson } from '../intake/intake.js';
+import { isValidElevenLabsVoiceId } from '../llm/elevenlabsTts.js';
 
 const nullableFields = <T extends z.ZodRawShape>(shape: T) => Object.fromEntries(
   Object.entries(shape).map(([key, schema]) => [key, schema.nullable()]),
@@ -30,7 +31,14 @@ function metadata(dir: string): Record<string, any> {
 export function getSeriesSettings(dir: string) {
   const meta = metadata(dir);
   return { style: meta.style ?? {}, tts: meta.tts ?? {}, visuals: meta.visuals ?? {},
+    ttsEngine: seriesTtsEngine(meta),
     effective: resolveSeriesStyle(meta.style), styleOptions: STYLE_CATALOG };
+}
+
+/** Read-only: the engine is fixed at intake, PATCH never changes it. */
+function seriesTtsEngine(meta: Record<string, any>): string | null {
+  const engine = meta.tts && typeof meta.tts === 'object' ? String(meta.tts.engine ?? '').trim() : '';
+  return engine || null;
 }
 
 /** Null resets an override; omitted fields preserve the saved value. */
@@ -38,6 +46,10 @@ export function patchSeriesSettings(dir: string, input: unknown) {
   const result = seriesSettingsPatchSchema.safeParse(input);
   if (!result.success) throw Object.assign(new Error(validationMessage(result.error)), { statusCode: 400 });
   const meta = metadata(dir);
+  const voiceId = result.data.tts?.voice_id;
+  if (seriesTtsEngine(meta) === 'elevenlabs' && typeof voiceId === 'string' && !isValidElevenLabsVoiceId(voiceId)) {
+    throw Object.assign(new Error('tts.voice_id: invalid ElevenLabs voice id (expected 16-40 letters or digits)'), { statusCode: 400 });
+  }
   for (const group of ['style', 'tts', 'visuals'] as const) {
     const patch = result.data[group];
     if (!patch) continue;
