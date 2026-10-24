@@ -103,6 +103,7 @@ export function normalizeChapterPlan(raw: unknown, ch: string, isFirst: boolean,
   const r = isRec(raw) ? raw : {};
   let role = (ROLES as readonly string[]).includes(String(r.role)) ? (r.role as Role) : "rising";
   if (isFirst) role = "opening";
+  else if (role === "opening") role = "setup";
   let exit = (EXITS as readonly string[]).includes(String(r.exit)) ? (r.exit as Exit) : "flow";
   if (exit === "finale" && !isLast) exit = "act_break";
   const b = Number(r.budget_s);
@@ -113,8 +114,16 @@ export function normalizeChapterPlan(raw: unknown, ch: string, isFirst: boolean,
 }
 
 /** Deterministic plan when the planner is unavailable: even budget, flowing exits. */
-export function fallbackPlan(ch: string, isFirst: boolean): ChapterPlan {
-  return normalizeChapterPlan({}, ch, isFirst, false);
+export function fallbackPlan(ch: string, isFirst: boolean, isLast = false): ChapterPlan {
+  // No planner verdict: never invent a finale (the series may be ongoing).
+  return normalizeChapterPlan({ exit: "flow" }, ch, isFirst, isLast);
+}
+
+/** Single-pass {name} substitution: injected text is never re-scanned. */
+function fill(template: string, values: Record<string, string>): string {
+  return template.replace(/\{\{|\}\}|\{([a-z_]+)\}/g, (m, k?: string) =>
+    m === "{{" ? "{" : m === "}}" ? "}" : k !== undefined && k in values ? values[k]! : m,
+  );
 }
 
 export interface ArcInput {
@@ -128,7 +137,7 @@ function blockEvents(chs: string[], events: ArcInput["events"], cap: number): st
   return chs
     .map((c) => {
       const ev = events(c);
-      const lines = ev.slice(0, cap).map((e) => `- ${e}`);
+      const lines = ev.slice(0, cap).map((e) => `- ${e.replace(/\s+/g, " ").trim()}`);
       if (ev.length > cap) lines.push(`- (+${ev.length - cap} smaller events)`);
       return `${c}:\n${lines.join("\n") || "- (not read yet)"}`;
     })
@@ -144,6 +153,10 @@ export async function ensureMoviePlan(outDir: string, input: ArcInput, opts: { d
   const order = [...input.chapters].sort((a, b) => chNum(a) - chNum(b));
   const first = order[0];
   const last = order[order.length - 1];
+  // The series grew since an earlier plan: only the current last chapter may close it.
+  for (const [c, cp] of Object.entries(plan.chapters)) {
+    if (cp.exit === "finale" && c !== last) plan.chapters[c] = { ...cp, exit: "act_break" };
+  }
   for (let i = 0; i < order.length; i += ARC_BLOCK) {
     // Only chapters already read can be planned; unread ones are planned on a later
     // call (the writer uses an unsaved fallback for them meanwhile).
@@ -153,16 +166,15 @@ export async function ensureMoviePlan(outDir: string, input: ArcInput, opts: { d
     const arcKeys = Object.keys(plan.arc).filter((k) => chNum(k) < chNum(block[0]!)).sort((a, b) => chNum(a) - chNum(b));
     const arcSoFar = arcKeys.length ? plan.arc[arcKeys[arcKeys.length - 1]!]! : before.length ? "(earlier chapters planned without a summary)" : "(this block opens the movie)";
     const ahead = order.slice(i + ARC_BLOCK, i + ARC_BLOCK + ARC_AHEAD);
-    const prompt = ARC_PLAN_TASK
-      .replace("{arc_so_far}", arcSoFar)
-      .replace("{threads}", plan.open_threads.length ? plan.open_threads.map((t) => `- ${t}`).join("\n") : "(none)")
-      .replace("{chapters}", blockEvents(block, input.events, 40))
-      .replace("{ahead}", ahead.length ? blockEvents(ahead, input.events, 8) : "(none: this block reaches the end of the available chapters)")
-      .replace(/\{min_s\}/g, String(BUDGET_MIN_S))
-      .replace(/\{max_s\}/g, String(BUDGET_MAX_S))
-      .replace(/\{avg_s\}/g, String(BUDGET_AVG_S))
-      .replace(/\{\{/g, "{")
-      .replace(/\}\}/g, "}");
+    const prompt = fill(ARC_PLAN_TASK, {
+      arc_so_far: arcSoFar,
+      threads: plan.open_threads.length ? plan.open_threads.map((t) => `- ${t}`).join("\n") : "(none)",
+      chapters: blockEvents(block, input.events, 40),
+      ahead: ahead.length ? blockEvents(ahead, input.events, 8) : "(none: this block reaches the end of the available chapters)",
+      min_s: String(BUDGET_MIN_S),
+      max_s: String(BUDGET_MAX_S),
+      avg_s: String(BUDGET_AVG_S),
+    });
     if (opts.diagnosticsDir) {
       fs.mkdirSync(opts.diagnosticsDir, { recursive: true });
       fs.writeFileSync(path.join(opts.diagnosticsDir, `arc-${block[0]}-prompt.txt`), prompt);
@@ -192,7 +204,7 @@ export async function ensureMoviePlan(outDir: string, input: ArcInput, opts: { d
       rows = {};
     }
     for (const c of block) {
-      plan.chapters[c] = rows[c] ? normalizeChapterPlan(rows[c], c, c === first, c === last) : fallbackPlan(c, c === first);
+      plan.chapters[c] = rows[c] ? normalizeChapterPlan(rows[c], c, c === first, c === last) : fallbackPlan(c, c === first, c === last);
     }
     if (summary) plan.arc[block[block.length - 1]!] = summary;
     plan.open_threads = threads;
@@ -207,7 +219,7 @@ export function spokenLines(script: string): string[] {
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith("#"))
-    .map((l) => l.replace(/@p\d{4}_\d+|@hold\b|\[[a-z ]+\]/gi, "").replace(/\s+/g, " ").trim())
+    .map((l) => l.replace(/@p\d+(?:_\d+)?\b|@hold\b|\[[a-z ]+\]/g, "").replace(/\s+/g, " ").trim())
     .filter(Boolean);
 }
 
@@ -235,7 +247,7 @@ export function movieShape(cp: ChapterPlan, handoff: string): StoryShape {
       ? "This chapter is filler for the movie: keep only its 1-3 moments that matter."
       : `Role in the movie: ${cp.role}. Keep only the moments that fit this budget.`);
   const budgetDraft = `- LENGTH: about ${words} words in total (~${lines} lines); never pad to fill it.`;
-  const opening = !handoff || cp.role === "opening";
+  const opening = cp.role === "opening";
   if (opening) {
     return {
       plan: SHAPE_MOVIE_OPEN.plan.replace("@@BUDGET_PLAN@@", budgetPlan),
@@ -248,7 +260,7 @@ export function movieShape(cp: ChapterPlan, handoff: string): StoryShape {
       .replace(/@@ENTRY@@/g, cp.entry)
       .replace(/@@ROLE@@/g, cp.role)
       .replace(/@@FOCUS@@/g, cp.focus || "deliver this chapter's turn and skip the rest")
-      .replace(/@@HANDOFF@@/g, handoff)
+      .replace(/@@HANDOFF@@/g, handoff || "(unavailable: continue the story naturally from STORY SO FAR)")
       .replace(/@@EXIT_PLAN@@/g, exit.plan)
       .replace(/@@EXIT_DRAFT@@/g, exit.draft)
       .replace(/@@EXIT_REVIEW@@/g, exit.review)

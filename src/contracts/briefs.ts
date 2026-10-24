@@ -98,8 +98,7 @@ export const SHAPE_EPISODE = {
     "- Moment 1 is the cold open: the chapter's strongest predicament or reversal, when the\n" +
     "  source supports opening there. Then orient: who this is and why it matters.\n" +
     "- The last moment is the chapter's real unresolved turn: the hook into what comes next.\n" +
-    "- Open where the previous episode left off when EARLIER NARRATION exists (unless the\n" +
-    "  cold open is stronger).",
+    "- When EARLIER NARRATION exists, moment 1 picks up where it left off; otherwise use the cold open.",
   draft:
     "- Cold open: start on the plan's first moment, the hottest predicament, in the\n" +
     "  middle of it. Then turn to who this is (\"So who is he really?\" style) only when the\n" +

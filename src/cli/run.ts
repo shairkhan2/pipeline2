@@ -904,7 +904,7 @@ export async function _runLocked(
             const nextN = Number.parseInt(/\d+/.exec(next)?.[0] ?? "0", 10);
             if (!isDirectory(nextDir) || nextN < startN) continue;
             try {
-              await _hooks.readChapter(nextDir, out, force, keepStale, aheadCast, cv);
+              await _hooks.readChapter(nextDir, out, false, keepStale, aheadCast, cv);
               console.log(`   read-ahead: ${next} ready for the writer's look-ahead`);
             } catch (e) {
               const msg = e instanceof Error ? e.message : String(e);
@@ -1051,13 +1051,17 @@ export async function _runLocked(
         // chapter's last lines instead of opening a new episode.
         let movieShape: import("../stages/storyWriter.js").StoryShape | undefined;
         let movieArc = "";
-        if (resolveSeriesStyle(seriesStyle).writerMode === "story" && storyShapeMode(seriesStyle as { storyShape?: string }) === "movie") {
+        const willWrite = force || repair || !fs.existsSync(scriptTarget);
+        if (willWrite && resolveSeriesStyle(seriesStyle).writerMode === "story" && storyShapeMode(seriesStyle as { storyShape?: string }) === "movie") {
           const all = chaptersIn(sdir).filter((c) => (Number.parseInt(/\d+/.exec(c)?.[0] ?? "0", 10) || 0) >= startN);
           const mplan = await ensureMoviePlan(out, { chapters: all, events: (c) => writerMod._obsEvents(out, c) }, {
             diagnosticsDir: path.join(out, "movie_diagnostics"),
           });
-          const cp = mplan.chapters[ch] ?? fallbackPlan(ch, ch === all[0]);
+          const cp = mplan.chapters[ch] ?? fallbackPlan(ch, ch === all[0], ch === all[all.length - 1]);
           const handoff = ch === all[0] ? "" : handoffLines(out, ch);
+          if (ch !== all[0] && !handoff) {
+            process.stderr.write(`   movie: WARN ${ch} has no earlier narration to continue from; write earlier chapters first\n`);
+          }
           movieShape = buildMovieShape(cp, handoff);
           movieArc = arcContext(mplan, ch);
           console.log(

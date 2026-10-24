@@ -10,7 +10,7 @@
  *   planStory         - STORY_PLAN_TASK -> validatePlan
  *   draftStory        - STORY_TASK      -> validateDraft
  *   reviewStory       - STORY_REVIEW_TASK -> validateReview
- *   writeStoryScript  - all three, with ONE bounded source-backed correction
+ *   writeStoryScript  - all three, with bounded source-backed repair rounds (later rounds patch flagged steps)
  *
  * PARITY NOTES (Python -> JS)
  *  - Python `str.strip()` / `str.split()` use Python whitespace (incl. \x1c-\x1f, \x85);
@@ -430,8 +430,9 @@ export function normalizeUnits(data: unknown): unknown {
       .map((s) => s.trim())
       .filter(Boolean)
       .flatMap((s) => splitLongLine(s));
-    if (parts.length <= 1) {
-      steps.push(parts.length ? { ...raw, line: parts[0] } : raw);
+    if (!parts.length) continue; // blank line: nothing to say
+    if (parts.length === 1) {
+      steps.push({ ...raw, line: parts[0] });
       continue;
     }
     parts.forEach((line, i) => {

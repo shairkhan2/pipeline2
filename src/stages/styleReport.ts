@@ -34,10 +34,10 @@ function narrationLines(script: string): Array<{ text: string; panels: number; h
   for (const raw of script.split("\n")) {
     const l = raw.trim();
     if (!l || l.startsWith("#")) continue;
-    const panels = (l.match(/@p\d{4}_\d+/g) ?? []).length;
+    const panels = (l.match(/@p\d+(?:_\d+)?\b/g) ?? []).length;
     const hold = /@hold\b/.test(l);
     const text = l
-      .replace(/@p\d{4}_\d+/g, "")
+      .replace(/@p\d+(?:_\d+)?\b/g, "")
       .replace(/@hold\b/g, "")
       .replace(/\[[a-z ]+\]/gi, "")
       .replace(/\s+/g, " ")
@@ -57,7 +57,7 @@ export function styleReport(script: string): StyleReport {
   const lens = spoken.map((l) => wc(l.text));
   const median = lens.length ? [...lens].sort((a, b) => a - b)[Math.floor(lens.length / 2)]! : 0;
   const glued = spoken.slice(1).filter((l) => GLUE.test(l.text)).length;
-  const glueShare = spoken.length > 1 ? glued / (spoken.length - 1) : 0;
+  const glueShare = spoken.length > 1 ? glued / (spoken.length - 1) : 0.39; // too short to judge
   const flags: string[] = [];
 
   spoken.forEach((l, i) => {

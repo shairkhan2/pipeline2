@@ -35,7 +35,7 @@ const MusicBed: React.FC<{src: string; volume: number; loopS?: number}> = ({src,
   const {fps, durationInFrames} = useVideoConfig();
   const fade = Math.round(fps * 1.5);
   const vol = (f: number) =>
-    volume * Math.min(1, f / fade, (durationInFrames - f) / fade);
+    volume * Math.max(0, Math.min(1, f / fade, (durationInFrames - f) / fade));
   const audio = <Audio src={staticFile(src)} volume={vol} />;
   return loopS && loopS > 0 ? <Loop durationInFrames={Math.round(loopS * fps)}>{audio}</Loop> : audio;
 };

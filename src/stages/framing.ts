@@ -1153,6 +1153,7 @@ export async function frameShots(
     }
     const source = sourceOf(shot, pid);
     if (!existsSync(source)) {
+      process.stderr.write(`   framing: WARN missing source for ${pid}: ${source}\n`);
       stats.unchanged += 1;
       continue;
     }

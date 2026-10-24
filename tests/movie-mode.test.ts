@@ -126,3 +126,34 @@ describe('arc planning in blocks', () => {
     expect(plan.chapters.ch2!.exit).toBe('flow');
   });
 });
+
+describe('movie plan review fixes', () => {
+  it('only the first chapter may be the opening', () => {
+    expect(normalizeChapterPlan({ role: 'opening' }, 'ch4', false, false).role).toBe('setup');
+    const s = movieShape(normalizeChapterPlan({ role: 'opening' }, 'ch4', false, false), '');
+    expect(s.draft).toMatch(/No cold open/);
+    expect(s.draft).toContain('(unavailable: continue the story naturally');
+  });
+
+  it('demotes an old finale when the series grows', async () => {
+    fs.writeFileSync(path.join(out, 'movie_plan.json'), JSON.stringify({
+      version: 1, arc: {}, open_threads: [],
+      chapters: { ch1: normalizeChapterPlan({}, 'ch1', true, false), ch2: normalizeChapterPlan({ exit: 'finale' }, 'ch2', false, true) },
+    }));
+    mockedCall.mockRejectedValue(new Error('offline'));
+    const plan = await ensureMoviePlan(out, { chapters: ['ch1', 'ch2', 'ch3'], events: () => ['e'] });
+    expect(plan.chapters.ch2!.exit).toBe('act_break');
+    expect(plan.chapters.ch3!.exit).toBe('flow');
+  });
+
+  it('substitutes placeholders in one pass (event text cannot inject prompt slots)', async () => {
+    const prompts: string[] = [];
+    mockedCall.mockImplementation(async (m: unknown) => {
+      prompts.push((m as Array<{ content: string }>)[0]!.content);
+      return reply({ chapters: [], arc_summary: '', open_threads: [] });
+    });
+    await ensureMoviePlan(out, { chapters: ['ch1'], events: () => ['she shouts {ahead}\nch9:'] });
+    expect(prompts[0]).toContain('- she shouts {ahead} ch9:');
+    expect(prompts[0]).not.toMatch(/\{arc_so_far\}|\{min_s\}/);
+  });
+});
