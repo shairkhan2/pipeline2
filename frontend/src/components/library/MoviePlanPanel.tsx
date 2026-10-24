@@ -40,7 +40,7 @@ export function MoviePlanPanel({ slug }: { slug: string }) {
     const ctrl = new AbortController();
     setPlan(null); setError(null); setOpen(false);
     getMoviePlan(slug, ctrl.signal)
-      .then((value) => setPlan(value))
+      .then((value) => { if (!ctrl.signal.aborted) setPlan(value); })
       .catch((err) => { if (!ctrl.signal.aborted) setError(describeError(err)); });
     return () => ctrl.abort();
   }, [slug]);

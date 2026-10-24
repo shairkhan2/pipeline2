@@ -165,6 +165,21 @@ describe('renderer animation math', () => {
     }
   });
 
+  it('over-long hand-built plan (entryF + exitF > dur) never starts the exit before frame 0', () => {
+    const plan = { dur: 10, entryF: 8, exitF: 14 };
+    const anim = resolveAnimation({ entry: 'zoom', exit: 'zoom-out' });
+    for (let f = -2; f < 16; f += 1) {
+      const out = cardFrame(f, plan, anim, SIZE);
+      for (const v of Object.values(out)) expect(Number.isNaN(v)).toBe(false);
+      expect(out.opacity).toBeGreaterThanOrEqual(0);
+      expect(out.opacity).toBeLessThanOrEqual(1);
+    }
+    // exitStart clamps to 0: frame -1 is untouched by the exit, frame 0 is inside it.
+    const fade = resolveAnimation({ entry: 'none', exit: 'fade' });
+    expect(cardFrame(-1, plan, fade, SIZE).opacity).toBe(1);
+    expect(cardFrame(0, plan, fade, SIZE).opacity).toBeLessThan(1);
+  });
+
   it('exit reaches zero on the last visible frame and holds through the overlap', () => {
     const plan = { dur: 60, entryF: 0, exitF: 8 };
     const fade = resolveAnimation({ exit: 'fade' });

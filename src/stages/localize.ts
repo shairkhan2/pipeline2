@@ -30,6 +30,7 @@ import { resolveOutDir } from "../config/secretStore.js";
 import { PROMO_ALGO_VERSION } from "../contracts/hashes.js";
 import { call, laneSnapshotStatus, type ChatMessage } from "../llm/client.js";
 import { localizedSpeechText, synthesizeVertexTtsToFile, vertexTtsConfigFingerprint } from "../llm/vertexTts.js";
+import { normalizeCardAnimation } from "../intake/ingest.js";
 import { load as loadPromoBlock } from "../intake/promoBlock.js";
 import { detectActivePipelineRuns, flockFd, tryFlockFd, withSharedSeriesLock } from "../locks/seriesLock.js";
 import {
@@ -942,7 +943,8 @@ export function renderConfig(sdir: string, check: SourceCheck): RenderConfig {
   const visuals = isRecord(meta.visuals) ? meta.visuals : {};
   const background = String(visuals.background ?? meta.background ?? "starfield");
   const motion = String(visuals.motion ?? meta.motion ?? "window");
-  const animation = isRecord(visuals.animation) ? sha256Json(visuals.animation) : undefined;
+  const normAnimation = normalizeCardAnimation(visuals.animation);
+  const animation = normAnimation ? sha256Json(normAnimation) : undefined;
   const music = isRecord(meta.music) ? sha256Json(meta.music) : undefined;
   let quality = "1080p";
   const envQuality = (process.env.MANHWA_RENDER_QUALITY ?? "").trim().toLowerCase();

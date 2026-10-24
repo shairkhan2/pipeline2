@@ -1922,7 +1922,7 @@ export default function NewSeriesPage() {
                       </dd>
                     </div>
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Chapters</dt><dd className="font-mono">{chapters.trim() || "all"}</dd></div>
-                    <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Source & style</dt><dd>{sourceMode === "upload" ? file?.name || "No ZIP selected" : driveId ? "Google Drive ZIP" : "Waiting for link"} · {BG_LABELS[background] || background} · {MOTION_LABELS[motion] || motion}</dd></div>
+                    <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Source & style</dt><dd>{sourceMode === "upload" ? file?.name || "No ZIP selected" : driveId ? "Google Drive ZIP" : "Waiting for link"} · {BG_LABELS[background] || background} · {MOTION_LABELS[motion || "window"] || motion || "Window"}</dd></div>
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Render lane & quality</dt><dd>{laneLabel(chosenLane?.id || DEFAULT_LANE, lanes)} · {renderQuality}</dd></div>
                     {outroEnabled ? (
                       <div className="flex justify-between gap-3 px-3 py-2 text-sm">

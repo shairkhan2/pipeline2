@@ -104,6 +104,11 @@ function round1(n: number): number {
 
 /** Duration from render metadata only (no ffprobe): shots.json last end_s, then tts_durs.json sum, then report.duration. */
 function chapterDuration(outDir: string, key: string, report: unknown): number | undefined {
+  // The rendered video's duration wins: shots.json can be newer than the published video.
+  if (isObject(report)) {
+    const d = finiteNumber(report.duration);
+    if (d !== undefined && d > 0) return round1(d);
+  }
   const shots = readJson(inside(outDir, key, 'video', 'shots.json'));
   const list = isObject(shots) && Array.isArray(shots.shots) ? shots.shots : Array.isArray(shots) ? shots : null;
   if (list && list.length) {
@@ -114,10 +119,6 @@ function chapterDuration(outDir: string, key: string, report: unknown): number |
   if (Array.isArray(durs) && durs.length) {
     const nums = durs.map(finiteNumber);
     if (nums.every((n) => n !== undefined)) return round1((nums as number[]).reduce((a, b) => a + b, 0));
-  }
-  if (isObject(report)) {
-    const d = finiteNumber(report.duration);
-    if (d !== undefined && d > 0) return round1(d);
   }
   return undefined;
 }

@@ -59,6 +59,19 @@ describe('movie plan view', () => {
     expect(view.plan!.chapters).not.toHaveProperty('bogus');
   });
 
+  it('prefers the rendered video duration from report.json over shots.json and tts_durs.json', () => {
+    const out = path.join(dir, 'out');
+    write(path.join(out, 'movie_plan.json'), plan);
+    write(path.join(out, 'ch1', 'video', 'shots.json'), { shots: [{ end_s: 140 }] });
+    write(path.join(out, 'ch1', 'report.json'), { status: 'video-ok', duration: 131.26 });
+    write(path.join(out, 'ch2', 'video', 'shots.json'), { shots: [{ end_s: 42 }] });
+    write(path.join(out, 'ch2', 'video', 'tts_durs.json'), [1, 2]);
+    write(path.join(out, 'ch2', 'report.json'), { duration: 0 });
+    const [ch1, ch2] = getMoviePlanView(dir).chapters;
+    expect(ch1!.durationS).toBe(131.3);
+    expect(ch2!.durationS).toBe(42);
+  });
+
   it('coerces unknown role/exit values', () => {
     write(path.join(dir, 'out', 'movie_plan.json'), { chapters: { ch1: { role: 'weird', exit: 'nope', budget_s: 'x' } } });
     expect(getMoviePlanView(dir).chapters[0]).toMatchObject({ role: 'filler', exit: 'flow', budget_s: 0, rendered: false });

@@ -56,14 +56,22 @@ describe('locale render config matches the English movie defaults', () => {
     const plain = localize.renderConfig(sdir, check);
     const plainKey = localize.renderKeyFor('tk', 'v', 1, plain);
 
-    writeMeta({ visuals: { motion: 'window', animation: { entry: 'fade', pushIn: 0.04 } } });
+    writeMeta({ visuals: { motion: 'window', animation: { entry: 'fade', pushIn: 'subtle' } } });
     const anim = localize.renderConfig(sdir, check);
     expect(anim.animation).toEqual(expect.any(String));
     const animKey = localize.renderKeyFor('tk', 'v', 1, anim);
     expect(animKey).not.toBe(plainKey);
 
-    writeMeta({ visuals: { motion: 'window', animation: { entry: 'slide', pushIn: 0.04 } } });
+    writeMeta({ visuals: { motion: 'window', animation: { entry: 'slide-up', pushIn: 'subtle' } } });
     expect(localize.renderKeyFor('tk', 'v', 1, localize.renderConfig(sdir, check))).not.toBe(animKey);
+
+    writeMeta({ visuals: { motion: 'window', animation: { pushIn: 'subtle', entry: 'fade' } } });
+    expect(localize.renderKeyFor('tk', 'v', 1, localize.renderConfig(sdir, check))).toBe(animKey);
+
+    writeMeta({ visuals: { motion: 'window', animation: { bogus: true } } });
+    const invalid = localize.renderConfig(sdir, check);
+    expect(invalid.animation).toBeUndefined();
+    expect(localize.renderKeyFor('tk', 'v', 1, invalid)).toBe(plainKey);
 
     writeMeta({ visuals: { motion: 'window' }, music: { enabled: true, file: 'music/bed.mp3', volume: 0.1 } });
     const music = localize.renderConfig(sdir, check);

@@ -144,7 +144,7 @@ export function cardFrame(
     if (anim.entry === 'slide-left') out.dx = (1 - e) * SLIDE_X * size.w;
     if (!first) out.backdropOpacity = clamp01(p * 2);
   }
-  const exitStart = plan.dur - plan.exitF;
+  const exitStart = Math.max(0, plan.dur - plan.exitF);
   if (plan.exitF > 0 && anim.exit !== 'none' && frame >= exitStart) {
     // Reaches 0 on the shot's last visible frame and holds through the overlap tail.
     const p = clamp01((frame - exitStart + 1) / plan.exitF);
