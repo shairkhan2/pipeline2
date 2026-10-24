@@ -3,7 +3,7 @@ import type { IntakeCatalog, SeriesStyle, TtsStyle } from '@/lib/api';
 export type EditableTtsStyle = Omit<TtsStyle, 'speed'> & { speed?: number | null };
 
 const labels: Record<keyof SeriesStyle, string> = {
-  writerMode: 'Writer mode', matchMode: 'Panel matching', emotionTags: 'Emotion tags', pacing: 'Pacing',
+  writerMode: 'Writer mode', storyShape: 'Story shape', matchMode: 'Panel matching', emotionTags: 'Emotion tags', pacing: 'Pacing',
 };
 const control = 'field mt-1 min-h-11';
 

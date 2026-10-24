@@ -171,7 +171,7 @@ export interface JobsList {
   [key: string]: unknown;
 }
 
-export type SeriesStyle = Partial<Record<'writerMode' | 'matchMode' | 'emotionTags' | 'pacing', string>>;
+export type SeriesStyle = Partial<Record<'writerMode' | 'storyShape' | 'matchMode' | 'emotionTags' | 'pacing', string>>;
 export type StyleOptions = Record<keyof SeriesStyle, Array<{ value: string; label: string; description: string }>>;
 export interface TtsStyle { voice_id?: string; speed?: number; style?: string; language?: string }
 export interface SeriesSettings {

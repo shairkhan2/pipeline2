@@ -12,6 +12,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -1109,6 +1110,56 @@ function findBox(listing: string, box: string): Box | null {
   return null;
 }
 
+/** Per-box composition sync: one signature check per render, a push only on change. */
+const _nodeSyncLocks = new Map<string, Promise<void>>();
+
+/** Content signature of the studio's composition files (src/, config); deps excluded. */
+export function studioSignature(studio: string): string {
+  const files: string[] = ["remotion.config.ts", "tsconfig.json"];
+  const srcRoot = path.join(studio, "src");
+  if (fs.existsSync(srcRoot)) for (const full of walkFiles(srcRoot)) files.push(path.relative(studio, full));
+  return createHash("sha256")
+    .update(files.sort().map((p) => `${p}:${fs.existsSync(path.join(studio, p)) ? _digest(path.join(studio, p)) : "-"}`).join("\n"))
+    .digest("hex");
+}
+
+async function syncNodeStudio(
+  run: ProcessRunner,
+  box: string,
+  remoteDir: string,
+  studio: string,
+  say: (msg: string) => void,
+): Promise<void> {
+  const prev = _nodeSyncLocks.get(box) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((r) => (release = r));
+  const chained = prev.then(() => mine);
+  _nodeSyncLocks.set(box, chained);
+  await prev;
+  try {
+    const signature = studioSignature(studio);
+    const marker = `${remoteDir}/.pipeline-src-sha256`;
+    const remote = run(["sbx", "--cloud", "exec", box, "sh", "-c", `cat ${shQuote(marker)} 2>/dev/null || true`], 60);
+    if (remote.status === 0 && String(remote.stdout ?? "").trim() === signature) return;
+    say(`[cloud ${box}] syncing composition (src changed)`);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "studio-src-"));
+    try {
+      const archive = path.join(tmp, "src.tar.gz");
+      const present = ["src", "remotion.config.ts", "tsconfig.json"].filter((e) => fs.existsSync(path.join(studio, e)));
+      const tar = run(["tar", "-czf", archive, "-C", studio, ...present], 300);
+      if (tar.status !== 0) throw new RuntimeError(`studio tar failed: ${String(tar.stderr ?? "").slice(-200)}`);
+      nodeRun(run, ["cp", archive, `${box}:${remoteDir}/.studio-src.tar.gz`], 900);
+      nodeRun(run, ["exec", box, "sh", "-c",
+        `cd ${shQuote(remoteDir)} && rm -f ${shQuote(marker)} && rm -rf src && tar -xzf .studio-src.tar.gz && rm -f .studio-src.tar.gz && printf '%s' ${shQuote(signature)} > ${shQuote(marker)}`], 300);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  } finally {
+    release();
+    if (_nodeSyncLocks.get(box) === chained) _nodeSyncLocks.delete(box);
+  }
+}
+
 export function createCloudNode(
   cfg: CloudNodeConfig,
   runner?: ProcessRunner,
@@ -1293,6 +1344,8 @@ export function createCloudNode(
           }
           say(`[cloud ${id} ${box}] ${proj}`);
           write?.write(`[cloud ${id} ${box}] ${proj}\n`);
+          // Keep the node's composition identical to ours, or it renders an old look.
+          await syncNodeStudio(run, box, remoteDir, studioLocal, say);
           nodeRun(run, ["exec", box, "sh", "-c", `mkdir -p ${shQuote(`${remoteDir}/public`)} ${shQuote(`${job}/tmp`)} && rm -rf -- ${shQuote(publicDir)}`], 60);
           nodeRun(run, ["cp", assets, `${box}:${remoteDir}/public`], 900);
           nodeRun(run, ["cp", propsPath, `${box}:${job}/shots.json`], 900);

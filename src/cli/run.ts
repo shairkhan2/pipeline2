@@ -1001,8 +1001,22 @@ export async function _runLocked(
         const scriptTarget = path.join(cdir, scriptName);
 
         // EP1 OPENING
+        const movieMode =
+          resolveSeriesStyle(seriesStyle).writerMode === "story" &&
+          storyShapeMode(seriesStyle as { storyShape?: string }) === "movie";
         let opening = "";
-        if (hasOp && ch === startCh) {
+        let scoutHint = "";
+        if (hasOp && ch === startCh && movieMode) {
+          // Movie mode writes its own opening: the scout's pick guides the cold open
+          // instead of being spliced in as a separate first beat (no double opening).
+          const ctx = _hooks.scout.contextDigest(out, startCh);
+          scoutHint = [
+            op.scene ? `SCOUT PICK for the cold open (use it only if it happens in this chapter): ${String(op.scene)}` : "",
+            op.why ? `Why it hooks: ${String(op.why)}` : "",
+            pyStrip(ctx) ? `BEFORE THE MOVIE (context only; the viewer has not seen it):\n${ctx}` : "",
+          ].filter(Boolean).join("\n");
+          console.log(`   movie opening: scout pick ${String(op.panel ?? "None")} used as a cold-open hint`);
+        } else if (hasOp && ch === startCh) {
           const ctx = _hooks.scout.contextDigest(out, startCh);
           const hookStr = String(op.hook || "");
           const takenList = [...hookStr.matchAll(/@(p\d{4}_\d+)/g)].map((m) => `@${m[1]}`);
@@ -1052,7 +1066,7 @@ export async function _runLocked(
         let movieShape: import("../stages/storyWriter.js").StoryShape | undefined;
         let movieArc = "";
         const willWrite = force || repair || !fs.existsSync(scriptTarget);
-        if (willWrite && resolveSeriesStyle(seriesStyle).writerMode === "story" && storyShapeMode(seriesStyle as { storyShape?: string }) === "movie") {
+        if (willWrite && movieMode) {
           const all = chaptersIn(sdir).filter((c) => (Number.parseInt(/\d+/.exec(c)?.[0] ?? "0", 10) || 0) >= startN);
           const mplan = await ensureMoviePlan(out, { chapters: all, events: (c) => writerMod._obsEvents(out, c) }, {
             diagnosticsDir: path.join(out, "movie_diagnostics"),
@@ -1063,7 +1077,7 @@ export async function _runLocked(
             process.stderr.write(`   movie: WARN ${ch} has no earlier narration to continue from; write earlier chapters first\n`);
           }
           movieShape = buildMovieShape(cp, handoff);
-          movieArc = arcContext(mplan, ch);
+          movieArc = [scoutHint, arcContext(mplan, ch)].filter(Boolean).join("\n");
           console.log(
             `   movie: ${cp.role}, ~${cp.budget_s}s, entry "${cp.entry}", exit ${cp.exit}` +
               (handoff ? ` | continues from ${handoff.split("\n").length} line(s)` : " | movie opening"),

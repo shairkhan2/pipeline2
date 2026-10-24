@@ -29,6 +29,7 @@ export function resolveSeriesStyle(style: SeriesStyle = {}, env: NodeJS.ProcessE
     matchMode: style.matchMode ?? env.MATCH_MODE ?? 'auto',
     emotionTags,
     pacing: PACING[pacing as keyof typeof PACING] ?? PACING.normal,
+    storyShape: (style.storyShape ?? env.STORY_SHAPE ?? 'movie') === 'episode' ? 'episode' as const : 'movie' as const,
   };
 }
 

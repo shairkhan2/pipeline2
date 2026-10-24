@@ -650,7 +650,7 @@ export default function NewSeriesPage() {
   const [style, setStyle] = useState<import('@/lib/api').SeriesStyle>({});
   const [ttsStyle, setTtsStyle] = useState<EditableTtsStyle>({});
   const [background, setBackground] = useState("starfield");
-  const [motion, setMotion] = useState("cut");
+  const [motion, setMotion] = useState("");
   const [laneId, setLaneId] = useState(DEFAULT_LANE);
   const [renderQuality, setRenderQuality] = useState<RenderQuality>("1080p");
   const [outroEnabled, setOutroEnabled] = useState(false);
@@ -714,7 +714,7 @@ export default function NewSeriesPage() {
   const modelVoices = activeModelGroup?.voices || provider?.voices || [];
   const voice = modelVoices.find((item) => item.id === voiceId) || provider?.voices.find((item) => item.id === voiceId) || modelVoices[0] || provider?.voices[0] || null;
   const backgrounds = catalog?.backgrounds?.length ? catalog.backgrounds : ["starfield", "storm-valley", "mist-pines"];
-  const motions = catalog?.motions?.length ? catalog.motions : ["cut", "duo"];
+  const motions = catalog?.motions?.length ? catalog.motions : ["window", "cut", "duo"];
   const driveId = parseDriveId(gdriveUrl);
   const slugPreview = slug || slugify(title);
   const chosenLane = lanes.find((lane) => lane.id === laneId) || lanes[0];
@@ -1046,7 +1046,7 @@ export default function NewSeriesPage() {
           voice: finalVoiceId,
           chapters: chapterCheck.spec,
           background,
-          motion,
+          motion: motion || "window",
           renderLane: lane.id,
           renderQuality: finalQuality,
           outroConfig,
@@ -1069,7 +1069,7 @@ export default function NewSeriesPage() {
             voice: finalVoiceId,
             chapters: chapterCheck.spec,
             background,
-            motion,
+            motion: motion || "window",
             renderLane: lane.id || DEFAULT_LANE,
             renderQuality: finalQuality,
             outroConfig,

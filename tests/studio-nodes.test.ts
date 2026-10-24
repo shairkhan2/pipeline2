@@ -249,6 +249,54 @@ describe('createCloudNode: isolated multi-instance sandboxes', () => {
       else process.env.MANHWA_STUDIO = previousStudio;
     }
   });
+
+  it('syncs a changed composition to the box before rendering, and skips an unchanged one', async () => {
+    const dir = makeTmp('cloudsync');
+    const studio = path.join(dir, 'studio');
+    fs.mkdirSync(path.join(studio, 'public', 'series_1'), { recursive: true });
+    fs.mkdirSync(path.join(studio, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(studio, 'src', 'Recap.tsx'), 'v1');
+    const props = path.join(dir, 'shots.json');
+    fs.writeFileSync(props, JSON.stringify({ audio: 'series_1/audio.mp3' }));
+    const video = path.join(dir, 'video', 'video.mp4');
+    let marker = '';
+    const calls: string[][] = [];
+    const runner: cloudlane.ProcessRunner = (args) => {
+      calls.push([...args]);
+      if (args[0] === 'ffprobe') return ok('12.5\n');
+      if (args[0] === 'tar') { fs.writeFileSync(args[2]!, 'tgz'); return ok(); }
+      if (args[2] === 'exec' && String(args.at(-1)).startsWith('cat ')) return ok(marker);
+      if (args[2] === 'exec' && String(args.at(-1)).includes('.pipeline-src-sha256') && String(args.at(-1)).includes('printf')) {
+        marker = cloudlane.studioSignature(studio);
+        return ok();
+      }
+      if (args[2] === 'cp') {
+        const dst = args[4];
+        if (args[3].startsWith('sbx-arm-1:') && args[3].endsWith('video.mp4')) {
+          fs.mkdirSync(path.dirname(dst), { recursive: true });
+          fs.writeFileSync(dst, 'mp4');
+        }
+        return ok();
+      }
+      return ok();
+    };
+    const previousStudio = process.env.MANHWA_STUDIO;
+    process.env.MANHWA_STUDIO = studio;
+    try {
+      const node = cloudlane.createCloudNode({ id: 'sbx-arm-1', box: 'sbx-arm-1' }, runner);
+      await node.render(props, video, () => {});
+      const pushes = () => calls.filter((c) => c[2] === 'cp' && String(c[3]).endsWith('src.tar.gz')).length;
+      expect(pushes()).toBe(1);
+      await node.render(props, video, () => {});
+      expect(pushes()).toBe(1);
+      fs.writeFileSync(path.join(studio, 'src', 'Recap.tsx'), 'v2');
+      await node.render(props, video, () => {});
+      expect(pushes()).toBe(2);
+    } finally {
+      if (previousStudio === undefined) delete process.env.MANHWA_STUDIO;
+      else process.env.MANHWA_STUDIO = previousStudio;
+    }
+  });
 });
 
 /* ================================================================== *
