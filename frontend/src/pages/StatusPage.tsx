@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { ErrorNotice, Notice, RawDetails } from "@/components/ui/notice";
 import { Tooltip } from "@/components/ui/tooltip";
 import { FeedRow, LaneHealth, RunTotals, buildFeed } from "@/components/status/RunHealth";
+import { RunSettingsDialog } from "@/components/shared/RunSettingsDialog";
 import { Sortable, SortableHandle, SortableItem } from "@/components/ui/sortable";
 import {
   api,
@@ -104,9 +105,10 @@ interface StatusRun {
   title?: string;
   series?: string;
   slug?: string;
-  jobId?: string;
+  jobId?: string | null;
   state?: string;
   paused?: boolean;
+  pausedWhere?: string | null;
   alive?: boolean;
   pid?: number;
   elapsed?: number;
@@ -119,7 +121,7 @@ interface StatusRun {
   controlActions?: string[];
   chapters?: Record<string, ChapterRow>;
   activeCalls?: Record<string, ActiveCall>;
-  providers?: Record<string, { coolingUntil?: number }>;
+  providers?: Record<string, { coolingUntil?: number | null; coolingReason?: string }>;
   recentCalls?: RecentCall[];
   events?: ActivityEvent[];
   totals?: { calls?: number; errors?: number; tokens?: number };
@@ -685,6 +687,7 @@ export default function StatusPage() {
   const [saving, setSaving] = useState(false);
   const [banner, setBanner] = useState("");
   const [runControlBusy, setRunControlBusy] = useState<"" | "pause" | "resume" | "stop">("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [controlError, setControlError] = useState<{ error: unknown } | null>(null);
   const [stopConfirm, setStopConfirm] = useState(false);
   const statusRef = useRef<DeskStatus | null>(null);
@@ -733,7 +736,7 @@ export default function StatusPage() {
         const next = asStatus(statusResult.value);
         applyStatus(next);
         setConnError(next.stale ? `The collector is temporarily unavailable. Showing the last measurement from ${new Date(toMs(next.at || 0)).toLocaleTimeString()}.` : "");
-        setConnection(pausedRef.current ? "Paused" : next.stale ? "Reconnecting" : "Live · 5s");
+        setConnection(pausedRef.current ? "Frozen" : next.stale ? "Reconnecting" : "Live · 5s");
       } else {
         setConnection("Reconnecting");
         setConnError(statusRef.current
@@ -1071,6 +1074,7 @@ export default function StatusPage() {
     return null;
   }, [run, directRunJobId, intakeJobs]);
   const runJobId = directRunJobId || matchedJob?.id || "";
+  useEffect(() => { setSettingsOpen(false); }, [runJobId]);
   const retryNow = useRetryClock(matchedJob?.notBefore || 0);
   const waitingRetry = matchedJob?.status === "queued" && (matchedJob.notBefore || 0) > retryNow;
   const failures = buildFeed(run, issueOnly, (name) => STAGE_LABEL[name] || titleCase(name), waitingRetry ? `Retrying in ${retryCountdown(matchedJob!.notBefore!, retryNow)}` : undefined);
@@ -1087,9 +1091,12 @@ export default function StatusPage() {
   const isRunPaused = matchedJob
     ? Boolean(matchedJob.paused || String(matchedJob.status || "").toLowerCase() === "paused")
     : Boolean(run?.paused || String(run?.state || "").toLowerCase() === "paused");
+  const isRunPausing = !isRunPaused && Boolean(matchedJob?.pauseRequested);
+  const pausedWhere = (matchedJob?.pausedWhere || run?.pausedWhere || "") as string;
+  const pauseReason = isRunPaused ? String(matchedJob?.pauseReason || "") : "";
   const runEffectiveState = isRunPaused
     ? "paused"
-    : waitingRetry ? "retrying" : String(matchedJob?.status || run?.state || "idle").toLowerCase();
+    : isRunPausing ? "pausing" : waitingRetry ? "retrying" : String(matchedJob?.status || run?.state || "idle").toLowerCase();
   const isTerminalRun = ["completed", "done", "failed", "interrupted", "stopped", "cancelled"].includes(runEffectiveState);
   const advertisedControlActions = useMemo(() => {
     if (matchedJob && Array.isArray(matchedJob.controlActions)) {
@@ -1113,8 +1120,9 @@ export default function StatusPage() {
       ? advertisedControlActions.includes("pause")
       : runEffectiveState === "running" || runEffectiveState === "queued" || Boolean(run?.alive));
   const canResumeRun =
-    isRunPaused &&
-    (advertisedControlActions !== null ? advertisedControlActions.includes("resume") : true);
+    (isRunPaused || isRunPausing) &&
+    (advertisedControlActions !== null ? advertisedControlActions.includes("resume") : isRunPaused);
+  const canChangeSettings = Boolean(matchedJob && Array.isArray(matchedJob.actions) && matchedJob.actions.includes("settings"));
   const canStopRun =
     !isTerminalRun &&
     (advertisedControlActions !== null
@@ -1148,11 +1156,12 @@ export default function StatusPage() {
           return exists ? current.map((j) => (j.id === res.job.id ? res.job : j)) : [res.job, ...current];
         });
       }
+      const name = run?.title || run?.series || runJobId;
       setBanner(
         action === "pause"
-          ? `Paused ${run?.title || run?.series || runJobId}.`
+          ? res?.job?.pauseRequested && !res.job.paused ? `Pausing ${name} after the current step.` : `Paused ${name}.`
           : action === "resume"
-            ? `Resumed ${run?.title || run?.series || runJobId}.`
+            ? isRunPausing ? `Pause cancelled for ${name}.` : `Resumed ${name}.`
             : `Stopped ${run?.title || run?.series || runJobId}.`,
       );
       await refresh(true);
@@ -1172,17 +1181,17 @@ export default function StatusPage() {
       actions={(
         <div className="flex items-center gap-2">
           <span className="text-xs text-muted-foreground" role="status">{connection.startsWith("Live") ? "Live" : connection}</span>
-          <Tooltip label={paused ? "Resume updates" : "Pause updates"} side="bottom"><Button
+          <Tooltip label={paused ? "Unfreeze view" : "Freeze view"} side="bottom"><Button
             type="button"
             variant="outline"
             className="size-11 p-0"
             aria-pressed={paused}
-            aria-label={paused ? "Resume live updates" : "Pause live updates"}
+            aria-label={paused ? "Unfreeze view" : "Freeze view"}
             onClick={() => {
               const next = !paused;
               setPaused(next);
               pausedRef.current = next;
-              setConnection(next ? "Paused" : status?.stale ? "Reconnecting" : "Live · 5s");
+              setConnection(next ? "Frozen" : status?.stale ? "Reconnecting" : "Live · 5s");
               if (!next) void refresh(true);
             }}
           >
@@ -1229,11 +1238,19 @@ export default function StatusPage() {
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
                     {(status?.runs || []).length <= 1 ? <h3 className="text-2xl font-semibold tracking-[-0.015em]">{run.title || run.series || run.id}</h3> : null}
-                    <span className={cn("flex items-center gap-2 text-sm", waitingRetry ? "text-warning" : "text-muted-foreground")}><span className={cn("size-2 rounded-full", waitingRetry ? "bg-warning" : runEffectiveState === "running" ? "bg-info" : runEffectiveState === "failed" ? "bg-destructive" : "bg-border-strong")} aria-hidden />{titleCase(runEffectiveState)}{waitingRetry ? <span role="timer">{retryCountdown(matchedJob!.notBefore!, retryNow)}</span> : null}</span>
+                    <span className={cn("flex items-center gap-2 text-sm", waitingRetry ? "text-warning" : "text-muted-foreground")}><span className={cn("size-2 rounded-full", waitingRetry ? "bg-warning" : runEffectiveState === "running" ? "bg-info" : runEffectiveState === "failed" ? "bg-destructive" : runEffectiveState === "pausing" || runEffectiveState === "paused" ? "bg-warning" : "bg-border-strong")} aria-hidden /><span role="status" aria-live="polite">{isRunPausing ? "Pausing…" : titleCase(runEffectiveState)}</span>{waitingRetry ? <span role="timer">{retryCountdown(matchedJob!.notBefore!, retryNow)}</span> : null}</span>
                   </div>
                 </div>
                 <p className="text-sm text-muted-foreground tabular-nums">{run.completed ?? 0} of {run.total ?? 0} chapters</p>
               </div>
+              {isRunPausing ? (
+                <p className="mt-2 text-sm text-muted-foreground">Finishing the current step, then pausing.</p>
+              ) : isRunPaused && (pausedWhere || pauseReason) ? (
+                <div className="mt-2 text-sm">
+                  {pausedWhere ? <p>Paused at <span className="font-mono">{pausedWhere}</span></p> : null}
+                  {pauseReason ? <p className="mt-1 text-muted-foreground [overflow-wrap:anywhere]">{pauseReason}</p> : null}
+                </div>
+              ) : null}
               <div className="mt-4 h-2 overflow-hidden rounded-full bg-background" role="progressbar" aria-label="Completed chapters" aria-valuemin={0} aria-valuemax={Math.max(1, run.total || 1)} aria-valuenow={run.completed || 0}>
                 <i className="block h-full bg-primary" style={{ width: `${progress}%` }} />
               </div>
@@ -1247,13 +1264,13 @@ export default function StatusPage() {
                 ) : null}
                 {privileged && runJobId ? (
                   <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Active run controls">
-                    {isRunPaused ? (
-                      <Tooltip label="Resume" side="top"><Button
+                    {isRunPaused || isRunPausing ? (
+                      <Tooltip label={isRunPausing ? "Cancel pause" : "Resume"} side="top"><Button
                         type="button"
                         size="sm"
                         variant="outline"
                         className="size-11 p-0"
-                        aria-label="Resume run"
+                        aria-label={isRunPausing ? "Cancel pause" : "Resume run"}
                         disabled={!canResumeRun || Boolean(runControlBusy)}
                         onClick={() => void handleRunControl("resume")}
                       >
@@ -1272,6 +1289,18 @@ export default function StatusPage() {
                         <Pause className="size-[18px]" strokeWidth={1.75} aria-hidden />
                       </Button></Tooltip>
                     )}
+                    {canChangeSettings ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="min-h-11"
+                        disabled={Boolean(runControlBusy)}
+                        onClick={() => setSettingsOpen(true)}
+                      >
+                        Change settings
+                      </Button>
+                    ) : null}
                     {stopConfirm ? (
                       <div className="inline-flex flex-wrap items-center gap-1.5" role="group" aria-label="Confirm stop run">
                         <Button
@@ -1317,7 +1346,7 @@ export default function StatusPage() {
         </section>
 
         {controlError ? <ErrorNotice error={controlError.error} /> : null}
-        {run ? <LaneHealth run={run} /> : null}
+        {run ? <LaneHealth run={run} privileged={privileged} onLaneReset={() => void refresh(true)} /> : null}
 
         <section aria-labelledby="matrixHeading">
           <h2 id="matrixHeading" className="sr-section-label">Chapters</h2>
@@ -1654,6 +1683,17 @@ export default function StatusPage() {
 
         <span className="sr-only"><PollStamp updatedRef={updatedRef} /></span>
       </div>
+      <RunSettingsDialog
+        job={matchedJob}
+        open={settingsOpen && Boolean(matchedJob)}
+        privileged={privileged}
+        onClose={() => setSettingsOpen(false)}
+        onSaved={(saved, resumed) => {
+          if (saved?.id) setIntakeJobs((current) => current.map((j) => (j.id === saved.id ? saved : j)));
+          setBanner(resumed ? `Saved settings and resumed ${run?.title || run?.series || runJobId}.` : "Settings saved.");
+          void refresh(true);
+        }}
+      />
     </AppShell>
   );
 }

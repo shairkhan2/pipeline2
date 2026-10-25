@@ -215,6 +215,8 @@ export function blankRun(
     startedAt: p.startedAt,
     updatedAt: p.startedAt,
     state: 'running',
+    jobId: null,
+    pausedWhere: null,
     video,
     source,
     chapters: Object.fromEntries(chapters.map((ch) => [ch, { stages: {} }])),
@@ -296,6 +298,11 @@ export function observeLog(run: Run, text: string): void {
     }
     m = /^videos: (\d+) ok/.exec(line);
     if (m) run.state = line.includes('FAILED:') ? 'failed' : 'completed';
+    m = /^== PAUSED at (.+)$/.exec(line);
+    if (m) {
+      run.state = 'paused';
+      run.pausedWhere = m[1].trim();
+    }
   }
   const warningTokens = ['!!', 'DOWN:', 'fact_check: FAIL', 'UNGROUNDED'];
   run.events = text
@@ -361,13 +368,17 @@ export function enrichRun(run: Run, procs: Record<number, Run>, now: number, pat
   const p = procs[run.pid];
   const alive = Boolean(p && p.startTicks === run.startTicks && p.state !== 'Z');
   run.alive = alive;
+  run.jobId = typeof run.jobId === 'string' && run.jobId ? run.jobId : null;
+  run.pausedWhere = typeof run.pausedWhere === 'string' && run.pausedWhere ? run.pausedWhere : null;
   if (!alive && run.state === 'running') run.state = 'interrupted';
   // Final snapshots can outlive both their process and their last network call.
   if (!alive || run.state !== 'running') {
     run.activeCalls = {};
     for (const row of Object.values(run.chapters) as Run[]) {
       for (const stage of Object.values((row.stages || {}) as Record<string, Run>)) {
-        if (['running', 'queued', 'retrying'].includes(stage.state)) stage.state = 'interrupted';
+        if (['running', 'queued', 'retrying'].includes(stage.state)) {
+          stage.state = run.state === 'paused' ? 'paused' : 'interrupted';
+        }
       }
     }
   }

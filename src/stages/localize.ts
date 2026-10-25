@@ -30,6 +30,7 @@ import { resolveOutDir } from "../config/secretStore.js";
 import { PROMO_ALGO_VERSION } from "../contracts/hashes.js";
 import { call, laneSnapshotStatus, type ChatMessage } from "../llm/client.js";
 import { localizedSpeechText, synthesizeVertexTtsToFile, vertexTtsConfigFingerprint } from "../llm/vertexTts.js";
+import { scriptFileForEngine } from "../domain/runControl.js";
 import { normalizeCardAnimation } from "../intake/ingest.js";
 import { load as loadPromoBlock } from "../intake/promoBlock.js";
 import { detectActivePipelineRuns, flockFd, tryFlockFd, withSharedSeriesLock } from "../locks/seriesLock.js";
@@ -317,11 +318,6 @@ export function parseChapterSelection(spec: unknown, available: readonly string[
  * Source eligibility (read-only)
  * ------------------------------------------------------------------ */
 
-const SCRIPT_BY_ENGINE: Record<string, string> = {
-  eleven: "script_eleven.md",
-  elevenlabs: "script_eleven.md",
-  external: "script_voice.md",
-};
 const PANEL_EXTS = [".jpg", ".png", ".jpeg", ".webp"] as const;
 
 export interface SourceCheck {
@@ -363,7 +359,7 @@ function seriesEngine(sdir: string): string {
  * A leftover `script_voice.md` must not shadow `script.md` on an edge series.
  */
 export function engineScriptPath(outDir: string, ch: string, engine: string): string {
-  const name = SCRIPT_BY_ENGINE[engine] ?? "script.md";
+  const name = scriptFileForEngine(engine);
   const primary = path.join(outDir, ch, name);
   if (isRegularFile(primary)) return primary;
   // A legacy/renamed engine script is only a fallback when the engine-specific

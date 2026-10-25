@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 
 import { pyReprStr } from "../contracts/hashes.js";
 import { failClass, failureNote, type FailClass } from "../domain/failure.js";
+import { JOB_ID_ENV, PAUSE_FILE_ENV, RUN_PAUSED_EXIT_CODE, pauseFileFor } from "../domain/runControl.js";
 import { defaultStudioSettings, getStudioSettings, type StudioSettings } from "../config/studioConfig.js";
 import { resolveOutDir } from "../config/secretStore.js";
 import { seriesStyleSchema, ttsStyleSchema, STYLE_CATALOG, validationMessage } from '../config/seriesStyle.js';
@@ -126,6 +127,8 @@ export const MAX_LOG_TAIL_LINES = 80;
 export const ACTIVE_JOB_STATES = ["queued", "paused", "downloading", "ingesting", "running"] as const;
 export const RECOVERABLE_JOB_STATES = ["failed", "interrupted"] as const;
 export const CONTINUABLE_JOB_STATES = ["completed", "failed", "interrupted"] as const;
+/** States whose run settings may change: no run process is working on them. */
+export const SETTINGS_EDITABLE_JOB_STATES = ["queued", "paused", "failed", "interrupted"] as const;
 
 export const RENDER_QUALITIES = ["1080p", "720p"] as const;
 export type RenderQuality = (typeof RENDER_QUALITIES)[number];
@@ -1277,6 +1280,8 @@ function resetJobForRerun(job: JobRecord, note: string, env?: Env): JobRecord {
   job.progress = null;
   job.paused = false;
   job.stopRequested = false;
+  removePauseFile(job, env);
+  clearPauseFields(job);
   job.updatedAt = now;
   return job;
 }
@@ -2747,6 +2752,9 @@ function readJobLogTail(jobId: string, maxLines = MAX_LOG_TAIL_LINES, env?: Env)
   }
 }
 
+/** Job fields a settings edit may change while a worker holds an older snapshot. */
+const JOB_SETTINGS_KEYS = ["chapters", "runChapters", "renderLane", "renderQuality", "outroConfig", "tts", "visuals"] as const;
+
 function saveJob(job: JobRecord, env?: Env): JobRecord {
   return withJobMetaLock(env, () => {
     const jdir = jobsDir(env);
@@ -2756,6 +2764,12 @@ function saveJob(job: JobRecord, env?: Env): JobRecord {
       job.controlRevision = persisted.controlRevision;
       job.paused = persisted.paused;
       job.stopRequested = persisted.stopRequested;
+      job.pauseRequested = Boolean(persisted.pauseRequested);
+      // Settings edits (job PATCH, Series settings sync) also bump the revision.
+      for (const key of JOB_SETTINGS_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(persisted, key)) job[key] = persisted[key];
+      }
+      job.metaApplied = Boolean(job.metaApplied || persisted.metaApplied);
       if (persisted.stopRequested) {
         job.status = "interrupted";
         job.statusNote = persisted.statusNote;
@@ -2782,10 +2796,75 @@ function availableActions(job: JobRecord): string[] {
   if ((RECOVERABLE_JOB_STATES as readonly string[]).includes(st)) acts.push("retry");
   if ((CONTINUABLE_JOB_STATES as readonly string[]).includes(st)) acts.push("continue");
   // Live controls travel with the job so a client can render buttons from one field.
-  if (st === "paused" || (st === "running" && job.paused)) acts.push("resume");
+  // Resume on a running job cancels a pending pause request, or continues a SIGSTOP freeze.
+  if (resumable(job)) acts.push("resume");
   else if (st === "running") acts.push("pause");
   if (st === "running" || st === "downloading" || st === "ingesting" || st === "paused") acts.push("stop", "cancel");
+  if (st === "paused" || (RECOVERABLE_JOB_STATES as readonly string[]).includes(st)) acts.push("settings");
   return acts;
+}
+
+function resumable(job: JobRecord): boolean {
+  return job.status === "paused" || (job.status === "running" && Boolean(job.paused || job.pauseRequested));
+}
+
+function settingsEditable(job: JobRecord): boolean {
+  return (SETTINGS_EDITABLE_JOB_STATES as readonly string[]).includes(String(job.status));
+}
+
+function removePauseFile(job: JobRecord, env?: Env): void {
+  const recorded = typeof job.pauseFile === "string" && job.pauseFile ? job.pauseFile : null;
+  const own = JOB_ID_RE.test(String(job.id)) ? pauseFileFor(jobsDir(env), String(job.id)) : null;
+  for (const file of new Set([recorded, own])) {
+    if (!file) continue;
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // already gone
+    }
+  }
+}
+
+function writePauseFile(file: string, body: Record<string, unknown>): void {
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
+  fs.renameSync(tmp, file);
+}
+
+/** `{by, reason}` from a pause file, or null when it is missing or unreadable. */
+function readPauseFile(file: unknown): { by: string; reason: string | null } | null {
+  if (typeof file !== "string" || !file) return null;
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    if (!data || typeof data !== "object") return null;
+    return {
+      by: data.by === "auto" ? "auto" : "user",
+      reason: typeof data.reason === "string" && data.reason.trim() ? sanitizeLine(data.reason, 400) : null,
+    };
+  } catch {
+    return fs.existsSync(file) ? { by: "user", reason: null } : null;
+  }
+}
+
+function initialPauseFields(): JobRecord {
+  return { pauseRequested: false, pausedAt: null, pauseReason: null, pausedWhere: null, pauseFile: null, metaApplied: false };
+}
+
+function clearPauseFields(job: JobRecord): void {
+  job.pauseRequested = false;
+  job.pausedAt = null;
+  job.pauseReason = null;
+  job.pausedWhere = null;
+}
+
+export function controlActions(job: JobRecord): string[] {
+  const st = job.status;
+  if (st === "running") return resumable(job) ? ["resume", "stop", "cancel"] : ["pause", "stop", "cancel"];
+  if (st === "paused") return ["resume", "stop", "cancel", "settings"];
+  if (st === "queued") return ["pause", "stop"];
+  if ((RECOVERABLE_JOB_STATES as readonly string[]).includes(st)) return ["settings"];
+  return [];
 }
 
 function publicProgress(job: JobRecord): Record<string, unknown> | null {
@@ -2827,8 +2906,12 @@ export function publicJobView(job: JobRecord, includeLogs = true, env?: Env): Re
     autoRetry: job.autoRetry ?? null,
     failureDetail: job.failureDetail ? sanitizeLine(job.failureDetail, 500) : null,
     actions: availableActions(job),
-    controlActions: job.status === "paused" || (job.status === "running" && job.paused)
-      ? ["resume", "stop"] : ["queued", "running"].includes(job.status) ? ["pause", "stop"] : [],
+    controlActions: controlActions(job),
+    pauseRequested: Boolean(job.pauseRequested),
+    pausedAt: typeof job.pausedAt === "number" ? job.pausedAt : null,
+    pauseReason: job.pauseReason ? sanitizeLine(job.pauseReason, 400) : null,
+    pausedWhere: job.pausedWhere ? sanitizeLine(job.pausedWhere, 120) : null,
+    settingsEditable: settingsEditable(job),
     statusNote: sanitizeLine(job.statusNote || "") || null,
     sourceType: job.sourceType,
     sourceSummary: sanitizeLine(job.sourceSummary || ""),
@@ -2890,7 +2973,29 @@ function reconcileJobsLocked(jdir: string, env?: Env): JobRecord[] {
       // A dead recorded runPid means the pipeline run itself is gone even when
       // the worker that spawned it is still alive: the job can never progress.
       const runGone = job.runPid != null && !rAlive;
-      if ((!wAlive && !rAlive) || runGone) {
+      if (((!wAlive && !rAlive) || runGone) && (job.paused === true || job.pauseRequested === true)) {
+        // A paused run that died (a frozen run killed by a service restart, or a
+        // pause the worker never recorded) stays paused: the user chose to stop it.
+        const pf = readPauseFile(job.pauseFile);
+        appendJobLog(
+          String(job.id),
+          `RECONCILE: job kept paused (previous state=${state}, workerPid=${job.workerPid}, runPid=${job.runPid})`,
+          env,
+        );
+        job.status = "paused";
+        job.paused = true;
+        job.pauseRequested = false;
+        job.pausedAt = typeof job.pausedAt === "number" ? job.pausedAt : Date.now() / 1000;
+        if (!job.pauseReason) job.pauseReason = pf?.by === "auto" && pf.reason ? pf.reason : "Paused by user";
+        job.notBefore = null;
+        job.workerPid = null;
+        job.workerStartTicks = null;
+        job.runPid = null;
+        job.runStartTicks = null;
+        job.statusNote = "Paused (the run was restarted). Resume to continue.";
+        removePauseFile(job, env);
+        saveJob(job, env);
+      } else if ((!wAlive && !rAlive) || runGone) {
         const now = Date.now() / 1000;
         job.status = "interrupted";
         job.paused = false;
@@ -3237,6 +3342,7 @@ export async function enqueueJob(opts: EnqueueOptions = {}): Promise<Record<stri
         error: null,
         autoRetry: initialAutoRetry(env),
         logTail: [],
+        ...initialPauseFields(),
       };
       appendJobLog(
         jobId,
@@ -3345,6 +3451,7 @@ export async function createJob(opts: EnqueueOptions = {}): Promise<Record<strin
       workerPid: null, workerStartTicks: null, runPid: null, runStartTicks: null, error: null, logTail: [],
       outroConfig: opts.outroConfig ?? null,
       autoRetry: initialAutoRetry(env),
+      ...initialPauseFields(),
     };
     appendJobLog(current.id, `Extension queued: chapters=${spec}`, env);
     return saveJob(current, env);
@@ -3364,7 +3471,17 @@ function signalJobRun(job: JobRecord, signal: NodeJS.Signals): void {
 export function pauseJob(jobId: string, env?: Env): Record<string, unknown> {
   const job = withJobMetaLock(env, () => {
     const current = loadJob(jobId, env);
-    if (current.paused) return current;
+    if (current.paused || current.pauseRequested) return current;
+    if (current.status === "running" && typeof current.pauseFile === "string" && current.pauseFile) {
+      // Cooperative pause: the run stops at its next safe point and exits 75.
+      writePauseFile(current.pauseFile, { at: Date.now(), by: "user" });
+      current.pauseRequested = true;
+      current.controlRevision = Number(current.controlRevision || 0) + 1;
+      current.statusNote = "Pausing: finishing the current step…";
+      appendJobLog(String(current.id), "PAUSE requested by user (run stops at its next safe point)", env);
+      return saveJob(current, env);
+    }
+    // An older run without a pause file is frozen in place.
     if (current.status === "running") signalJobRun(current, "SIGSTOP");
     else if (current.status === "queued") current.status = "paused";
     else throw new ConflictError("Only queued or running jobs can be paused");
@@ -3379,13 +3496,34 @@ export function pauseJob(jobId: string, env?: Env): Record<string, unknown> {
 export function resumeJob(jobId: string, env?: Env): Record<string, unknown> {
   const job = withJobMetaLock(env, () => {
     const current = loadJob(jobId, env);
+    if (current.status === "running" && current.pauseRequested && !current.paused) {
+      removePauseFile(current, env);
+      current.pauseRequested = false;
+      current.controlRevision = Number(current.controlRevision || 0) + 1;
+      current.statusNote = "Pause cancelled";
+      appendJobLog(String(current.id), "PAUSE cancelled by user", env);
+      return saveJob(current, env);
+    }
     if (!current.paused && current.status !== "paused") throw new ConflictError("Job is not paused");
-    if (current.status === "running") signalJobRun(current, "SIGCONT");
-    else if (current.status === "paused") current.status = "queued";
-    else throw new ConflictError("This job cannot be resumed");
+    if (current.status === "running") {
+      signalJobRun(current, "SIGCONT");
+      current.statusNote = "Resumed by user";
+    } else if (current.status === "paused") {
+      current.status = "queued";
+      // A paused auto-retry keeps its backoff; a run that paused resumes now.
+      if (current.pausedAt != null) current.notBefore = null;
+      if (current.reachedRunning || current.runProcessGroup != null) {
+        // Continue from saved work: finished chapters skip, nothing is re-imported.
+        current.onlyUnrendered = true;
+        current.skipIngest = true;
+      }
+      removePauseFile(current, env);
+      current.statusNote = "Resumed; continuing from saved work";
+      appendJobLog(String(current.id), "RESUME: queued to continue from saved work", env);
+    } else throw new ConflictError("This job cannot be resumed");
     current.paused = false;
+    clearPauseFields(current);
     current.controlRevision = Number(current.controlRevision || 0) + 1;
-    current.statusNote = "Resumed by user";
     return saveJob(current, env);
   });
   if (job.status === "queued") spawnWorkerIfNeeded(REPO_ROOT, env);
@@ -3402,6 +3540,8 @@ export function stopJob(jobId: string, env?: Env): Record<string, unknown> {
     } else if (current.status !== "queued" && current.status !== "paused") {
       throw new ConflictError("Only queued, paused or running jobs can be stopped");
     }
+    removePauseFile(current, env);
+    clearPauseFields(current);
     current.stopRequested = true;
     current.notBefore = null;
     current.paused = false;
@@ -3539,6 +3679,7 @@ export async function executeSingleJob(
   let ingestedNames: string[] = [];
   // Hash of the archive retained in this execution, if retention succeeded.
   let retainedSha256: string | null = null;
+  const metaWasApplied = Boolean(job.metaApplied);
 
   try {
     // Job metadata is untrusted: never follow a symlinked staging path (or parent).
@@ -3595,7 +3736,9 @@ export async function executeSingleJob(
         );
       }
       // Extension/resume jobs never ingest, so persist their visual choice before the run.
-      const jobVisuals = job.visuals || {};
+      // Once applied, later Series settings edits own meta.json: never re-apply on resume.
+      const applyMeta = !metaWasApplied;
+      const jobVisuals = applyMeta ? job.visuals || {} : {};
       const background = String(jobVisuals.background || "").trim().toLowerCase();
       const motion = String(jobVisuals.motion || "").trim().toLowerCase();
       if (background || motion) {
@@ -3608,7 +3751,7 @@ export async function executeSingleJob(
       }
       // A newly selected TTS voice/provider must reach the extended chapters too:
       // `meta.json` is what the audio stage reads, so persist it under the series lock.
-      const jobTtsMeta = job.tts && typeof job.tts.metaTts === "object" && job.tts.metaTts
+      const jobTtsMeta = applyMeta && job.tts && typeof job.tts.metaTts === "object" && job.tts.metaTts
         ? job.tts.metaTts as Record<string, unknown>
         : null;
       if (jobTtsMeta && Object.keys(jobTtsMeta).length > 0) {
@@ -3817,7 +3960,7 @@ export async function executeSingleJob(
           "Re-enable it in lane settings or start a new job that inherits the global policy.",
       );
     }
-    if (job.visuals && typeof job.visuals === "object") {
+    if (!metaWasApplied && job.visuals && typeof job.visuals === "object") {
       withExclusiveSeriesLock(sdir, { seriesRoot: sRoot, nonblocking: true }, () => {
         const metaPath = path.join(sdir, "meta.json");
         if (lexists(metaPath) && fs.lstatSync(metaPath).isSymbolicLink()) {
@@ -3836,6 +3979,8 @@ export async function executeSingleJob(
         }
       });
     }
+    // meta.json now holds this job's tts and visuals (from ingest or the resume merge above).
+    job.metaApplied = true;
     let pEnv: Env;
     try {
       pEnv = buildPipelineEnv(repoRoot, env);
@@ -3885,6 +4030,14 @@ export async function executeSingleJob(
       cmd = defaultRunCommand(repoRoot, pEnv, slug, runNames, String(job.chapters ?? "all"), Boolean(runChapters));
     }
 
+    // A stale request from an earlier run must not pause this one at its first safe point.
+    const pauseFile = pauseFileFor(jdir, jobId);
+    removePauseFile({ ...job, pauseFile }, env);
+    pEnv[PAUSE_FILE_ENV] = pauseFile;
+    pEnv[JOB_ID_ENV] = jobId;
+    job.pauseFile = pauseFile;
+    job.pauseRequested = false;
+    job.reachedRunning = true;
     job.status = "running";
     job.statusNote = `Running full pipeline (${runNames.length} chapter(s), video lane on)…`;
     job.progress = { phase: "pipeline", chapter: null, chapterIndex: 0, chapterTotal: runNames.length };
@@ -3893,6 +4046,7 @@ export async function executeSingleJob(
 
     let lastSave = performance.now();
     let lastErr: string | null = null;
+    let pausedWhere: string | null = null;
     const runStartedAt = Date.now() / 1000;
     const proc = spawn(cmd[0]!, cmd.slice(1), {
       cwd: repoRoot,
@@ -3912,7 +4066,9 @@ export async function executeSingleJob(
       appendJobLog(jobId, clean, env);
       if (clean.includes("FAILED") || clean.includes("!!") || clean.includes("Error")) lastErr = clean;
       if (/!!\s+ch\d+\s+FAILED\b/.test(clean)) job.failureDetail = clean;
-      if (clean.startsWith("== ch")) {
+      const mPaused = /^== PAUSED at (.+)$/.exec(clean);
+      if (mPaused) pausedWhere = mPaused[1]!.trim().slice(0, 120) || null;
+      else if (clean.startsWith("== ch")) {
         job.statusNote = clean;
         const mCh = /^== (ch\d+)/.exec(clean);
         if (mCh && runNames.includes(mCh[1]!)) {
@@ -3957,7 +4113,42 @@ export async function executeSingleJob(
     job.runPid = null;
     job.runStartTicks = null;
     job.endedAt = Date.now() / 1000;
-    if (rc === 0) {
+    // Live controls decide how the exit is recorded: re-read them before the file goes.
+    const live = loadJobFile(path.join(jdir, `${jobId}.json`));
+    const pauseInfo = readPauseFile(pauseFile);
+    const pauseAsked = Boolean(live?.pauseRequested || job.pauseRequested || pauseInfo);
+    job.stopRequested = Boolean(job.stopRequested || live?.stopRequested);
+    removePauseFile(job, env);
+    if (live) {
+      // Keep settings saved during the run, then outrank the record so the exit state wins.
+      for (const key of JOB_SETTINGS_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(live, key)) job[key] = live[key];
+      }
+      job.metaApplied = Boolean(job.metaApplied || live.metaApplied);
+      job.controlRevision = Math.max(Number(live.controlRevision || 0), Number(job.controlRevision || 0)) + 1;
+    }
+    job.pauseRequested = false;
+    const pausedOnError = rc !== 0 && rc !== RUN_PAUSED_EXIT_CODE && pauseAsked && !job.stopRequested;
+    if ((rc === RUN_PAUSED_EXIT_CODE || pausedOnError) && !job.stopRequested) {
+      const now = Date.now() / 1000;
+      job.status = "paused";
+      job.paused = true;
+      job.pausedAt = now;
+      job.pauseReason = pauseInfo?.by === "auto" && pauseInfo.reason ? pauseInfo.reason : "Paused by user";
+      job.pausedWhere = pausedWhere;
+      job.notBefore = null;
+      job.workerPid = null;
+      job.workerStartTicks = null;
+      job.endedAt = null;
+      if (pausedOnError) {
+        const short = sanitizeLine(lastErr || `Pipeline run exited with code ${rc}`, 160);
+        job.statusNote = `Paused. The run stopped on an error first: ${short}. Resume to try again.`;
+        appendJobLog(jobId, `STAGE paused: rc=${rc} with a pause requested (${short})`, env);
+      } else {
+        job.statusNote = `Paused at ${pausedWhere || "a safe point"}. Change settings if you want, then Resume.`;
+        appendJobLog(jobId, `STAGE paused: pipeline stopped at ${pausedWhere || "a safe point"} (rc=${rc})`, env);
+      }
+    } else if (rc === 0) {
       job.status = "completed";
       job.progress = { phase: "done", chapterIndex: runNames.length, chapterTotal: runNames.length };
       job.statusNote = `Completed ${runNames.length} chapter(s).`;
@@ -4009,6 +4200,8 @@ export async function executeSingleJob(
     job.runPid = null;
     job.runStartTicks = null;
     job.endedAt = Date.now() / 1000;
+    removePauseFile(job, env);
+    job.pauseRequested = false;
     job.status = "failed";
     job.error = sanitizeLine(err, 400);
     job.statusNote = `Failed: ${job.error}`;
@@ -4412,6 +4605,135 @@ function argValue(argv: string[], flag: string): string {
 
 function hasFlag(argv: string[], flag: string): boolean {
   return argv.includes(flag);
+}
+
+/**
+ * After a Series settings save, align the series' queued, paused, failed and
+ * interrupted jobs, so a resumed run keeps the new settings instead of
+ * re-applying the job's originals. Returns the number of jobs updated.
+ */
+export function syncSeriesJobsAfterSettings(
+  slug: string,
+  change: { tts?: Record<string, unknown> | null; visuals?: Record<string, unknown> | null },
+  env?: Env,
+): number {
+  const jdir = jobsDir(env);
+  if (!isDir(jdir)) return 0;
+  const tts = change.tts && typeof change.tts === "object" && !Array.isArray(change.tts) ? change.tts : null;
+  const visuals = change.visuals && typeof change.visuals === "object" && !Array.isArray(change.visuals)
+    ? change.visuals : null;
+  return withJobMetaLock(env, () => {
+    let updated = 0;
+    for (const name of fs.readdirSync(jdir).filter((n) => n.endsWith(".json")).sort()) {
+      const job = loadJobFile(path.join(jdir, name));
+      if (!job || job.slug !== slug || !settingsEditable(job)) continue;
+      job.metaApplied = true;
+      if (tts) job.tts = { ...jobTtsFromMeta(job.tts, tts, env), metaTts: { ...tts } };
+      if (visuals) job.visuals = { ...visuals };
+      job.controlRevision = Number(job.controlRevision || 0) + 1;
+      appendJobLog(
+        String(job.id),
+        `SETTINGS: series settings changed (${[tts ? "tts" : "", visuals ? "visuals" : ""].filter(Boolean).join(", ") || "meta"}); resume keeps them`,
+        env,
+      );
+      saveJob(job, env);
+      updated += 1;
+    }
+    return updated;
+  });
+}
+
+/** Job-level provider/voice fields that describe a series' `meta.tts`. */
+function jobTtsFromMeta(prev: unknown, tts: Record<string, unknown>, env?: Env): Record<string, unknown> {
+  const old = prev && typeof prev === "object" && !Array.isArray(prev) ? prev as Record<string, unknown> : {};
+  const engine = String(tts.engine || "edge").trim().toLowerCase() || "edge";
+  const voiceId = String(tts.voice_id || "").trim();
+  const providerId = ttsProviderIdFromMeta(tts, env)
+    ?? (engine === "external" && tts.provider ? String(tts.provider) : engine);
+  let provider: RawTtsProvider | undefined;
+  try {
+    provider = loadRawTtsProviders(env).find((p) => p.id === providerId);
+  } catch {
+    provider = undefined;
+  }
+  const voice = provider?.voices.find((v) => v.id === voiceId);
+  const sameVoice = old.providerId === providerId && old.voiceId === voiceId;
+  return {
+    ...old,
+    providerId,
+    providerLabel: provider?.label ?? (sameVoice ? old.providerLabel : providerId),
+    engine,
+    voiceId: voiceId || (sameVoice ? old.voiceId : ""),
+    voiceLabel: voice?.label ?? (sameVoice && old.voiceLabel ? old.voiceLabel : voiceId),
+  };
+}
+
+export interface JobSettingsPatch {
+  chapters?: string;
+  renderLane?: string;
+  renderQuality?: RenderQuality | null;
+  outroConfig?: EnqueueOptions["outroConfig"] | null;
+}
+
+/**
+ * Change a job's run settings while no run works on it. The next run recomputes
+ * its chapter list from the new spec; finished chapters still skip.
+ */
+export function updateJobSettings(
+  jobId: string,
+  patch: JobSettingsPatch,
+  opts: { env?: Env; repoRoot?: string } = {},
+): Record<string, unknown> {
+  const env = resolveEnv(opts.env);
+  const repoRoot = opts.repoRoot || REPO_ROOT;
+  const has = (key: keyof JobSettingsPatch) => Object.prototype.hasOwnProperty.call(patch, key) && patch[key] !== undefined;
+  const spec = has("chapters") ? validateChaptersSpec(patch.chapters) : null;
+  const lane = has("renderLane") ? resolveRequestedRenderLane(patch.renderLane, env, repoRoot) : null;
+  if (has("renderQuality") && patch.renderQuality !== null && normalizeRenderQuality(patch.renderQuality) === null) {
+    throw new IntakeError(`Invalid renderQuality (allowed: ${RENDER_QUALITIES.join(", ")})`);
+  }
+  const job = withJobMetaLock(env, () => {
+    reconcileJobs(env);
+    const current = loadJob(jobId, env);
+    if (!settingsEditable(current) || isPidAlive(current.runPid, current.runStartTicks)) {
+      throw new ConflictError("Pause the run first.");
+    }
+    const changed: string[] = [];
+    if (spec !== null) {
+      const sdir = path.join(seriesRoot(env), String(current.slug));
+      const onDisk = existingChapterNumbers(sdir);
+      const requested = spec === "all" ? [] : parseChapterSpec(spec, []);
+      if (spec !== "all" && !requested.length) throw new IntakeError(`Chapter selection ${pyReprStr(spec)} matched no chapters`);
+      if (current.skipIngest) {
+        const missing = (spec === "all" ? [] : requested).filter((n) => !onDisk.includes(n));
+        if (missing.length || !onDisk.length) {
+          throw new IntakeError(
+            `Chapter(s) ${missing.map((n) => `ch${n}`).join(", ") || spec} are not extracted yet; use Continue to import them.`,
+          );
+        }
+      }
+      current.chapters = spec;
+      current.runChapters = spec === "all" ? null : requested;
+      changed.push(`chapters=${spec}`);
+    }
+    if (lane !== null) {
+      current.renderLane = lane;
+      changed.push(`renderLane=${lane}`);
+    }
+    if (has("renderQuality")) {
+      current.renderQuality = patch.renderQuality === null ? null : normalizeRenderQuality(patch.renderQuality);
+      changed.push(`renderQuality=${current.renderQuality ?? "studio default"}`);
+    }
+    if (has("outroConfig")) {
+      current.outroConfig = patch.outroConfig ?? null;
+      changed.push(`outro=${current.outroConfig?.enabled ? "on" : "off"}`);
+    }
+    if (!changed.length) return current;
+    current.controlRevision = Number(current.controlRevision || 0) + 1;
+    appendJobLog(String(current.id), `SETTINGS: job run settings changed (${changed.join(", ")})`, env);
+    return saveJob(current, env);
+  });
+  return publicJobView(job, true, env);
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {

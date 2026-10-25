@@ -1905,7 +1905,7 @@ describe('intake job failure, retry, crash and reconciliation', () => {
     const failed = jobFile(env, id);
     expect(failed.status).toBe('failed');
     expect(String(failed.error)).toContain('exited with code 137');
-    expect(intake.publicJobView(failed, false, env as never).actions).toEqual(['retry', 'continue']);
+    expect(intake.publicJobView(failed, false, env as never).actions).toEqual(['retry', 'continue', 'settings']);
   });
 
   it('a successful runner completes the job and keeps the chapter progress', async () => {

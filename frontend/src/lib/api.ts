@@ -228,11 +228,23 @@ export interface SeriesSettings {
   styleOptions: StyleOptions;
   /** Read-only, from meta.tts.engine. */
   ttsEngine?: string | null;
+  narration?: SeriesNarration;
+  /** Set while a live pipeline process holds the series; narration cannot change then. */
+  narrationLocked?: string | null;
 }
+export interface SeriesNarration { provider: string | null; voice: string | null; model: string | null }
 export interface SeriesSettingsPatch {
   style?: Partial<Record<keyof SeriesStyle, string | null>>;
   tts?: { voice_id?: string | null; model_id?: string | null; speed?: number | null; style?: string | null; language?: string | null };
   visuals?: { background?: string; motion?: string; animation?: CardAnimation | null };
+  narration?: { provider: string; voice: string; model?: string | null };
+}
+/** Body of PATCH /api/intake/jobs/:id/settings. Every field optional. */
+export interface JobRunSettingsPatch {
+  chapters?: string;
+  renderLane?: string;
+  renderQuality?: string;
+  outroConfig?: OutroConfigInput;
 }
 
 export interface IntakeCatalog {
@@ -1201,6 +1213,12 @@ export const api = {
         (res) => ({ ...res, job: parseIntakeJob(res?.job ?? res) }),
       );
     },
+    /** Run settings of a queued, paused, failed or interrupted job. A running job gets 409. */
+    updateJobSettings(id: string, patch: JobRunSettingsPatch): Promise<JobRecord> {
+      return request<unknown>(`/api/intake/jobs/${enc(id)}/settings`, { method: "PATCH", body: patch }).then((res) =>
+        parseIntakeJob(res && typeof res === "object" && "job" in res && (res as { job?: unknown }).job ? (res as { job: unknown }).job : res),
+      );
+    },
     cancelJob(id: string): Promise<{ ok?: boolean; job: JobRecord }> {
       return request<{ ok?: boolean; job: JobRecord }>(`/api/intake/jobs/${enc(id)}/stop`, { method: "POST", body: {} }).then(
         (res) => ({ ...res, job: parseIntakeJob(res?.job ?? res) }),
@@ -1456,6 +1474,10 @@ export const api = {
   },
 
   studio: {
+    /** Clears a lane cooldown in running runs and in the server. */
+    resetLane(lane: string): Promise<{ ok: boolean; lane: string; at: number }> {
+      return request("/api/studio/lanes/reset", { method: "POST", body: { lane } });
+    },
     catalog(): Promise<StudioCatalog> {
       return request<StudioCatalog>("/api/studio/catalog").then((cat) =>
         cat && cat.prompts ? { ...cat, prompts: normalizePromptsState(cat.prompts) } : cat,

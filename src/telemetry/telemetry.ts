@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { failureNote } from '../domain/failure.js';
+import { JOB_ID_ENV } from '../domain/runControl.js';
 
 export type StageState =
   | 'running'
@@ -174,6 +175,8 @@ export function start(series: string, chapters: string[], video = false, caption
       startedAt: now(),
       state: 'running',
       series,
+      jobId: String(process.env[JOB_ID_ENV] ?? '').trim() || null,
+      pausedWhere: null,
       video,
       captionVersion,
       chapters: Object.fromEntries(chapters.map((ch) => [ch, { stages: {} } as ChapterEntry])),
@@ -368,6 +371,18 @@ export function finish(success = true): void {
     data.state = success ? 'completed' : 'failed';
     data.endedAt = now();
     event('Run ' + data.state, success ? 'info' : 'error');
+    write();
+  });
+}
+
+/** The run stopped at a safe point because a pause was requested. */
+export function paused(where: string): void {
+  safe(() => {
+    if (!data) return;
+    data.state = 'paused';
+    data.pausedWhere = where;
+    data.endedAt = now();
+    event(`Run paused at ${where}`, 'info');
     write();
   });
 }

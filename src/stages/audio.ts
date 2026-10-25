@@ -38,6 +38,7 @@ import {
 } from "../contracts/hashes.js";
 import { stageCurrent } from "../telemetry/telemetry.js";
 import { failureNote, httpStatusOf, retryableHttpStatus } from "../domain/failure.js";
+import { checkpoint } from "../domain/runControl.js";
 import {
   findVertexTtsVoice,
   GEMINI_LOCALE_REQUEST_REV,
@@ -828,6 +829,19 @@ export function _lineFile(
   return [f, side];
 }
 
+/** Per-run narration options shared by the per-line TTS loops. */
+export interface NarrationLineOptions {
+  /** Chapter name, used only in the pause checkpoint label. */
+  chapter?: string;
+  /** elevenlabs only: strip inline tags from spoken text. Default: the model decides. */
+  stripTags?: boolean;
+}
+
+/** Pause safe point before synthesizing a line that is not cached yet. */
+function lineCheckpoint(engine: string, i: number, env: NodeJS.ProcessEnv, chapter?: string): void {
+  checkpoint(chapter ? `${engine} narration ${chapter} line ${i + 1}` : `${engine} narration line ${i + 1}`, env);
+}
+
 function loadGskKey(env: NodeJS.ProcessEnv): string {
   let key = env.GSK_API_KEY ?? "";
   if (!key) {
@@ -870,15 +884,18 @@ export async function ttsLinesEleven(
   tmpdirPath: string,
   voiceId: string,
   _outPrefix = "eleven",
+  opts: NarrationLineOptions & { env?: NodeJS.ProcessEnv } = {},
 ): Promise<Array<[number, number]>> {
   mkdirSync(tmpdirPath, { recursive: true });
   const spans: Array<[number, number]> = [];
   let t = 0;
   const env: NodeJS.ProcessEnv = { ...process.env, GSK_API_KEY: loadGskKey(process.env) };
+  const pauseEnv = opts.env ?? env;
   for (let i = 0; i < lines.length; i++) {
     const text = String(lines[i]![0]);
     const [f, side] = _lineFile(tmpdirPath, i, text);
     if (!existsSync(f) || statSync(f).size < 600) {
+      lineCheckpoint("eleven", i, pauseEnv, opts.chapter);
       const pid = voiceId.length >= 16 && !voiceId.includes(" ")
         ? { custom_voice_id: voiceId, output_format: "mp3_44100_128" }
         : { speaker: voiceId, output_format: "mp3_44100_128" };
@@ -942,6 +959,7 @@ export async function ttsLinesExternal(
   tmpdirPath: string,
   meta: unknown,
   env?: NodeJS.ProcessEnv,
+  opts: NarrationLineOptions = {},
 ): Promise<Array<[number, number]>> {
   const cfg = _resolveExternalTtsConfig(meta, env ?? process.env);
   mkdirSync(tmpdirPath, { recursive: true });
@@ -957,6 +975,7 @@ export async function ttsLinesExternal(
     const [f, side] = _lineFile(tmpdirPath, i, text, proof);
     let d = existsSync(f) ? _probeDuration(f) : 0;
     if (d <= 0) {
+      lineCheckpoint("external", i, runEnv, opts.chapter);
       if (existsSync(f)) unlinkSync(f);
       if (existsSync(side)) unlinkSync(side);
       const tmpOut = join(tmpdirPath, `.line_${String(i).padStart(3, "0")}.${process.pid}.tmp.mp3`);
@@ -1080,6 +1099,7 @@ export async function ttsLinesVertex(
   meta: unknown,
   env?: NodeJS.ProcessEnv,
   localeHint?: string | null,
+  opts: NarrationLineOptions = {},
 ): Promise<Array<[number, number]>> {
   const m = meta !== null && typeof meta === "object" && !Array.isArray(meta)
     ? meta as Record<string, unknown>
@@ -1115,7 +1135,9 @@ export async function ttsLinesVertex(
     // A localized take speaks prose only: Vertex reads bracket controls
     // literally. The stored script keeps its controls; only synthesis input
     // changes, exactly like the locale Edge path.
-    const text = locale ? localizedSpeechText(raw) : raw;
+    // A tagged script reused from another engine group is stripped the same way;
+    // the English proof below holds the spoken text, so it never matches a tagged take.
+    const text = locale ? localizedSpeechText(raw) : opts.stripTags ? stripEmotionControls(raw) : raw;
     // English keeps the historical proof byte-for-byte. A localized proof also
     // carries the locale and the resolved model, so a Hindi take can never prove
     // an English line (or another model's line) even for a shared voice id.
@@ -1145,6 +1167,7 @@ export async function ttsLinesVertex(
     const [f, side] = _lineFile(tmpdirPath, i, raw, proof);
     let d = existsSync(f) ? _probeDuration(f) : 0;
     if (d <= 0) {
+      lineCheckpoint("vertex", i, runEnv, opts.chapter);
       if (existsSync(f)) unlinkSync(f);
       if (existsSync(side)) unlinkSync(side);
       const tmpOut = join(tmpdirPath, `.line_${String(i).padStart(3, "0")}.${process.pid}.tmp.mp3`);
@@ -1179,6 +1202,7 @@ export async function ttsLinesGrok(
   tmpdirPath: string,
   meta: unknown,
   env?: NodeJS.ProcessEnv,
+  opts: NarrationLineOptions = {},
 ): Promise<Array<[number, number]>> {
   const m = meta !== null && typeof meta === "object" && !Array.isArray(meta)
     ? meta as Record<string, unknown>
@@ -1200,7 +1224,8 @@ export async function ttsLinesGrok(
   const spans: Array<[number, number]> = [];
   let t = 0;
   for (let i = 0; i < lines.length; i++) {
-    const text = String(lines[i]![0]);
+    const raw = String(lines[i]![0]);
+    const text = opts.stripTags ? stripEmotionControls(raw) : raw;
     const proof = pyJsonDumps(
       { text, tts: { engine: "grok", voice: voiceId, speed: pyFloat(pyRound(speed, 4)) } },
       { sortKeys: true },
@@ -1208,6 +1233,7 @@ export async function ttsLinesGrok(
     const [f, side] = _lineFile(tmpdirPath, i, text, proof);
     let d = existsSync(f) ? _probeDuration(f) : 0;
     if (d <= 0) {
+      lineCheckpoint("grok", i, runEnv, opts.chapter);
       if (existsSync(f)) unlinkSync(f);
       if (existsSync(side)) unlinkSync(side);
       const tmpOut = join(tmpdirPath, `.line_${String(i).padStart(3, "0")}.${process.pid}.tmp.mp3`);
@@ -1242,6 +1268,7 @@ export async function ttsLinesElevenlabs(
   tmpdirPath: string,
   meta: unknown,
   env?: NodeJS.ProcessEnv,
+  opts: NarrationLineOptions = {},
 ): Promise<Array<[number, number]>> {
   const m = meta !== null && typeof meta === "object" && !Array.isArray(meta)
     ? meta as Record<string, unknown>
@@ -1266,6 +1293,7 @@ export async function ttsLinesElevenlabs(
     console.log(`   audio: elevenlabs speed ${requestedSpeed} clamped to ${speed} (allowed 0.7-1.2)`);
   }
   const keepTags = elevenLabsModelSupportsTags(modelId);
+  const strip = opts.stripTags ?? !keepTags;
   const runEnv = env ?? process.env;
   const onPoolWait = (info: { untilMs: number; reasons: Array<{ hint: string; reason: string }> }): void => {
     stageCurrent("audio", "retrying", {
@@ -1284,10 +1312,14 @@ export async function ttsLinesElevenlabs(
   let t = 0;
   for (let i = 0; i < lines.length; i++) {
     const raw = String(lines[i]![0]);
-    const text = keepTags ? raw : stripEmotionControls(raw);
+    const text = strip ? stripEmotionControls(raw) : raw;
+    // The model alone decides the default spoken text, which the historical proof
+    // implies. A choice that speaks something else records it, so the takes never mix.
+    const modelText = keepTags ? raw : stripEmotionControls(raw);
     const proof = pyJsonDumps(
       {
         text: raw,
+        ...(text === modelText ? {} : { spoken: text }),
         tts: { engine: "elevenlabs", voice: voiceId, model: modelId, speed: pyFloat(pyRound(speed, 4)) },
       },
       { sortKeys: true },
@@ -1295,6 +1327,7 @@ export async function ttsLinesElevenlabs(
     const [f, side] = _lineFile(tmpdirPath, i, raw, proof);
     let d = existsSync(f) ? _probeDuration(f) : 0;
     if (d <= 0) {
+      lineCheckpoint("elevenlabs", i, runEnv, opts.chapter);
       if (existsSync(f)) unlinkSync(f);
       if (existsSync(side)) unlinkSync(side);
       const tmpOut = join(tmpdirPath, `.line_${String(i).padStart(3, "0")}.${process.pid}.tmp.mp3`);
@@ -1345,7 +1378,7 @@ export function elevenLabsModelOf(meta: unknown): string {
 export async function ttsLines(
   lines: ReadonlyArray<readonly [string, unknown]>,
   tmpdirPath: string,
-  opts?: { voice?: string; rate?: string; locale?: string | null },
+  opts?: { voice?: string; rate?: string; locale?: string | null; env?: NodeJS.ProcessEnv } & NarrationLineOptions,
 ): Promise<[Array<[number, number]>, string, number]> {
   mkdirSync(tmpdirPath, { recursive: true });
   const voice = opts?.voice || VOICE;
@@ -1359,12 +1392,15 @@ export async function ttsLines(
   let t = 0;
   for (let i = 0; i < lines.length; i++) {
     const raw = String(lines[i]![0]);
-    const text = opts?.locale ? localizedSpeechText(raw) : raw;
+    const stripped = !opts?.locale && opts?.stripTags === true;
+    const text = opts?.locale ? localizedSpeechText(raw) : stripped ? stripEmotionControls(raw) : raw;
     // The sidecar proves the exact text AND voice/rate: a cached line from a
     // previous voice must not be reused after the series voice changes.
-    const proof = `${localeTag}${voice}|${rate}|${raw}`;
+    // A stripped English line proves its spoken text, never the tagged one.
+    const proof = `${localeTag}${voice}|${rate}|${stripped ? `strip-v1|${text}` : raw}`;
     const [f, side] = _lineFile(tmpdirPath, i, raw, proof);
     if (!(existsSync(f) && statSync(f).size > 500)) {
+      lineCheckpoint("edge", i, opts?.env ?? process.env, opts?.chapter);
       await _edgeLine(text, f, 3, voice, rate);
       writeFileSync(side, proof, "utf8");
     }

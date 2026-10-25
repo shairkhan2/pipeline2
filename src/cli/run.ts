@@ -58,6 +58,12 @@ import {
 } from "../contracts/hashes.js";
 import * as promoBlockMod from "../intake/promoBlock.js";
 import { failClass } from "../domain/failure.js";
+import {
+  RUN_PAUSED_EXIT_CODE,
+  checkpoint,
+  chooseChapterScript,
+  isRunPausedError,
+} from "../domain/runControl.js";
 import { LANES, log, pagesIn } from "../llm/client.js";
 import { withSharedSeriesLock } from "../locks/seriesLock.js";
 import * as factCheckMod from "../stages/factCheck.js";
@@ -82,7 +88,7 @@ import {
 } from "../stages/writer.js";
 import * as telemetry from "../telemetry/telemetry.js";
 import * as renderlaneMod from "../workers/renderlane.js";
-import { RenderQueue, type VideoResult } from "../workers/renderlane.js";
+import { RenderQueue, resetVideoPause, videoPauseWhere, type VideoResult } from "../workers/renderlane.js";
 
 export const DOC = `Orchestrator - the pipeline is SERIES-AGNOSTIC; this file is the only place paths live.
 
@@ -782,6 +788,7 @@ export async function _runLocked(
     },
   });
   let vt: Promise<void> | null = null;
+  resetVideoPause();
   let videoWorkerError: string | null = null;
   /** Drain chapters still queued after the worker died so vq.join() can resolve. */
   const failQueuedVideoChapters = (): void => {
@@ -826,10 +833,17 @@ export async function _runLocked(
 
   const results: Array<[string, "ok" | "failed"]> = [];
   let halted: string | null = null;
+  // Where a pause request stopped the script lane (null = not paused).
+  let pausedAt: string | null = null;
+  const eligible: string[] = [];
 
   for (const ch of chs) {
-    if (halted) {
-      break; // chain policy: a hard failure stops the WHOLE run
+    if (halted || pausedAt) {
+      break; // chain policy: a hard failure stops the WHOLE run; a pause stops queuing
+    }
+    if (video && videoPauseWhere() !== null) {
+      pausedAt = videoPauseWhere();
+      break; // the video lane paused: take no further chapters
     }
     const chdir = path.join(sdir, ch);
     if (!isDirectory(chdir)) {
@@ -846,10 +860,12 @@ export async function _runLocked(
       console.log(`skip ${ch}: before episode 1 (${startCh}) - context only`);
       continue;
     }
+    eligible.push(ch);
 
     let scriptStage = "reader";
     for (let attempt = 0; attempt <= RETRY_ROUNDS; attempt++) {
       try {
+        checkpoint(`${ch} start`);
         if (attempt > 0) _hooks.telemetry.stage(ch, scriptStage, "queued");
         scriptStage = "reader";
         const tag = attempt === 0 ? "" : ` (retry ${attempt}/${RETRY_ROUNDS})`;
@@ -903,10 +919,12 @@ export async function _runLocked(
             const nextDir = path.join(sdir, next);
             const nextN = Number.parseInt(/\d+/.exec(next)?.[0] ?? "0", 10);
             if (!isDirectory(nextDir) || nextN < startN) continue;
+            checkpoint(`${next} read-ahead`);
             try {
               await _hooks.readChapter(nextDir, out, false, keepStale, aheadCast, cv);
               console.log(`   read-ahead: ${next} ready for the writer's look-ahead`);
             } catch (e) {
+              if (isRunPausedError(e)) throw e;
               const msg = e instanceof Error ? e.message : String(e);
               process.stderr.write(`   read-ahead: ${next} skipped (${msg.slice(0, 160)})\n`);
             }
@@ -988,6 +1006,7 @@ export async function _runLocked(
           : external
             ? "v2 EMOTION-TAGGED for external voice"
             : "one shot";
+        checkpoint(`${ch} writer`);
         console.log(`== ${ch}: WRITER (${writerModeLabel})`);
         scriptStage = "writer";
         _hooks.telemetry.stage(ch, "writer");
@@ -1001,6 +1020,17 @@ export async function _runLocked(
             ? "script_voice.md"
             : "script.md";
         const scriptTarget = path.join(cdir, scriptName);
+        // An engine switch keeps the chapter's existing script: another engine
+        // group's file is reused instead of paying for a new writer call.
+        let existingScript: string | null = fs.existsSync(scriptTarget) ? scriptTarget : null;
+        let reusedScript = false;
+        if (!force && existingScript === null) {
+          const choice = chooseChapterScript(cdir, engine);
+          if (choice.fallback) {
+            existingScript = choice.path;
+            reusedScript = true;
+          }
+        }
 
         // EP1 OPENING
         const movieMode =
@@ -1032,7 +1062,7 @@ export async function _runLocked(
 
         const block = _hooks.promoBlock.ensure(sdir, out); // I-19: mechanical, built once, cached
         let repair = false;
-        if (!force && fs.existsSync(scriptTarget)) {
+        if (!force && existingScript !== null) {
           const rp0 = path.join(cdir, "report.json");
           let holesPrev: string[] = [];
           try {
@@ -1067,7 +1097,7 @@ export async function _runLocked(
         // chapter's last lines instead of opening a new episode.
         let movieShape: import("../stages/storyWriter.js").StoryShape | undefined;
         let movieArc = "";
-        const willWrite = force || repair || !fs.existsSync(scriptTarget);
+        const willWrite = force || repair || existingScript === null;
         if (willWrite && movieMode) {
           const all = chaptersIn(sdir).filter((c) => (Number.parseInt(/\d+/.exec(c)?.[0] ?? "0", 10) || 0) >= startN);
           const mplan = await ensureMoviePlan(out, { chapters: all, events: (c) => writerMod._obsEvents(out, c) }, {
@@ -1092,7 +1122,7 @@ export async function _runLocked(
         writerMod.setLastWindow("");
 
         let script: string;
-        if (force || repair || !fs.existsSync(scriptTarget)) {
+        if (force || repair || existingScript === null) {
           script = await _hooks.writeScript(
             obs as unknown as ObsLike,
             bible as unknown as BibleLike,
@@ -1114,7 +1144,7 @@ export async function _runLocked(
             fs.writeFileSync(scriptTarget, script);
           }
         } else {
-          script = fs.readFileSync(scriptTarget, "utf8");
+          script = fs.readFileSync(existingScript, "utf8");
           const hasNarration = pySplitLines(script).some(
             (l) => pyStrip(l) && !pyLstrip(l).startsWith("#"),
           );
@@ -1141,10 +1171,14 @@ export async function _runLocked(
               fs.writeFileSync(scriptTarget, script);
             }
           } else {
-            console.log("   script exists - reusing (--force to rewrite)");
+            if (reusedScript) {
+              console.log(`   writer: reusing ${path.basename(existingScript)} for engine ${engine}`);
+            } else {
+              console.log("   script exists - reusing (--force to rewrite)");
+            }
             if (opening && !script.includes("## BEAT b00_opening")) {
               script = _withHook(script, op);
-              fs.writeFileSync(scriptTarget, script);
+              fs.writeFileSync(existingScript, script);
               console.log("   EP1 opening: hook injected as beat 1 (cached script)");
             }
           }
@@ -1166,6 +1200,7 @@ export async function _runLocked(
         }
 
         _hooks.telemetry.stage(ch, "writer", "done");
+        checkpoint(`${ch} check`);
         scriptStage = "check";
         _hooks.telemetry.stage(ch, "check");
 
@@ -1268,6 +1303,12 @@ export async function _runLocked(
         }
         break; // success: leave the retry loop
       } catch (e) {
+        if (isRunPausedError(e)) {
+          // A pause is never a chapter failure: no CHAPTERFAIL, no report, no retry.
+          pausedAt = e.where;
+          _hooks.telemetry.stage(ch, scriptStage, "queued", { note: "Paused" });
+          break;
+        }
         const cls = failClass(e);
         const errMsg = e instanceof Error ? e.message : String(e);
         process.stderr.write(`  !! ${ch} FAILED (${cls}): ${errMsg.slice(0, 200)}\n`);
@@ -1376,6 +1417,19 @@ export async function _runLocked(
     }
     if (vbad.length > 0) {
       bad = [...new Set([...bad, ...vbad])].sort(cmpCodePoints);
+    }
+  }
+
+  const pauseWhere = pausedAt ?? (video ? videoPauseWhere() : null);
+  if (pauseWhere !== null && !halted && bad.length === 0) {
+    const okSet = new Set(ok);
+    const allFinished = eligible.every(
+      (c) => okSet.has(c) && (!video || vresults[c]?.status === "video-ok"),
+    );
+    if (!allFinished) {
+      console.log(`== PAUSED at ${pauseWhere}`);
+      _hooks.telemetry.paused(pauseWhere);
+      return RUN_PAUSED_EXIT_CODE;
     }
   }
 
@@ -1677,7 +1731,24 @@ function isMainModule(): boolean {
   }
 }
 
+/** Stop (SIGTERM) and Ctrl-C exit with 143 and 130, so telemetry marks the run interrupted. */
+export function _installSignalHandlers(proc: NodeJS.Process = process): void {
+  let stopping = false;
+  const onSignal = (code: number): void => {
+    if (stopping) {
+      proc.exit(code); // second signal during shutdown: leave at once
+      return;
+    }
+    stopping = true;
+    proc.exitCode = code;
+    proc.exit(code);
+  };
+  proc.on("SIGTERM", () => onSignal(143));
+  proc.on("SIGINT", () => onSignal(130));
+}
+
 if (isMainModule()) {
+  _installSignalHandlers();
   main(process.argv.slice(2)).then(
     (code) => {
       process.exit(code);

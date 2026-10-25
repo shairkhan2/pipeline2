@@ -29,7 +29,9 @@ import {
   retryJob,
   sanitizeLine,
   spawnWorkerIfNeeded,
+  updateJobSettings,
   type EnqueueOptions,
+  type JobSettingsPatch,
 } from '../intake/intake.js';
 import { PREVIEW_DIR_NAME, generatePreview } from '../intake/voicePreview.js';
 import { FORBIDDEN_FIELDS, checkForbiddenKeys, readJsonBody, verifyCsrf } from './lanes.js';
@@ -348,6 +350,76 @@ export async function handleIntakeRoute(
     } catch (err) {
       const mapped = errorStatus(err, 400);
       return sendJson(res, mapped.status, { error: mapped.error || 'Job lookup failed' });
+    }
+  }
+
+  if (pathname.startsWith('/api/intake/jobs/') && req.method === 'PATCH') {
+    const rest = pathname.slice('/api/intake/jobs/'.length);
+    const m = /^(job-\d+-[a-f0-9]+)\/settings$/.exec(rest);
+    if (!m) {
+      req.resume();
+      if (/^[^/]+\/settings$/.test(rest)) return sendJson(res, 400, { error: 'Invalid job ID' });
+      return sendJson(res, 405, { error: 'method not allowed' });
+    }
+    const jobId = m[1]!;
+    if (!session.privileged) {
+      req.resume();
+      return sendJson(res, 403, {
+        error: 'Temporary viewing accounts cannot change pipeline jobs. Sign in with a persistent account.',
+      });
+    }
+    let body: Record<string, unknown>;
+    try {
+      // Same cap as job creation, which carries the same outroConfig.
+      body = await readJsonBody(req);
+    } catch (err) {
+      const mapped = errorStatus(err, 400);
+      return sendJson(res, mapped.status, { error: mapped.error || 'Bad request body' });
+    }
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      return sendJson(res, 400, { error: 'JSON object body required' });
+    }
+    const csrfCheck = verifyCsrf(req, session, typeof body.csrfToken === 'string' ? body.csrfToken : '');
+    if (!csrfCheck.ok) return sendJson(res, 403, { error: csrfCheck.error });
+    const forbiddenBody = checkForbiddenKeys(body);
+    if (forbiddenBody) return sendJson(res, 400, { error: forbiddenBody });
+    const allowed = new Set(['chapters', 'renderLane', 'renderQuality', 'outroConfig', 'csrfToken']);
+    for (const key of Object.keys(body)) {
+      if (!allowed.has(key)) return sendJson(res, 400, { error: `Unsupported settings field: ${key}` });
+    }
+    const patch: JobSettingsPatch = {};
+    if (body.chapters !== undefined) {
+      if (typeof body.chapters !== 'string' || !body.chapters.trim()) {
+        return sendJson(res, 400, { error: 'chapters must be a chapter selection (for example 2-5 or all)' });
+      }
+      patch.chapters = body.chapters.trim();
+    }
+    if (body.renderLane !== undefined) {
+      const renderLane = typeof body.renderLane === 'string' && !body.renderLane.trim()
+        ? undefined
+        : normalizeRenderLane(body.renderLane);
+      if (renderLane === null) {
+        return sendJson(res, 400, {
+          error: `Unsupported renderLane: ${String(body.renderLane).slice(0, 32)} (allowed: ${RENDER_LANE_VALUES.join(', ')})`,
+        });
+      }
+      if (renderLane !== undefined) patch.renderLane = renderLane;
+    }
+    if (body.renderQuality !== undefined) {
+      const renderQuality = isBlankField(body.renderQuality) ? null : normalizeRenderQuality(body.renderQuality);
+      if (renderQuality === null && !isBlankField(body.renderQuality)) {
+        return sendJson(res, 400, {
+          error: `Unsupported renderQuality: ${String(body.renderQuality).slice(0, 16)} (allowed: ${RENDER_QUALITIES.join(', ')})`,
+        });
+      }
+      patch.renderQuality = renderQuality;
+    }
+    try {
+      if (body.outroConfig !== undefined) patch.outroConfig = parseOutroConfig(body.outroConfig) ?? null;
+      return sendJson(res, 200, updateJobSettings(jobId, patch));
+    } catch (err) {
+      const mapped = errorStatus(err, 400);
+      return sendJson(res, mapped.status, { error: mapped.error || 'Job settings update failed' });
     }
   }
 

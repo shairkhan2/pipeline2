@@ -7,12 +7,25 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from "react";
-import { Activity, Cloud, Info, Link2, Monitor, RefreshCw, Rocket, Server, Upload, Volume2, X } from "lucide-react";
+import { Activity, Info, Link2, RefreshCw, Rocket, Upload, Volume2, X } from "lucide-react";
 
 import { AppShell } from "@/components/layout/AppShell";
 import { StyleFields, type EditableTtsStyle } from '@/components/library/StyleFields';
 import { ElevenLabsVoiceCheck } from '@/components/library/ElevenLabsVoiceCheck';
 import { CardAnimationFields, compactCardAnimation } from '@/components/library/CardAnimationFields';
+import { VoicePreview } from "@/components/shared/VoicePreview";
+import { RunSettingsDialog } from "@/components/shared/RunSettingsDialog";
+import {
+  ChaptersField,
+  DEFAULT_OUTRO_DRAFT,
+  FieldError,
+  normalizeChapters,
+  outroConfigFrom,
+  OutroFields,
+  RenderLaneField,
+  RenderQualityField,
+  type OutroDraft,
+} from "@/components/shared/RunOptionFields";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { Dropzone } from "@/components/ui/dropzone";
@@ -30,9 +43,8 @@ import {
   getCsrfToken,
   isApiError,
   type IntakeCatalog,
+  type JobRecord,
   type JobsList,
-  type OutroConfigInput,
-  type OutroHookType,
   type ProviderView,
   type RenderNode,
   type RenderQuality,
@@ -45,16 +57,13 @@ import {
   buildIntakeLanes,
   DEFAULT_LANE_ID,
   LANE_ID_RE,
-  RENDER_KIND_META,
   type IntakeLaneOption,
-  type RenderLaneKind,
 } from "@/lib/renderLanes";
 import {
   buildTtsProviders,
   conciseVoiceName,
   ELEVENLABS_VOICE_ID_RE,
   isElevenLabsProvider,
-  isPaidTtsProvider,
   readPreferredVoice,
   writePreferredVoice,
   type TtsProviderGroup,
@@ -72,7 +81,6 @@ const ACTIVE_JOB_KEY = "screeningroom.intake.activeJob";
 const STAGE_ORDER = ["download", "extract", "pipeline"] as const;
 const RESTORE_STATUSES = new Set(["queued", "downloading", "ingesting", "running", "paused", "failed", "interrupted"]);
 const ACTIVE_STATUSES = new Set(["queued", "downloading", "ingesting", "running", "paused"]);
-const CHAPTERS_RE = /^(all|\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)$/i;
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DEFAULT_LANE = DEFAULT_LANE_ID;
 const MAX_ZIP_FALLBACK = 1536 * 1024 * 1024;
@@ -89,10 +97,9 @@ const STEPS = [
 ] as const;
 
 type SourceMode = "gdrive" | "upload";
-type LaneKind = RenderLaneKind;
 type FieldName = "title" | "slug" | "gdrive" | "file" | "voice" | "chapters" | "renderLane";
 type FieldErrors = Partial<Record<FieldName, string>>;
-type JobAction = "retry" | "continue" | "cancel" | "stop" | "pause" | "resume";
+type JobAction = "retry" | "continue" | "cancel" | "stop" | "pause" | "resume" | "settings";
 
 type LaneOption = IntakeLaneOption;
 
@@ -131,6 +138,11 @@ interface IntakeJob {
   logTail?: string[];
   actions?: string[];
   controlActions?: string[];
+  pauseRequested?: boolean;
+  pausedAt?: number | null;
+  pauseReason?: string | null;
+  pausedWhere?: string | null;
+  settingsEditable?: boolean;
   statusUrl?: string;
   libraryUrl?: string;
   progress?: JobProgress;
@@ -188,6 +200,36 @@ function statusOf(job: IntakeJob | null | undefined): string {
   return String(job?.status || "queued").toLowerCase();
 }
 
+function isPausing(job: IntakeJob | null | undefined): boolean {
+  return Boolean(job?.pauseRequested) && statusOf(job) !== "paused";
+}
+
+function statusLabel(job: IntakeJob, waiting: boolean): string {
+  if (waiting) return "Retrying";
+  if (isPausing(job)) return "Pausing…";
+  const status = statusOf(job);
+  return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+/** Where a paused run stopped and why, or the pending pause request. */
+function PauseInfo({ job }: { job: IntakeJob }) {
+  const pausing = isPausing(job);
+  const paused = statusOf(job) === "paused";
+  if (!pausing && !paused) return null;
+  return (
+    <div className="mt-2 text-sm" role="status" aria-live="polite">
+      {pausing ? (
+        <p className="text-muted-foreground">Pausing… the current step finishes first.</p>
+      ) : (
+        <>
+          {job.pausedWhere ? <p>Paused at <span className="font-mono">{job.pausedWhere}</span></p> : <p>Paused</p>}
+          {job.pauseReason ? <p className="mt-1 text-muted-foreground [overflow-wrap:anywhere]">{job.pauseReason}</p> : null}
+        </>
+      )}
+    </div>
+  );
+}
+
 function normalizeLaneId(raw: unknown): string {
   const value = String(raw ?? "").trim().toLowerCase();
   return LANE_ID_RE.test(value) ? value : DEFAULT_LANE;
@@ -223,26 +265,6 @@ function defaultLaneId(
   const fromCaps = caps && typeof caps === "object" ? (caps as { renderLane?: { default?: unknown } }).renderLane?.default : undefined;
   const raw = fromSettings ?? catalog?.defaultRenderLane ?? fromCaps ?? DEFAULT_LANE;
   return normalizeLaneId(raw);
-}
-
-function isPaidExternal(provider: TtsProviderGroup | null): boolean {
-  return isPaidTtsProvider(provider);
-}
-
-function normalizeChapters(raw: string): { ok: true; spec: string } | { ok: false; error: string } {
-  const spec = String(raw || "").trim().toLowerCase().replace(/\s*,\s*/g, ",").replace(/\s*-\s*/g, "-");
-  if (!spec) return { ok: false, error: "Enter a chapter range, for example 2-5, or “all”." };
-  if (!CHAPTERS_RE.test(spec)) return { ok: false, error: "Use “all”, a range like 2-5, or a list like 1,2,3." };
-  for (const part of spec.split(",")) {
-    if (part === "all") continue;
-    if (part.includes("-")) {
-      const [a, b] = part.split("-").map(Number);
-      if (!(a >= 1) || !(b >= a)) return { ok: false, error: `“${part}” is not a valid range. Use 2-5.` };
-    } else if (!(Number(part) >= 1)) {
-      return { ok: false, error: `“${part}” is not a valid chapter number.` };
-    }
-  }
-  return { ok: true, spec };
 }
 
 function transferStage(job: IntakeJob): (typeof STAGE_ORDER)[number] {
@@ -331,6 +353,7 @@ function canAction(job: IntakeJob, action: JobAction, privileged: boolean, unsup
     if (Array.isArray(job.actions) && job.actions.includes("continue")) return true;
     return status === "completed" || status === "interrupted" || status === "failed";
   }
+  if (action === "settings") return Array.isArray(job.actions) && job.actions.includes("settings");
   const isControl = action === "pause" || action === "resume" || action === "stop" || action === "cancel";
   if (isControl && Array.isArray(job.controlActions)) {
     return job.controlActions.includes(controlAction) || (controlAction === "stop" && job.controlActions.includes("cancel"));
@@ -406,206 +429,7 @@ function laneLabel(id: string, lanes: LaneOption[]): string {
   return id === DEFAULT_LANE ? label : `${label} only`;
 }
 
-function fmtAudioTime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
-  const whole = Math.floor(seconds);
-  const mins = Math.floor(whole / 60);
-  const secs = whole % 60;
-  return `${mins}:${String(secs).padStart(2, "0")}`;
-}
-
 const CUSTOM_VOICE = "__custom_voice__";
-
-function FieldError({ id, message }: { id: string; message?: string }) {
-  return (
-    <div id={id} hidden={!message} className="mt-2">
-      {message ? <Notice tone="danger" title="Check input" details={<RawDetails text={message} />} /> : null}
-    </div>
-  );
-}
-
-function LaneIcon({ kind }: { kind: LaneKind }) {
-  if (kind === "docker-sbx") return <Cloud className="size-3.5" aria-hidden />;
-  if (kind === "ssh") return <Server className="size-3.5" aria-hidden />;
-  if (kind === "local") return <Monitor className="size-3.5" aria-hidden />;
-  return null;
-}
-
-function VoicePreview({
-  provider,
-  voice,
-  privileged,
-  model,
-}: {
-  provider: TtsProviderGroup | null;
-  voice: TtsVoiceItem | null;
-  privileged: boolean;
-  model?: string;
-}) {
-  const [src, setSrc] = useState("");
-  const [error, setError] = useState<string | ErrorInfo>("");
-  const [busy, setBusy] = useState(false);
-  const [playing, setPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [spendOk, setSpendOk] = useState(false);
-  const gen = useRef(0);
-  const abortRef = useRef<AbortController | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const paid = isPaidExternal(provider);
-  const blocked = !privileged || Boolean(provider && !provider.available);
-
-  useEffect(() => {
-    gen.current += 1;
-    abortRef.current?.abort();
-    abortRef.current = null;
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.currentTime = 0;
-    }
-    setSrc("");
-    setError("");
-    setBusy(false);
-    setPlaying(false);
-    setCurrentTime(0);
-    setDuration(0);
-    setSpendOk(false);
-  }, [provider?.id, voice?.id, model]);
-
-  useEffect(() => {
-    const onHide = () => {
-      if (!document.hidden) return;
-      gen.current += 1;
-      abortRef.current?.abort();
-      audioRef.current?.pause();
-      setBusy(false);
-      setPlaying(false);
-    };
-    document.addEventListener("visibilitychange", onHide);
-    return () => {
-      document.removeEventListener("visibilitychange", onHide);
-      gen.current += 1;
-      abortRef.current?.abort();
-    };
-  }, []);
-
-  async function listen() {
-    if (!provider || !voice || busy) return;
-    if (!privileged) return;
-    if (!provider.available) {
-      setError(`${provider.label} is unavailable: ${provider.unavailableReason || "not configured"}`);
-      return;
-    }
-    if (paid && !spendOk) {
-      setError("Confirm spend before synthesizing this paid voice.");
-      return;
-    }
-    if (src && audioRef.current) {
-      setError("");
-      audioRef.current.currentTime = 0;
-      void audioRef.current.play().catch(() => undefined);
-      return;
-    }
-    const token = ++gen.current;
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setBusy(true);
-    setError("");
-    try {
-      const preview = await api.intake.preview(provider.id, voice.id, controller.signal, model);
-      if (token !== gen.current) return;
-      setSrc(preview.audioUrl);
-      window.setTimeout(() => {
-        if (token !== gen.current) return;
-        void audioRef.current?.play().catch(() => undefined);
-      }, 40);
-    } catch (err) {
-      if (token !== gen.current) return;
-      setError(describeError(err));
-    } finally {
-      if (token === gen.current) setBusy(false);
-    }
-  }
-
-  function stop() {
-    gen.current += 1;
-    abortRef.current?.abort();
-    abortRef.current = null;
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.currentTime = 0;
-    }
-    setBusy(false);
-    setPlaying(false);
-    setCurrentTime(0);
-  }
-
-  return (
-    <section
-      className="mt-3 rounded-xl bg-background p-3"
-      aria-label="Voice sample player"
-      data-playing={playing ? "" : undefined}
-    >
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-3">
-          <Button
-            type="button"
-            variant={playing ? "outline" : "default"}
-            className="min-h-11"
-            disabled={blocked || busy || (paid && !spendOk)}
-            onClick={() => (playing ? stop() : void listen())}
-          >
-            {busy ? "Generating…" : playing ? "Stop" : "Listen sample"}
-          </Button>
-          {paid ? (
-            <label className="flex min-h-11 items-center gap-2 text-xs text-muted-foreground">
-              <input
-                type="checkbox"
-                checked={spendOk}
-                onChange={(event) => {
-                  setSpendOk(event.target.checked);
-                  if (event.target.checked) setError("");
-                }}
-              />
-              <span>
-                Allow paid preview
-              </span>
-            </label>
-          ) : (
-            <Tooltip side="top" label={
-              !privileged
-                ? "Temporary accounts cannot generate previews."
-                : provider && !provider.available
-                  ? `Preview unavailable (${provider.unavailableReason || "not configured"}).`
-                  : provider?.costNotice || "Free Edge TTS narration"
-            }><button type="button" aria-label="Preview information" className="grid size-11 place-items-center text-muted-foreground"><Info className="size-[18px]" strokeWidth={1.75} aria-hidden /></button></Tooltip>
-          )}
-        </div>
-        {src ? (
-          <div className="flex min-w-[220px] flex-1 items-center justify-end gap-2">
-            <audio
-              ref={audioRef}
-              src={src}
-              controls
-              preload="metadata"
-              className="h-9 max-w-xs flex-1"
-              onPlay={() => setPlaying(true)}
-              onPause={() => setPlaying(false)}
-              onEnded={() => setPlaying(false)}
-              onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-              onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
-            />
-            <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
-              {fmtAudioTime(currentTime)} / {fmtAudioTime(duration)}
-            </span>
-          </div>
-        ) : null}
-      </div>
-      {error ? <ErrorNotice className="mt-2" info={typeof error === "string" ? describeError(error) : error} onRetry={() => void listen()} /> : null}
-    </section>
-  );
-}
 
 function StagePips({ job }: { job: IntakeJob }) {
   const status = statusOf(job);
@@ -665,11 +489,7 @@ export default function NewSeriesPage() {
   const [cardAnimation, setCardAnimation] = useState<import('@/lib/api').CardAnimation>({});
   const [laneId, setLaneId] = useState(DEFAULT_LANE);
   const [renderQuality, setRenderQuality] = useState<RenderQuality>("1080p");
-  const [outroEnabled, setOutroEnabled] = useState(false);
-  const [outroTotalChapters, setOutroTotalChapters] = useState(50);
-  const [outroCoveredChapters, setOutroCoveredChapters] = useState(20);
-  const [outroHookType, setOutroHookType] = useState<OutroHookType>("part2");
-  const [outroCustomPrompt, setOutroCustomPrompt] = useState("");
+  const [outro, setOutro] = useState<OutroDraft>(DEFAULT_OUTRO_DRAFT);
   const [catalog, setCatalog] = useState<IntakeCatalog | null>(null);
   const [settingsState, setSettingsState] = useState<StudioSettingsState | null>(null);
   const [studioProviders, setStudioProviders] = useState<ProviderView[]>([]);
@@ -693,6 +513,7 @@ export default function NewSeriesPage() {
   const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set());
   const [unsupported, setUnsupported] = useState<Set<string>>(() => new Set());
   const [submitting, setSubmitting] = useState(false);
+  const [settingsJobId, setSettingsJobId] = useState("");
   const [upload, setUpload] = useState<UploadState>(IDLE_UPLOAD);
   const uploadAbort = useRef<AbortController | null>(null);
   const focusField = useRef<string | null>(null);
@@ -1057,15 +878,7 @@ export default function NewSeriesPage() {
     setSubmitting(true);
     const controller = new AbortController();
     uploadAbort.current = controller;
-    const outroConfig: OutroConfigInput | undefined = outroEnabled
-      ? {
-          enabled: true,
-          totalChapters: Math.max(1, outroTotalChapters),
-          coveredChapters: Math.max(1, outroCoveredChapters),
-          hookType: outroHookType,
-          customPrompt: outroCustomPrompt.trim() || undefined,
-        }
-      : undefined;
+    const outroConfig = outroConfigFrom(outro);
     try {
       let created: IntakeJob;
       if (sourceMode === "gdrive") {
@@ -1194,9 +1007,13 @@ export default function NewSeriesPage() {
           : action === "continue"
             ? `Continuing ${merged.title || merged.slug || "this job"} with chapters ${payload?.chapters || "all"}.`
             : action === "pause"
-              ? `Paused ${merged.title || merged.slug || "this job"}.`
+              ? merged.pauseRequested && statusOf(merged) !== "paused"
+                ? `Pausing ${merged.title || merged.slug || "this job"} after the current step.`
+                : `Paused ${merged.title || merged.slug || "this job"}.`
               : action === "resume"
-                ? `Resumed ${merged.title || merged.slug || "this job"}.`
+                ? existing.pauseRequested && statusOf(existing) !== "paused"
+                  ? `Pause cancelled for ${merged.title || merged.slug || "this job"}.`
+                  : `Resumed ${merged.title || merged.slug || "this job"}.`
                 : `Stop requested for ${merged.title || merged.slug || "this job"}.`,
         ok: true,
       });
@@ -1246,14 +1063,6 @@ export default function NewSeriesPage() {
     : jobs.some((job) => statusOf(job) === "queued")
       ? `${jobs.filter((job) => statusOf(job) === "queued").length} queued`
       : "Ready";
-  const unavailableLanes = lanes.filter((lane) => !lane.available && lane.id !== chosenLane?.id);
-  const laneGroups: Array<{ kind: LaneKind; label: string }> = [
-    { kind: "inherit", label: RENDER_KIND_META.inherit.groupLabel },
-    { kind: "local", label: RENDER_KIND_META.local.groupLabel },
-    { kind: "docker-sbx", label: RENDER_KIND_META["docker-sbx"].groupLabel },
-    { kind: "ssh", label: RENDER_KIND_META.ssh.groupLabel },
-    { kind: "custom", label: RENDER_KIND_META.custom.groupLabel },
-  ];
 
   function renderJob(job: IntakeJob) {
     const status = statusOf(job);
@@ -1266,12 +1075,14 @@ export default function NewSeriesPage() {
     const stoppable = canAction(job, "stop", privileged, unsupported);
     const pausable = canAction(job, "pause", privileged, unsupported);
     const resumable = canAction(job, "resume", privileged, unsupported);
+    const editable = canAction(job, "settings", privileged, unsupported);
+    const pausing = isPausing(job);
     const lane = normalizeLaneId(job.renderLane);
     return (
       <article key={job.id} className="min-w-0 rounded-[22px] bg-card p-4 [overflow-wrap:anywhere] md:p-5" data-job={job.id} data-selected={job.id === activeId ? "true" : undefined}>
         <div className="flex items-start justify-between gap-3">
           <h3 className="min-w-0 break-words text-[17px] font-semibold">{job.title || job.slug || job.id}</h3>
-          <span className={cn("shrink-0 rounded-full px-3 py-1 text-xs font-medium", waiting ? "bg-warning-soft text-warning" : status === "failed" ? "bg-destructive-soft text-destructive" : status === "completed" ? "bg-success-soft text-success" : "bg-muted text-muted-foreground")}>{waiting ? "Retrying" : status.charAt(0).toUpperCase() + status.slice(1)}</span>
+          <span className={cn("shrink-0 rounded-full px-3 py-1 text-xs font-medium", waiting ? "bg-warning-soft text-warning" : status === "failed" ? "bg-destructive-soft text-destructive" : status === "completed" ? "bg-success-soft text-success" : "bg-muted text-muted-foreground")}>{statusLabel(job, waiting)}</span>
         </div>
         <p className="mt-0.5 text-[13.5px] text-muted-foreground" title={`${cleanVoiceName(job.tts?.voiceLabel || job.tts?.voiceId || job.tts?.providerLabel || "Narrated")} · render ${lane}`}>
           {waiting ? `Retry ${job.autoRetry?.count ?? 1} of ${job.autoRetry?.max ?? 3}` : job.ingestedChapters?.length ? `${job.ingestedChapters.length} ${job.ingestedChapters.length === 1 ? "chapter" : "chapters"}` : `Chapters ${job.chapters || "all"}`}
@@ -1279,6 +1090,7 @@ export default function NewSeriesPage() {
           {waiting ? <span role="timer">in {retryCountdown(job.notBefore!, retryNow)}</span> : fmtAge(job.updatedAt || job.createdAt)}
         </p>
         {job.statusNote && !errorText && status !== "completed" ? <details className="mt-2 text-xs text-muted-foreground"><summary className="min-h-11 cursor-pointer py-3">Details</summary><RawDetails text={job.statusNote} /></details> : null}
+        <PauseInfo job={job} />
         <JobFailure job={job} />
         {waiting && job.autoRetry?.lastFailure ? <p className="mt-2 text-sm text-muted-foreground">{parseFailureNote(job.autoRetry.lastFailure).title}</p> : null}
         {logs.length ? (
@@ -1311,7 +1123,12 @@ export default function NewSeriesPage() {
           ) : null}
           {resumable ? (
             <Button type="button" variant="outline" className="min-h-11" disabled={busy} onClick={() => void runAction(job.id, "resume")}>
-              {busy ? "Working…" : "Resume"}
+              {busy ? "Working…" : pausing ? "Cancel pause" : "Resume"}
+            </Button>
+          ) : null}
+          {editable ? (
+            <Button type="button" variant="outline" className="min-h-11" disabled={busy} onClick={() => setSettingsJobId(job.id)}>
+              Change settings
             </Button>
           ) : null}
           {stoppable ? (
@@ -1373,13 +1190,14 @@ export default function NewSeriesPage() {
               <>
                 <div className="flex items-start justify-between gap-3">
                   <h2 id="successHeading" className="min-w-0 text-2xl font-semibold tracking-[-0.015em]">{activeJob.title || activeJob.slug || "This series"}</h2>
-                  <span className={cn("shrink-0 rounded-full px-3 py-1 text-xs font-medium", activeWaiting ? "bg-warning-soft text-warning" : "bg-muted text-muted-foreground")}>{activeWaiting ? "Retrying" : statusOf(activeJob).replace(/^./, (c) => c.toUpperCase())}</span>
+                  <span className={cn("shrink-0 rounded-full px-3 py-1 text-xs font-medium", activeWaiting ? "bg-warning-soft text-warning" : "bg-muted text-muted-foreground")}>{statusLabel(activeJob, activeWaiting)}</span>
                 </div>
                 {activeWaiting ? <>
                   <p className="mt-2 text-sm text-muted-foreground">Retry {activeJob.autoRetry?.count ?? 1} of {activeJob.autoRetry?.max ?? 3} · <span role="timer">in {retryCountdown(activeJob.notBefore!, retryNow)}</span></p>
                   {activeJob.autoRetry?.lastFailure ? <p className="mt-2 text-sm text-muted-foreground">{parseFailureNote(activeJob.autoRetry.lastFailure).title}</p> : null}
                   <details className="mt-2 text-xs text-muted-foreground"><summary className="min-h-11 cursor-pointer py-3">Details</summary><RawDetails text={[activeJob.autoRetry?.lastFailure, activeJob.failureDetail, activeJob.error, activeJob.statusNote].filter(Boolean).join("\n")} /></details>
                 </> : <StagePips job={activeJob} />}
+                <PauseInfo job={activeJob} />
                 <JobFailure job={activeJob} />
               </>
             ) : (
@@ -1394,7 +1212,10 @@ export default function NewSeriesPage() {
                 <Button type="button" variant="outline" className="min-h-11" disabled={busyIds.has(activeId)} onClick={() => void runAction(activeId, "pause")}>Pause</Button>
               ) : null}
               {activeJob && canAction(activeJob, "resume", privileged, unsupported) ? (
-                <Button type="button" variant="outline" className="min-h-11" disabled={busyIds.has(activeId)} onClick={() => void runAction(activeId, "resume")}>Resume</Button>
+                <Button type="button" variant="outline" className="min-h-11" disabled={busyIds.has(activeId)} onClick={() => void runAction(activeId, "resume")}>{isPausing(activeJob) ? "Cancel pause" : "Resume"}</Button>
+              ) : null}
+              {activeJob && canAction(activeJob, "settings", privileged, unsupported) ? (
+                <Button type="button" variant="outline" className="min-h-11" disabled={busyIds.has(activeId)} onClick={() => setSettingsJobId(activeId)}>Change settings</Button>
               ) : null}
               {activeJob && canAction(activeJob, "stop", privileged, unsupported) ? (
                 <Button type="button" variant="outline" className="min-h-11" disabled={busyIds.has(activeId)} onClick={() => void runAction(activeId, "stop")}>Stop</Button>
@@ -1593,38 +1414,16 @@ export default function NewSeriesPage() {
                     </div>
                   )}
 
-                  <label className="mt-4 block text-sm" htmlFor="chaptersSpec">
-                    Chapters
-                    <input
-                      id="chaptersSpec"
-                      className="field mt-1 min-h-11 font-mono"
-                      value={chapters}
-                      placeholder="all, 1-5, or 1,2,3"
-                      aria-invalid={errors.chapters ? true : undefined}
-                      aria-describedby="chaptersError"
-                      onChange={(event) => {
-                        setChapters(event.target.value);
-                        setField("chapters", "");
-                      }}
-                    />
-                  </label>
-                  <div className="mt-2 flex gap-2" role="group" aria-label="Chapter presets">
-                    {["all", "1"].map((preset) => (
-                      <button
-                        key={preset}
-                        type="button"
-                        className="min-h-11 rounded-full border border-border px-3 text-sm"
-                        aria-pressed={chapters.trim() === preset}
-                        onClick={() => {
-                          setChapters(preset);
-                          setField("chapters", "");
-                        }}
-                      >
-                        {preset === "all" ? "All chapters" : "Chapter 1"}
-                      </button>
-                    ))}
-                  </div>
-                  <FieldError id="chaptersError" message={errors.chapters} />
+                  <ChaptersField
+                    id="chaptersSpec"
+                    errorId="chaptersError"
+                    value={chapters}
+                    error={errors.chapters}
+                    onChange={(value) => {
+                      setChapters(value);
+                      setField("chapters", "");
+                    }}
+                  />
                 </section>
               ) : null}
 
@@ -1856,155 +1655,30 @@ export default function NewSeriesPage() {
               {step === 2 ? (
                 <section aria-labelledby="productionHeading">
                   <h2 id="productionHeading" tabIndex={-1} className="sr-only">Launch</h2>
-                  <label className="mt-4 block text-sm" htmlFor="renderLane">
-                    Render lane
-                    <select
-                      id="renderLane"
-                      className="field mt-1 min-h-11"
-                      value={chosenLane?.id || DEFAULT_LANE}
-                      disabled={!privileged}
-                      aria-invalid={errors.renderLane ? true : undefined}
-                      aria-describedby="renderLaneNote renderLaneError"
-                      onChange={(event) => {
-                        laneTouched.current = true;
-                        setLaneId(event.target.value);
-                        setField("renderLane", "");
-                      }}
-                    >
-                      {laneGroups.map((group) => {
-                        const options = lanes.filter((lane) => lane.kind === group.kind);
-                        if (!options.length) return null;
-                        return (
-                          <optgroup key={group.kind} label={group.label}>
-                            {options.map((lane) => (
-                              <option key={lane.id} value={lane.id} disabled={!lane.available}>
-                                {lane.label}{lane.available ? "" : " (Unavailable)"}
-                              </option>
-                            ))}
-                          </optgroup>
-                        );
-                      })}
-                    </select>
-                  </label>
-                  <span id="renderLaneNote" className="sr-only">
-                    <LaneIcon kind={chosenLane?.kind || "inherit"} />
-                    {chosenLane && chosenLane.id !== DEFAULT_LANE
-                      ? chosenLane.available
-                        ? `${chosenLane.label} only · waits if offline`
-                        : `Default lane ${chosenLane.label} is unavailable (${chosenLane.unavailableReason || "disabled or removed"}). Choose Auto or another available lane.`
-                      : "Follows lane policy"}
-                  </span>
-                  {chosenLane && !chosenLane.available ? (
-                    <Notice className="mt-2" tone="danger" title="Lane unavailable" details={<RawDetails text={`${chosenLane.label}: ${chosenLane.unavailableReason || "disabled or removed"}`} />} />
-                  ) : null}
-                  {unavailableLanes.length ? (
-                    <details className="mt-2 text-sm">
-                      <summary>Unavailable: {unavailableLanes.map((lane) => lane.label).join(", ")}</summary>
-                      <ul className="mt-2 text-warning">
-                        {unavailableLanes.map((lane) => (
-                          <li key={lane.id}><strong>{lane.label}</strong> — {lane.unavailableReason || "unavailable"}</li>
-                        ))}
-                      </ul>
-                    </details>
-                  ) : null}
-                  <FieldError id="renderLaneError" message={errors.renderLane} />
+                  <RenderLaneField
+                    id="renderLane"
+                    noteId="renderLaneNote"
+                    errorId="renderLaneError"
+                    lanes={lanes}
+                    value={chosenLane?.id || DEFAULT_LANE}
+                    error={errors.renderLane}
+                    disabled={!privileged}
+                    onChange={(value) => {
+                      laneTouched.current = true;
+                      setLaneId(value);
+                      setField("renderLane", "");
+                    }}
+                  />
 
-                  <div className="mt-4 rounded-xl bg-background p-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div>
-                        <p className="text-sm font-medium">Render quality</p>
-                        <p className="text-xs text-muted-foreground">
-                          {renderQuality === "720p" ? "1280×720" : "1920×1080"}
-                        </p>
-                      </div>
-                      <div className="flex gap-2" role="radiogroup" aria-label="Render quality">
-                        {(["1080p", "720p"] as const).map((q) => (
-                          <button
-                            key={q}
-                            type="button"
-                            role="radio"
-                            aria-checked={renderQuality === q}
-                            className={cn(
-                              "min-h-11 rounded-full px-4 text-sm",
-                              renderQuality === q ? "bg-primary-soft text-primary-text" : "bg-muted",
-                            )}
-                            onClick={() => {
-                              qualityTouched.current = true;
-                              setRenderQuality(q);
-                            }}
-                          >
-                            {q}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
+                  <RenderQualityField
+                    value={renderQuality}
+                    onChange={(q) => {
+                      qualityTouched.current = true;
+                      setRenderQuality(q);
+                    }}
+                  />
 
-                  <div className="mt-4 rounded-xl bg-background p-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div>
-                        <p className="text-sm font-medium">Episode outro</p>
-                      </div>
-                      <label className="flex min-h-11 items-center gap-2 text-sm">
-                        <input
-                          type="checkbox"
-                          checked={outroEnabled}
-                          onChange={(event) => setOutroEnabled(event.target.checked)}
-                        />
-                        Enable outro
-                      </label>
-                    </div>
-                    {outroEnabled ? (
-                      <div className="mt-3 space-y-3 border-t border-border pt-3">
-                        <div className="grid gap-3 sm:grid-cols-3">
-                          <label className="text-xs text-muted-foreground">
-                            Total chapters so far
-                            <input
-                              type="number"
-                              min={1}
-                              className="mt-1 min-h-11 w-full rounded-xl bg-card px-3 font-mono text-sm text-foreground"
-                              value={outroTotalChapters}
-                              onChange={(event) => setOutroTotalChapters(Math.max(1, Number(event.target.value) || 1))}
-                            />
-                          </label>
-                          <label className="text-xs text-muted-foreground">
-                            Covered chapters
-                            <input
-                              type="number"
-                              min={1}
-                              className="mt-1 min-h-11 w-full rounded-xl bg-card px-3 font-mono text-sm text-foreground"
-                              value={outroCoveredChapters}
-                              onChange={(event) => setOutroCoveredChapters(Math.max(1, Number(event.target.value) || 1))}
-                            />
-                          </label>
-                          <label className="text-xs text-muted-foreground">
-                            Hook type
-                            <select
-                              className="mt-1 min-h-11 w-full rounded-xl bg-card px-3 text-sm text-foreground"
-                              value={outroHookType}
-                              onChange={(event) => setOutroHookType(event.target.value as OutroHookType)}
-                            >
-                              <option value="part2">Part 2</option>
-                              <option value="next_chapter">Next chapter</option>
-                              <option value="new_series">New series</option>
-                              <option value="custom">Custom</option>
-                            </select>
-                          </label>
-                        </div>
-                        {outroHookType === "custom" ? (
-                          <label className="block text-xs text-muted-foreground">
-                            Custom outro call-to-action
-                            <input
-                              className="mt-1 min-h-11 w-full rounded-xl bg-card px-3 text-sm text-foreground"
-                              value={outroCustomPrompt}
-                              placeholder="Ask viewers to drop a comment for Part 2"
-                              onChange={(event) => setOutroCustomPrompt(event.target.value)}
-                            />
-                          </label>
-                        ) : null}
-                      </div>
-                    ) : null}
-                  </div>
+                  <OutroFields value={outro} onChange={setOutro} />
 
                   <dl className="sr-group mt-4 divide-y divide-border bg-muted [&_dd]:min-w-0 [&_dd]:break-words [&_dd]:text-right [&_dt]:shrink-0" aria-live="polite">
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Series</dt><dd>{title.trim() || "Not set"}</dd></div>
@@ -2024,10 +1698,10 @@ export default function NewSeriesPage() {
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Chapters</dt><dd className="font-mono">{chapters.trim() || "all"}</dd></div>
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Source & style</dt><dd>{sourceMode === "upload" ? file?.name || "No ZIP selected" : driveId ? "Google Drive ZIP" : "Waiting for link"} · {BG_LABELS[background] || background} · {MOTION_LABELS[motion || "window"] || motion || "Window"}</dd></div>
                     <div className="flex justify-between gap-3 px-3 py-2 text-sm"><dt>Render lane & quality</dt><dd>{laneLabel(chosenLane?.id || DEFAULT_LANE, lanes)} · {renderQuality}</dd></div>
-                    {outroEnabled ? (
+                    {outro.enabled ? (
                       <div className="flex justify-between gap-3 px-3 py-2 text-sm">
                         <dt>Episode outro</dt>
-                        <dd className="font-mono">{outroCoveredChapters}/{outroTotalChapters} ch</dd>
+                        <dd className="font-mono">{outro.coveredChapters}/{outro.totalChapters} ch</dd>
                       </div>
                     ) : null}
                   </dl>
@@ -2105,6 +1779,19 @@ export default function NewSeriesPage() {
           </section>
         )}
       </div>
+      <RunSettingsDialog
+        job={(jobs.find((job) => job.id === settingsJobId) as JobRecord | undefined) ?? null}
+        open={Boolean(settingsJobId)}
+        privileged={privileged}
+        onClose={() => setSettingsJobId("")}
+        onSaved={(saved, resumed) => {
+          if (saved?.id) {
+            setJobs((current) => current.map((job) => (job.id === saved.id ? { ...job, ...(saved as IntakeJob) } : job)));
+          }
+          setActionNote({ text: resumed ? "Settings saved. Resuming from saved work." : "Settings saved.", ok: true });
+          void loadJobs();
+        }}
+      />
     </AppShell>
   );
 }

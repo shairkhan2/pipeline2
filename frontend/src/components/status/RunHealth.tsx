@@ -1,9 +1,11 @@
 import { useEffect, useId, useState } from "react";
 import { ChevronDown } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { RawDetails } from "@/components/ui/notice";
+import { api } from "@/lib/api";
 import { Tooltip } from "@/components/ui/tooltip";
-import { parseFailureNote, type FailureNote } from "@/lib/errors";
+import { errorLine, parseFailureNote, type FailureNote } from "@/lib/errors";
 import { cn } from "@/lib/utils";
 
 export interface HealthCall {
@@ -29,7 +31,7 @@ export interface HealthEvent {
 export interface HealthRun {
   alive?: boolean;
   state?: string;
-  providers?: Record<string, { coolingUntil?: number }>;
+  providers?: Record<string, { coolingUntil?: number | null; coolingReason?: string | null }>;
   recentCalls?: HealthCall[];
   events?: HealthEvent[];
   totals?: { calls?: number; errors?: number; tokens?: number };
@@ -79,6 +81,7 @@ interface LaneState {
   provider: string;
   models: string[];
   coolingMs: number;
+  coolingReason: string;
   lastError: FailureNote | null;
   lastErrorAt: number | null;
   lastOkAt: number | null;
@@ -87,8 +90,12 @@ interface LaneState {
 const DOT = { ok: "bg-success", wait: "bg-warning", bad: "bg-destructive" } as const;
 const WORD = { ok: "text-muted-foreground", wait: "text-warning", bad: "text-destructive" } as const;
 
-/** One row per provider: dot, name, one-word status. Hover a row for the reason. */
-export function LaneHealth({ run }: { run: HealthRun }) {
+/** One row per provider: dot, name, one-word status. A cooling lane shows its reason and, for privileged users, "Retry now". */
+export function LaneHealth({ run, privileged = false, onLaneReset }: { run: HealthRun; privileged?: boolean; onLaneReset?: (lane: string) => void }) {
+  const [resetBusy, setResetBusy] = useState("");
+  const [resetError, setResetError] = useState<Record<string, string>>({});
+  const [resetDone, setResetDone] = useState<Record<string, number>>({});
+  const [announce, setAnnounce] = useState("");
   const live = run.alive !== false && run.state === "running";
   const coolingUntil = live
     ? Math.max(0, ...Object.values(run.providers || {}).map((info) => (typeof info.coolingUntil === "number" && Number.isFinite(info.coolingUntil) ? toMs(info.coolingUntil) : 0)))
@@ -98,7 +105,7 @@ export function LaneHealth({ run }: { run: HealthRun }) {
   const touch = (provider: string) => {
     let lane = lanes.get(provider);
     if (!lane) {
-      lane = { provider, models: [], coolingMs: 0, lastError: null, lastErrorAt: null, lastOkAt: null };
+      lane = { provider, models: [], coolingMs: 0, coolingReason: "", lastError: null, lastErrorAt: null, lastOkAt: null };
       lanes.set(provider, lane);
     }
     return lane;
@@ -124,6 +131,26 @@ export function LaneHealth({ run }: { run: HealthRun }) {
   for (const [provider, info] of Object.entries(run.providers || {})) {
     const lane = touch(provider);
     if (live && typeof info?.coolingUntil === "number") lane.coolingMs = Math.max(0, toMs(info.coolingUntil) - now);
+    // Hide the cooldown right after a reset until telemetry catches up.
+    if (resetDone[provider] && now - resetDone[provider]! < 15000) lane.coolingMs = 0;
+    if (typeof info?.coolingReason === "string") lane.coolingReason = info.coolingReason.trim();
+  }
+
+  async function resetLane(lane: string) {
+    if (resetBusy) return;
+    setResetBusy(lane);
+    setResetError((current) => ({ ...current, [lane]: "" }));
+    try {
+      await api.studio.resetLane(lane);
+      setResetDone((current) => ({ ...current, [lane]: Date.now() }));
+      setAnnounce(`${lane} cooldown cleared. Retrying now.`);
+      onLaneReset?.(lane);
+    } catch (error) {
+      setResetError((current) => ({ ...current, [lane]: errorLine(error) }));
+      setAnnounce(`Could not retry ${lane}: ${errorLine(error)}`);
+    } finally {
+      setResetBusy("");
+    }
   }
   const rows = [...lanes.values()];
   if (!rows.length) return null;
@@ -131,15 +158,17 @@ export function LaneHealth({ run }: { run: HealthRun }) {
   return (
     <section aria-labelledby="laneHealthHeading">
       <h2 id="laneHealthHeading" className="sr-section-label">Models</h2>
+      <p className="sr-only" role="status" aria-live="polite">{announce}</p>
       <ul className="sr-group">
         {rows.map((lane) => {
           const cooling = lane.coolingMs > 0;
           const failed = !cooling && lane.lastError && (lane.lastOkAt === null || (lane.lastErrorAt ?? 0) >= lane.lastOkAt);
           const state = cooling ? "wait" : failed ? "bad" : "ok";
           const word = cooling ? countdown(lane.coolingMs) : failed ? lane.lastError!.label : "Ready";
-          const why = cooling || failed ? lane.lastError?.title : undefined;
+          const why = cooling ? lane.coolingReason || lane.lastError?.title : failed ? lane.lastError?.title : undefined;
+          const resetErr = resetError[lane.provider];
           return (
-            <li key={lane.provider} className="sr-row min-h-12 py-2.5" title={why}>
+            <li key={lane.provider} className={cn("sr-row min-h-12 py-2.5", (cooling || resetErr) && "flex-wrap")} title={why}>
               <span className={cn("size-2 shrink-0 rounded-full", DOT[state])} aria-hidden />
               <span className="min-w-0 flex-1 truncate text-[15px]">
                 {lane.provider}
@@ -147,8 +176,23 @@ export function LaneHealth({ run }: { run: HealthRun }) {
               </span>
               <span className={cn("shrink-0 text-[14px] font-medium tabular-nums", WORD[state])} role={cooling ? "timer" : undefined}>
                 {word}
-                {why ? <span className="sr-only">, {why}</span> : null}
+                {why && !cooling ? <span className="sr-only">, {why}</span> : null}
               </span>
+              {cooling && privileged ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="min-h-11 md:min-h-8"
+                  disabled={Boolean(resetBusy)}
+                  aria-label={`Retry ${lane.provider} now`}
+                  onClick={() => void resetLane(lane.provider)}
+                >
+                  {resetBusy === lane.provider ? "Retrying…" : "Retry now"}
+                </Button>
+              ) : null}
+              {cooling && why ? <p className="basis-full pl-5 text-[13px] text-muted-foreground [overflow-wrap:anywhere]">{why}</p> : null}
+              {resetErr ? <p className="basis-full pl-5 text-[13px] text-destructive">{resetErr}</p> : null}
             </li>
           );
         })}

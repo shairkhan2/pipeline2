@@ -720,8 +720,18 @@ async function withLaneSlot<T>(role: string, lane: Lane, fn: () => Promise<T>): 
 }
 
 const cooldowns = new Map<string, number>();
+/** Wall-clock ms at which each lane's current cooldown was set (for manual resets). */
+const cooldownSetAt = new Map<string, number>();
 const wbConv = new Map<string, string>();
-const vtok: { tok: string | null; exp: number } = { tok: null, exp: 0 };
+/** Vertex LLM tokens keyed by `${providerId}:${secretFingerprint}`. */
+const vtok = new Map<string, { tok: string; exp: number }>();
+
+let nowImpl: () => number = () => Date.now();
+
+/** Test-only. Production never calls this. Wall-clock ms for cooldowns and change checks. */
+export function _setClockForTests(fn: (() => number) | null): void {
+  nowImpl = fn ?? (() => Date.now());
+}
 
 let sleepImpl: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => {
   setTimeout(resolve, ms);
@@ -754,8 +764,217 @@ export function _resetSnapshotForTests(): void {
   laneSems.clear();
   _activeCounts.clear();
   cooldowns.clear();
+  cooldownSetAt.clear();
+  vtok.clear();
   laneCache.synced = false;
   laneCache.store = {};
+  laneWatch.checkedAt = Number.NEGATIVE_INFINITY;
+  laneWatch.stamp = null;
+  laneWatch.fingerprints = null;
+  laneWatch.resetsCheckedAt = Number.NEGATIVE_INFINITY;
+  laneWatch.resetsStamp = null;
+}
+
+/** How often a run re-checks provider config and manual lane resets. */
+export const LANE_CHECK_INTERVAL_MS = 5000;
+export const LANE_RESETS_FILENAME = "lane-resets.json";
+
+const laneWatch: {
+  checkedAt: number;
+  stamp: string | null;
+  fingerprints: Map<string, string> | null;
+  resetsCheckedAt: number;
+  resetsStamp: string | null;
+} = {
+  checkedAt: Number.NEGATIVE_INFINITY,
+  stamp: null,
+  fingerprints: null,
+  resetsCheckedAt: Number.NEGATIVE_INFINITY,
+  resetsStamp: null,
+};
+
+export function laneResetsPath(outDir?: string): string {
+  return path.join(secretStore.resolveOutDir(outDir), "config", LANE_RESETS_FILENAME);
+}
+
+function fileStamp(file: string): string {
+  try {
+    const st = fs.statSync(file);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return "-";
+  }
+}
+
+/** First 16 hex chars of sha256(secret); the plain secret is never kept. */
+function secretFingerprint(ref: string | null | undefined, outDir?: string): string {
+  if (!ref) return "";
+  try {
+    const raw = secretStore.getSecret(ref, outDir);
+    return raw ? createHash("sha256").update(raw).digest("hex").slice(0, 16) : "none";
+  } catch {
+    return "unreadable";
+  }
+}
+
+function laneFingerprint(lane: Lane): string {
+  const providerId = lane.provider || lane.name;
+  const ref = lane.secretRef ?? (lane.protocol ? `provider:${providerId}` : null);
+  return [
+    providerId,
+    lane.authMode ?? "",
+    lane.base ?? "",
+    lane.projectId ?? "",
+    lane.model,
+    secretFingerprint(ref, lane.outDir),
+  ].join("|");
+}
+
+/** Fingerprint per lane name across the role chains and every stage chain. */
+function laneFingerprints(): Map<string, string> {
+  const byName = new Map<string, Set<string>>();
+  const add = (lanes: Lane[]) => {
+    for (const ln of lanes) {
+      const set = byName.get(ln.name) ?? new Set<string>();
+      set.add(laneFingerprint(ln));
+      byName.set(ln.name, set);
+    }
+  };
+  try {
+    add(_activeLanes("vision"));
+    add(_activeLanes("writer"));
+  } catch {
+    // keep what was collected
+  }
+  for (const stage of studioConfig.STAGES) {
+    try {
+      add(resolveStageLanes(stage).lanes);
+    } catch {
+      // a broken stage route never blocks the check
+    }
+  }
+  return new Map([...byName].map(([name, set]) => [name, [...set].sort().join("\n")]));
+}
+
+function clearCooldown(name: string, why: string): boolean {
+  if (!cooldowns.has(name)) return false;
+  cooldowns.delete(name);
+  cooldownSetAt.delete(name);
+  log(`COOLDOWN cleared lane ${name} (${why})`);
+  telemetry.provider(name, { coolingUntil: null, coolingReason: null });
+  return true;
+}
+
+/** Clear this process's cooldown for one lane (Studio "Retry now"). */
+export function resetLaneCooldown(name: string): boolean {
+  return clearCooldown(name, "manual reset");
+}
+
+/** Lane names of the role chains and every stage chain. */
+export function configuredLaneNames(): string[] {
+  return [...laneFingerprints().keys()];
+}
+
+/**
+ * Record a manual reset in `<outDir>/config/lane-resets.json` (0600, atomic) so
+ * running pipelines drop the lane's older cooldown.
+ */
+export function writeLaneReset(name: string, at: number, outDir?: string): void {
+  const file = laneResetsPath(outDir);
+  let doc: Record<string, number> = {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === "number" && Number.isFinite(v)) doc[k] = v;
+      }
+    }
+  } catch {
+    doc = {};
+  }
+  doc[name] = at;
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+  try {
+    const fd = fs.openSync(tmp, flags, 0o600);
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify(doc, null, 2)}\n`);
+      fs.fchmodSync(fd, 0o600);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, file);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+/**
+ * Pick up provider account changes made after this process started. Reloads the
+ * lane snapshot (semaphores and active counts stay: in-flight calls hold them)
+ * and clears the cooldown of every lane whose fingerprint changed.
+ */
+function checkProviderConfig(now: number): void {
+  if (now - laneWatch.checkedAt < LANE_CHECK_INTERVAL_MS) return;
+  laneWatch.checkedAt = now;
+  const configDir = path.join(secretStore.resolveOutDir(), "config");
+  const stamp = ["providers.json", "stages.json", secretStore.SECRETS_FILENAME]
+    .map((file) => fileStamp(path.join(configDir, file)))
+    .join(",");
+  if (laneWatch.fingerprints && stamp === laneWatch.stamp) return;
+  const changed = laneWatch.fingerprints !== null;
+  laneWatch.stamp = stamp;
+  if (changed) {
+    snapshot.loaded = false;
+    laneCache.synced = false;
+    laneCache.store = {};
+  }
+  const before = laneWatch.fingerprints;
+  const after = laneFingerprints();
+  laneWatch.fingerprints = after;
+  if (!before) return;
+  for (const name of [...cooldowns.keys()]) {
+    if (before.get(name) !== after.get(name)) clearCooldown(name, "provider settings changed");
+  }
+}
+
+/** Drop cooldowns that started before the lane's manual reset time. */
+function checkLaneResets(now: number): void {
+  if (now - laneWatch.resetsCheckedAt < LANE_CHECK_INTERVAL_MS) return;
+  laneWatch.resetsCheckedAt = now;
+  const file = laneResetsPath();
+  const stamp = fileStamp(file);
+  if (stamp === laneWatch.resetsStamp) return;
+  laneWatch.resetsStamp = stamp;
+  if (stamp === "-") return;
+  let resets: Record<string, unknown>;
+  try {
+    resets = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  if (!resets || typeof resets !== "object" || Array.isArray(resets)) return;
+  for (const [name, at] of Object.entries(resets)) {
+    if (typeof at !== "number" || !Number.isFinite(at)) continue;
+    const setAt = cooldownSetAt.get(name);
+    if (setAt !== undefined && setAt < at) clearCooldown(name, "manual reset");
+  }
+}
+
+function refreshLaneState(): void {
+  const now = nowImpl();
+  try {
+    checkProviderConfig(now);
+  } catch {
+    // a config read failure never fails a call
+  }
+  try {
+    checkLaneResets(now);
+  } catch {
+    // same
+  }
 }
 
 function stamp(d = new Date()): string {
@@ -840,7 +1059,6 @@ function studioVertexProvider(): studioConfig.ProviderView | null {
 }
 
 export async function vertexToken(): Promise<string> {
-  if (vtok.tok && Date.now() / 1000 < vtok.exp - 120) return vtok.tok;
   const provider = studioVertexProvider();
   if (!provider) {
     throw new AuthError("Vertex credential missing: configure a vertex-ai provider in Studio");
@@ -850,6 +1068,10 @@ export async function vertexToken(): Promise<string> {
   if (!rawSecret) {
     throw new AuthError(`Vertex credential missing for provider '${provider.id}'`);
   }
+  // Keyed per account: a swapped credential never reuses the old account's token.
+  const cacheKey = `${provider.id}:${createHash("sha256").update(rawSecret).digest("hex").slice(0, 16)}`;
+  const cached = vtok.get(cacheKey);
+  if (cached && Date.now() / 1000 < cached.exp - 120) return cached.tok;
   const oauthMode = provider.auth?.mode === "vertex-oauth" || studioConfig.isVertexOAuthSecret(rawSecret);
   const resolved = oauthMode
     ? await studioConfig.resolveVertexOAuthAccessToken(rawSecret, {
@@ -858,9 +1080,9 @@ export async function vertexToken(): Promise<string> {
         tokenUrl: provider.auth?.tokenUrl,
       })
     : await studioConfig.mintVertexAccessToken(rawSecret, { fetchFn: fetchImpl });
-  vtok.tok = resolved.accessToken;
-  vtok.exp = resolved.expiresAt ?? Date.now() / 1000 + 3600;
-  return vtok.tok;
+  vtok.clear();
+  vtok.set(cacheKey, { tok: resolved.accessToken, exp: resolved.expiresAt ?? Date.now() / 1000 + 3600 });
+  return resolved.accessToken;
 }
 
 const oauthRefreshInFlight = new Map<string, Promise<string | null>>();
@@ -1210,16 +1432,23 @@ function quotaResetS(err: string): number | null {
 }
 
 function cooldownLeft(name: string): number {
-  return Math.max(0, (cooldowns.get(name) ?? 0) - Date.now() / 1000);
+  return Math.max(0, (cooldowns.get(name) ?? 0) - nowImpl() / 1000);
 }
 
 const AUTH_COOLDOWN_S = 1800;
 
 function cooldown(name: string, seconds: number, why: string): void {
-  const until = Date.now() / 1000 + Math.max(0, seconds);
+  const now = nowImpl();
+  const until = now / 1000 + Math.max(0, seconds);
   cooldowns.set(name, Math.max(cooldowns.get(name) ?? 0, until));
+  cooldownSetAt.set(name, now);
   log(`COOLDOWN lane ${name} for ${Math.trunc(seconds)}s (${why})`);
-  telemetry.provider(name, { coolingUntil: Date.now() / 1000 + seconds });
+  telemetry.provider(name, { coolingUntil: now / 1000 + seconds, coolingReason: why });
+}
+
+/** Seconds left on a lane's cooldown in this process (0 when not cooling). */
+export function laneCooldownLeft(name: string): number {
+  return cooldownLeft(name);
 }
 
 function isFilterBlocked(status: number, err: string): boolean {
@@ -1911,6 +2140,7 @@ export async function call(messages: ChatMessage[], options: CallOptions = {}): 
   const retries = optNum(options.retries, 4);
   const tag = options.tag ?? "";
   const timeout = optNum(options.timeout, 600);
+  refreshLaneState();
 
   let key: string;
   let lanes: Lane[];
@@ -1939,6 +2169,8 @@ export async function call(messages: ChatMessage[], options: CallOptions = {}): 
   telemetry.bind({ role: key });
   let waited = 0;
   for (;;) {
+    // A wait for a cooling lane also notices a provider change or a manual reset.
+    if (waited > 0) refreshLaneState();
     const failures: string[] = [];
     for (const ln of lanes) {
       const left = cooldownLeft(ln.name);

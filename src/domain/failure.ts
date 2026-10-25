@@ -13,6 +13,8 @@
  * stage ("HTTP 429 · rate limited"). It never returns prompt or response text.
  */
 
+import { isRunPausedError } from "./runControl.js";
+
 export type FailClass = "permanent" | "transient" | "unknown";
 
 /**
@@ -117,6 +119,9 @@ function classifyText(s: string, name: string): FailClass {
  * that may come back (rate limit, cooling, outage) makes the whole call transient.
  */
 export function failClass(e: unknown): FailClass {
+  // A pause is never a failure: the chapter resumes from its caches. Callers
+  // check isRunPausedError first; "transient" keeps any that do not from halting.
+  if (isRunPausedError(e)) return "transient";
   if (e !== null && typeof e === "object" && "permanent" in e && Boolean((e as { permanent?: unknown }).permanent)) {
     return "permanent"; // story/semantic gates must not trigger whole-draft rewrite loops
   }
@@ -145,6 +150,7 @@ export function failClass(e: unknown): FailClass {
  * class name. Never includes prompt, response or credential text.
  */
 export function failureNote(e: unknown): string {
+  if (isRunPausedError(e)) return "Paused";
   const name = errorName(e);
   const s = errorText(e);
   if (name === "ElevenLabsPoolExhaustedError" || ELEVENLABS_POOL.test(s)) return "ElevenLabs keys exhausted";

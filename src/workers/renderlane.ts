@@ -48,7 +48,8 @@ import { pyFloatRepr } from "../contracts/hashes.js";
 import { pyRoundFixed } from "../stages/factCheck.js";
 import { withSharedSeriesLock } from "../locks/seriesLock.js";
 import * as telemetryMod from "../telemetry/telemetry.js";
-import { failClass, failureNote, type FailClass } from "../domain/failure.js";
+import { failClass, failureNote, httpStatusOf, type FailClass } from "../domain/failure.js";
+import { PAUSE_FILE_ENV, RunPausedError, checkpoint, isRunPausedError } from "../domain/runControl.js";
 import * as cloudlaneMod from "./cloudlane.js";
 import * as lappyMod from "./lappy.js";
 import * as nodeRegistryMod from "./nodeRegistry.js";
@@ -1791,6 +1792,82 @@ export interface VideoResult {
   class?: FailClass;
 }
 
+/* ------------------------------------------------------------------ *
+ * Cooperative pause in the video lane
+ * ------------------------------------------------------------------ */
+
+let videoPause: string | null = null;
+
+/** Where the video lane stopped for a pause in this run, or null. */
+export function videoPauseWhere(): string | null {
+  return videoPause;
+}
+
+/** Forget a previous run's video-lane pause (one run per process; tests run many). */
+export function resetVideoPause(): void {
+  videoPause = null;
+}
+
+function noteVideoPause(ch: string, where: string, log: (m: string) => void): void {
+  if (videoPause === null) videoPause = where;
+  log(`   pause: ${ch} left unrendered (${where})`);
+}
+
+const NARRATION_ENGINE_LABEL: Record<string, string> = {
+  vertex: "Vertex TTS",
+  grok: "Grok TTS",
+  eleven: "ElevenLabs (GSK)",
+};
+
+function seriesTtsEngine(sdir: string): string {
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(sdir, "meta.json"), "utf8")) as { tts?: { engine?: unknown } };
+    return String(meta?.tts?.engine ?? "").trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * A narration account the pinned engine rejected (HTTP 401/403) cannot heal by
+ * waiting. Inside an intake run (MANHWA_PAUSE_FILE set) the run pauses so the
+ * user can fix the account or switch narration; the chapter is not failed.
+ * Returns the pause point, or null when this failure is not such a case.
+ */
+export function _autoPauseOnRejectedNarration(
+  sdir: string,
+  ch: string,
+  e: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const file = String(env[PAUSE_FILE_ENV] ?? "").trim();
+  if (!file) return null;
+  const engine = seriesTtsEngine(sdir);
+  const label = NARRATION_ENGINE_LABEL[engine];
+  if (!label) return null; // elevenlabs has its own key pool; edge/external have no account
+  const text = errText(e);
+  const narration = engine === "eleven"
+    ? /\bgsk audio\b|\btts line\b/i.test(text)
+    : new RegExp(`\\b${engine} tts line\\b`, "i").test(text);
+  if (!narration) return null;
+  const bare = /\b(401|403)\b/.exec(text);
+  const status = httpStatusOf(text) ?? (bare ? Number(bare[1]) : null);
+  if (status !== 401 && status !== 403) return null;
+  const detail = /"message"\s*:\s*"([^"]{1,200})"/.exec(text)?.[1]?.trim().slice(0, 100)
+    || (status === 401 ? "key rejected" : "access denied");
+  const reason =
+    `${label} rejected the account (HTTP ${status}: ${detail}). ` +
+    "Fix the account in Studio or switch narration in Series settings, then Resume.";
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ at: Date.now(), by: "auto", reason }), { mode: 0o600, flag: "wx" });
+  } catch (err) {
+    // An existing file is a pause already requested; keep it as it is.
+    if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") return null;
+  }
+  return `${ch} narration`;
+}
+
 const VIDEO_RETRY_DELAYS_S = [120, 600] as const;
 const VIDEO_MAX_ATTEMPTS = VIDEO_RETRY_DELAYS_S.length + 1;
 
@@ -1848,6 +1925,14 @@ export async function worker(
 
       const runOne = async (ch: string, remote: boolean, tag: string): Promise<void> => {
         let final = true;
+        try {
+          if (videoPause !== null) throw new RunPausedError(videoPause);
+          checkpoint(`${ch} video`);
+        } catch (e) {
+          noteVideoPause(ch, (e as { where: string }).where, log);
+          wq.taskDone();
+          return;
+        }
         attempts[ch] = (attempts[ch] ?? 0) + 1;
         try {
           const [v, dur] = await _hooks.produce(
@@ -1860,6 +1945,11 @@ export async function worker(
           );
           results[ch] = { status: "video-ok", video: v, duration: dur, video_attempts: attempts[ch] };
         } catch (e) {
+          const pausedWhere = isRunPausedError(e) ? e.where : _autoPauseOnRejectedNarration(sdir, ch, e);
+          if (pausedWhere !== null) {
+            noteVideoPause(ch, pausedWhere, log);
+            return;
+          }
           failcounts[ch] = (failcounts[ch] ?? 0) + 1;
           if (failClass(e) === "transient" && failcounts[ch] < VIDEO_MAX_ATTEMPTS) {
             final = false;
@@ -2074,6 +2164,14 @@ export async function _workerPlan(
         let final = true;
         let tries = 0;
         try {
+          if (videoPause !== null) throw new RunPausedError(videoPause);
+          checkpoint(`${ch} video`);
+        } catch (e) {
+          noteVideoPause(ch, (e as { where: string }).where, log);
+          wq.taskDone();
+          return;
+        }
+        try {
           tries += 1;
           const [v, dur] = await _hooks.produce(sdir, ch, out, {
             log,
@@ -2085,6 +2183,12 @@ export async function _workerPlan(
           // Unpinned (`inherit`) plans may overflow to the next eligible lane;
           // a pinned plan stays strictly pinned and fails here.
           let lastErr: unknown = e;
+          const pausedFirst = isRunPausedError(e) ? e.where : _autoPauseOnRejectedNarration(sdir, ch, e);
+          if (pausedFirst !== null) {
+            // Never a failure and never a fallback lane: the chapter waits for Resume.
+            noteVideoPause(ch, pausedFirst, log);
+            return;
+          }
           if (pinned === null || pinned === undefined) {
             const chainFn = rp.fallback_chain ?? rp.fallbackChain;
             const chain = chainFn ? chainFn(plan, lane) : [];
@@ -2114,6 +2218,11 @@ export async function _workerPlan(
                 return;
               } catch (e2) {
                 lastErr = e2;
+                const pausedLater = isRunPausedError(e2) ? e2.where : _autoPauseOnRejectedNarration(sdir, ch, e2);
+                if (pausedLater !== null) {
+                  noteVideoPause(ch, pausedLater, log);
+                  return;
+                }
               }
             }
           }

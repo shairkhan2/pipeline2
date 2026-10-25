@@ -45,6 +45,7 @@ import {
 } from "../contracts/hashes.js";
 import { applyPromoMeta, normBox, normPromoBbox } from "../contracts/schemas.js";
 import { needsPositions, panelOrderKey, panelPositions } from "../domain/panels.js";
+import { checkpoint } from "../domain/runControl.js";
 import {
   call as llmCall,
   FilterBlocked,
@@ -621,6 +622,8 @@ export async function readChapter(
       }
     }
     if (!(status === "ok" && data && part)) {
+      // Safe point: every earlier batch is cached, so a resume continues here.
+      checkpoint(`${ch} reader batch ${bi + 1}/${batches.length}`);
       if (status === "stale") {
         console.error(`  !! batch ${bi + 1} stale -> re-reading`);
       }

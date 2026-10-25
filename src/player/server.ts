@@ -40,7 +40,7 @@ import type { LaneSession, SendJson } from './lanes.js';
 import { handleIntakeRoute, initIntakeQueue as initJobsQueue, parseJsonParam, parseOutroConfig, streamUploadToStaging } from './jobs.js';
 import { MAX_ZIP_BYTES } from '../intake/ingest.js';
 import { extendSeries, generateSeriesOutro, getSeriesMergeState, inspectSeriesOutro, mergeSeriesChapters, resolveSeriesDir, setSeriesOutroAttachment } from './seriesTools.js';
-import { getSeriesSettings, patchSeriesSettings } from './seriesSettings.js';
+import { getSeriesSettings, updateSeriesSettings } from './seriesSettings.js';
 import { getMoviePlanView } from './moviePlanView.js';
 import { assertNoSymlinks } from './storageTrash.js';
 import { handleSetupRoute, isSetupOpen } from './setup.js';
@@ -761,7 +761,7 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse): 
       const csrf = verifyCsrf(req, session, typeof body.csrfToken === 'string' ? body.csrfToken : '');
       if (!csrf.ok) return sendJson(res, 403, { error: csrf.error });
       const { csrfToken: _token, ...patch } = body;
-      return sendJson(res, 200, patchSeriesSettings(dir, patch));
+      return sendJson(res, 200, await updateSeriesSettings(dir, patch));
     }
     const moviePlanMatch = /^\/api\/series\/([^/]+)\/movie-plan$/.exec(pathname);
     if (moviePlanMatch) {

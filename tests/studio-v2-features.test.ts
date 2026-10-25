@@ -318,7 +318,7 @@ describe('live job and lane controls', () => {
   it('pauses queued jobs and resumes them without spawning a worker when disabled', async () => {
     chapter(1);
     const job = await createJob({ slug, chapters: '1', spawnWorker: false });
-    expect(pauseJob(String(job.id))).toMatchObject({ status: 'paused', paused: true, controlActions: ['resume', 'stop'] });
+    expect(pauseJob(String(job.id))).toMatchObject({ status: 'paused', paused: true, controlActions: ['resume', 'stop', 'cancel', 'settings'] });
     expect(resumeJob(String(job.id))).toMatchObject({ status: 'queued', paused: false });
     expect(stopJob(String(job.id))).toMatchObject({ status: 'interrupted', paused: false });
     expect(() => resumeJob(String(job.id))).toThrow('not paused');
@@ -377,7 +377,8 @@ describe('live job and lane controls', () => {
       }, { timeout: 10_000 });
       pauseJob(String(job.id));
       await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(getJob(String(job.id))).toMatchObject({ paused: true, status: 'running' });
+      // New runs pause cooperatively: the request waits for the next safe point.
+      expect(getJob(String(job.id))).toMatchObject({ pauseRequested: true, paused: false, status: 'running' });
       resumeJob(String(job.id));
       expect(stopJob(String(job.id))).toMatchObject({ status: 'interrupted' });
       await task;

@@ -72,6 +72,8 @@ import {
 import { Block, ensure as ensurePromoBlock, load as loadPromoBlock } from "../intake/promoBlock.js";
 import { getStudioSettings, type RenderQuality } from "../config/studioConfig.js";
 import { GEMINI_LOCALE_REQUEST_REV, isGeminiTtsVoiceId } from "../llm/vertexTts.js";
+import { elevenLabsModelSupportsTags } from "../llm/elevenlabsTts.js";
+import { chooseChapterScript } from "../domain/runControl.js";
 import {
   assertNoSymlinkPath,
   getLanguageEntry,
@@ -1247,26 +1249,35 @@ export async function main(
       throw e;
     }
   }
-  if (engine === "eleven" || engine === "elevenlabs") {
-    const cand = scriptPath.replaceAll("script.md", "script_eleven.md");
-    if (existsSync(cand)) {
-      scriptPath = cand;
-    } else if (locale === null) {
+  let stripTags = false;
+  if (locale === null) {
+    const choice = chooseChapterScript(dirname(scriptPath), engine, {
+      engineSupportsTags: engine === "elevenlabs"
+        ? elevenLabsModelSupportsTags(elevenModel)
+        : engine === "eleven" || engine === "external",
+    });
+    if (choice.fallback || existsSync(choice.path)) {
+      scriptPath = choice.path;
+      // elevenlabs also strips for a non-tag model, whatever script it reads.
+      stripTags = choice.stripTags || (engine === "elevenlabs" && !elevenLabsModelSupportsTags(elevenModel));
+    } else if (!existsSync(scriptPath)) {
       throw new SystemExit(
-        `engine=${engine} but ${cand} missing - run the writer first (python run.py <series> ${ch})`,
+        `engine=${engine} but ${choice.path} missing - run the writer first (python run.py <series> ${ch})`,
       );
     }
+    if (choice.fallback) {
+      console.log(
+        `narration: engine ${engine} reusing ${basename(choice.path)} (${choice.preferred} missing)`
+        + (stripTags ? ", delivery tags stripped" : ""),
+      );
+    }
+  } else if (engine === "eleven" || engine === "elevenlabs") {
     // Locale run: the localize stage writes script.md only, so fall back to it.
+    const cand = scriptPath.replaceAll("script.md", "script_eleven.md");
+    if (existsSync(cand)) scriptPath = cand;
   } else if (engine === "external") {
     const cand = scriptPath.replaceAll("script.md", "script_voice.md");
-    if (existsSync(cand)) {
-      scriptPath = cand;
-    } else if (locale === null) {
-      throw new SystemExit(
-        `engine=external but ${cand} missing - run the writer first (python run.py <series> ${ch})`,
-      );
-    }
-    // Locale run: the localize stage writes script.md only, so fall back to it.
+    if (existsSync(cand)) scriptPath = cand;
   }
   if (locale !== null && !existsSync(scriptPath)) {
     throw new SystemExit(
@@ -1289,9 +1300,17 @@ export async function main(
       ? `[${uniq.map((t) => pyReprStr(t)).join(", ")}]`
       : "NONE (valid per EMOTION LAW)";
     console.log(
-      `${engine} mode: voicing ${basename(scriptPath)} - ${tags.length} emotion tags: ${shown}`,
+      `${engine} mode: voicing ${basename(scriptPath)} - ${tags.length} emotion tags: ${shown}`
+      + (stripTags && tags.length ? " (stripped before synthesis)" : ""),
     );
   }
+  // Stripping changes the audio but not the parsed lines, so a non-default choice
+  // joins the key. elevenlabs already strips for non-tag models, and the model is in
+  // the key, so only a choice that differs from that and removes a tag counts.
+  // Unchanged setups keep their keys.
+  const engineStrips = engine === "elevenlabs" && !elevenLabsModelSupportsTags(elevenModel);
+  const stripsText = locale === null && stripTags !== engineStrips
+    && lines.some(([text]) => stripEmotionControls(text) !== text);
   let obs = JSON.parse(readFileSync(obsPath, "utf8")) as Record<string, unknown>;
   if (isRecord(obs) && "data" in obs) obs = obs.data as Record<string, unknown>;
   const panelsDir = join(dirname(obsPath), "panels", ch);
@@ -1300,8 +1319,9 @@ export async function main(
   const tmpdir = join(outDir, "tts_lines_" + engine);
   // elevenlabs folds the model into the voice slot of the key: a model change
   // re-renders, a key-pool change does not.
+  const voiceSlot = elevenModel === undefined ? voiceId : `${voiceId}|model=${elevenModel}`;
   const baseKey = _narrationCacheKey(
-    lines, engine, elevenModel === undefined ? voiceId : `${voiceId}|model=${elevenModel}`, extCfg, ttsSpeed,
+    lines, engine, stripsText ? `${voiceSlot}|tags=${stripTags ? "strip" : "keep"}` : voiceSlot, extCfg, ttsSpeed,
   );
   // English keeps the golden key formula verbatim. A locale run wraps it in a
   // versioned locale fingerprint, so Hindi audio can never satisfy an English
@@ -1330,20 +1350,23 @@ export async function main(
       console.log("tts: cache incomplete (tts_durs.json missing/invalid) -> regenerating");
     }
     let lst: string;
+    // eleven and external voice tags natively; the choice never strips for them.
+    const lineOpts = { chapter: ch, stripTags };
     if (engine === "eleven") {
-      spans = await ttsLinesEleven(lines, tmpdir, voiceId!);
+      spans = await ttsLinesEleven(lines, tmpdir, voiceId!, "eleven", { ...lineOpts, env: options.env });
       lst = writeIndexConcat(tmpdir, lines.length);
     } else if (engine === "external") {
-      spans = await ttsLinesExternal(lines, tmpdir, meta, options.env);
+      spans = await ttsLinesExternal(lines, tmpdir, meta, options.env, lineOpts);
       lst = writeIndexConcat(tmpdir, lines.length);
     } else if (engine === "vertex") {
-      spans = await ttsLinesVertex(lines, tmpdir, meta, options.env, locale);
+      spans = await ttsLinesVertex(lines, tmpdir, meta, options.env, locale, lineOpts);
       lst = writeIndexConcat(tmpdir, lines.length);
     } else if (engine === "grok") {
-      spans = await ttsLinesGrok(lines, tmpdir, meta, options.env);
+      spans = await ttsLinesGrok(lines, tmpdir, meta, options.env, lineOpts);
       lst = writeIndexConcat(tmpdir, lines.length);
     } else if (engine === "elevenlabs") {
-      spans = await ttsLinesElevenlabs(lines, tmpdir, meta, options.env);
+      spans = await ttsLinesElevenlabs(lines, tmpdir, meta, options.env,
+        locale === null ? lineOpts : { chapter: ch });
       lst = writeIndexConcat(tmpdir, lines.length);
     } else {
       // Series-selected Edge voice and speed must actually reach edge-tts.
@@ -1355,6 +1378,8 @@ export async function main(
           ? edgeRateFromSpeed(ttsSpeed)
           : edgeRateFromSpeed(ttsSpeed, LOCALE_EDGE_RATE),
         locale,
+        ...lineOpts,
+        ...(options.env ? { env: options.env } : {}),
       });
       spans = gen[0];
       lst = gen[1];

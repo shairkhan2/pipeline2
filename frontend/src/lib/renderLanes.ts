@@ -171,6 +171,16 @@ export interface JobRecord {
   error?: string | null;
   actions?: string[];
   controlActions?: string[];
+  pauseRequested?: boolean;
+  /** Unix seconds. */
+  pausedAt?: number | null;
+  pauseReason?: string | null;
+  pausedWhere?: string | null;
+  settingsEditable?: boolean;
+  chapters?: string | null;
+  renderLane?: string | null;
+  renderQuality?: string | null;
+  outroConfig?: Record<string, unknown> | null;
   [key: string]: unknown;
 }
 
@@ -193,6 +203,7 @@ export function parseIntakeJob(raw: unknown): JobRecord {
     ...r,
     id: typeof r.id === "string" ? r.id : String(r.id ?? ""),
     paused: Boolean(r.paused),
+    pauseRequested: Boolean(r.pauseRequested),
     ...(actions !== undefined ? { actions } : {}),
     ...(controlActions !== undefined ? { controlActions } : {}),
   };

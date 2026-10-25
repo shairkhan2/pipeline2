@@ -65,7 +65,12 @@ import {
   type ProviderUpsertInput,
   type RenderNodeUpsertInput,
 } from "../config/studioConfig.js";
-import { _resetSnapshotForTests as resetLlmSnapshot } from "../llm/client.js";
+import {
+  _resetSnapshotForTests as resetLlmSnapshot,
+  configuredLaneNames,
+  resetLaneCooldown,
+  writeLaneReset,
+} from "../llm/client.js";
 import {
   getRegisteredNodes,
   registerNodeForRuntime,
@@ -872,6 +877,15 @@ export async function handleStudioRoute(
       // signals or mutates a job; run-scoped controls replace it.
       const result = controlRenderLane(String(body.laneId || ""), body.action as "pause" | "resume" | "stop", undefined, outDir);
       return sendJson(res, Number(result.statusCode) || 409, result);
+    }
+    if (pathname === "/api/studio/lanes/reset") {
+      if (method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
+      const lane = typeof body.lane === "string" ? body.lane.trim() : "";
+      if (!lane || !configuredLaneNames().includes(lane)) return sendJson(res, 400, { error: "lane must be a configured lane name" });
+      const at = Date.now();
+      writeLaneReset(lane, at, outDir);
+      resetLaneCooldown(lane);
+      return sendJson(res, 200, { ok: true, lane, at });
     }
     /* ---------- GET /api/studio/catalog ---------- */
     if (pathname === "/api/studio/catalog") {

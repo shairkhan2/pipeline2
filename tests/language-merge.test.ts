@@ -161,7 +161,9 @@ function authHeaders(extra: Record<string, string> = {}): Record<string, string>
 async function api(route: string, method = 'GET', body?: unknown): Promise<Response> {
   return fetch(`${base}${route}`, {
     method,
-    headers: authHeaders(),
+    // Synchronous media probes between requests can outlast the server's idle
+    // timeout before fetch processes the socket close. Use a fresh connection.
+    headers: authHeaders({ connection: 'close' }),
     body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body ?? {}),
   });
 }

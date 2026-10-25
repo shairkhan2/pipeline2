@@ -207,14 +207,14 @@ describe("failure classification", () => {
 });
 
 describe("engine allow-lists", () => {
-  it("timeline accepts elevenlabs and requires script_eleven.md", async () => {
+  it("timeline accepts elevenlabs and requires a script", async () => {
     const sdir = path.join(root, "series", "s1");
     const out = path.join(sdir, "out");
     fs.mkdirSync(path.join(out, "ch1"), { recursive: true });
     fs.writeFileSync(path.join(sdir, "meta.json"), JSON.stringify({ tts: { engine: "elevenlabs", voice_id: VOICE } }));
     fs.writeFileSync(path.join(out, "promo_block.json"), JSON.stringify({ version: 1, pages: [] }));
     fs.writeFileSync(path.join(out, "obs_ch1.json"), JSON.stringify({ panels: [] }));
-    fs.writeFileSync(path.join(out, "ch1", "script.md"), "Line. @p0001_1\n");
+    // No script at all: another engine group's script would be reused (tests/script-reuse.test.ts).
     const err = await timeline.main(sdir, "ch1", path.join(out, "ch1", "script.md"), path.join(out, "obs_ch1.json"),
       path.join(out, "ch1", "video")).catch((e) => e);
     expect(String(err?.message ?? err)).toContain("engine=elevenlabs but");
